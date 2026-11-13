@@ -158,6 +158,41 @@ const LIMIT = E.MAX_EXPORT_BYTES
 		assert.equal(r.unknownVolts, 2, '要统计出多少样点电压未知')
 	}
 
+	// ---- 估算通过、最终超限：必须靠最终文本复核挡住（缺口行也算长度） ----
+	{
+		const LIMIT = 4000
+		// 20 行数据 → 估算 ≈ 56×20 = 1120 < 4000（计划通过，且 gaps() 为空 → 估算没算缺口行）
+		// 但遍历会吐出 200 条缺口标记行，最终文本远超 4000，必须由最终复核挡住
+		const stub = {
+			total: () => 20,
+			gaps: () => [],
+			droppedRanges: () => [],
+			walkExact: async (start, end, visit) => {
+				for (let i = 0; i < 200; i++) {
+					visit({ kind: 'gap', lo: 100000000 + i, hi: 100000000 + i })
+				}
+				for (let i = 0; i < 20; i++) {
+					visit({ kind: 'samples', lo: i, hi: i + 1, values: Float32Array.from([1000]), volts: 3.3 })
+				}
+				return { samples: 20, missing: 0, dropped: 0, gaps: 200, aborted: false }
+			},
+		}
+		const plan = E.planExport({ kind: 'range', start: 0, end: 19, limitBytes: LIMIT })
+		assert.equal(plan.ok, true, '估算阶段应当通过（否则测不到最终复核）：' + JSON.stringify(plan))
+		const r = await E.buildCsv(stub, 0, 20, { samplePeriodSec: 1, limitBytes: LIMIT })
+		assert.equal(r.ok, false, '最终文本超限必须拒绝')
+		assert.equal(r.code, 'too_large')
+		assert.equal(r.text, undefined, '拒绝时不能交出半截内容')
+		assert.match(r.message, /超过/)
+	}
+
+	// ---- 估算阶段就把缺口标记计入（缺口很多时提前拒绝，不靠兜底） ----
+	{
+		const plan = E.planExport({ kind: 'range', start: 0, end: 200, limitBytes: 20000, gapMarkers: 400 })
+		assert.equal(plan.ok, false, '400 条缺口标记要把估算顶过上限')
+		assert.equal(plan.reason, 'too_large')
+	}
+
 	// ---- 导出服务：超限时既不调 saveFile 也不写文件 ----
 	{
 		let saved = 0

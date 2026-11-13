@@ -10,9 +10,13 @@
 	// 每行固定开销的保守估计（下标 + 时间 + 电流 + 功率 + 电压 + 换行）
 	const BYTES_PER_ROW_ESTIMATE = 56
 
-	function estimateCsvBytes(n) {
+	// 每条缺口标记行的保守开销（"# gap <kind> <lo>..<hi>"）
+	const BYTES_PER_GAP_MARKER = 48
+
+	function estimateCsvBytes(n, gapMarkers) {
 		const rows = Math.max(0, n | 0)
-		return CSV_HEADER.length + rows * BYTES_PER_ROW_ESTIMATE
+		const gaps = Math.max(0, gapMarkers | 0)
+		return CSV_HEADER.length + rows * BYTES_PER_ROW_ESTIMATE + gaps * BYTES_PER_GAP_MARKER
 	}
 
 	function maxRowsFor(limitBytes) {
@@ -45,7 +49,7 @@
 		const start = Math.max(0, req.start | 0)
 		const end = Math.max(start, req.end | 0)
 		const n = end - start
-		const estimate = estimateCsvBytes(n)
+		const estimate = estimateCsvBytes(n, req.gapMarkers)
 		if (n <= 0) {
 			return {
 				ok: false, kind: kind, limitBytes: limit, requestedSamples: 0, estimatedBytes: estimate,
@@ -97,7 +101,10 @@
 	async function buildCsv(wave, start, end, ctx) {
 		ctx = ctx || {}
 		const limit = ctx.limitBytes > 0 ? ctx.limitBytes : MAX_EXPORT_BYTES
-		const plan = planExport({ kind: 'range', start: start, end: end, limitBytes: limit })
+		// 估算时把缺口标记也计进去（否则估算通过、最终超限只能靠最后一处兜底）
+		const gapMarkers = (wave && typeof wave.gaps === 'function' ? wave.gaps().length : 0) +
+			(wave && typeof wave.droppedRanges === 'function' ? wave.droppedRanges().length : 0)
+		const plan = planExport({ kind: 'range', start: start, end: end, limitBytes: limit, gapMarkers: gapMarkers })
 		if (!plan.ok) return { ok: false, code: plan.reason, message: plan.message, plan: plan }
 		const per = ctx.samplePeriodSec > 0 ? ctx.samplePeriodSec : 0
 		const parts = [CSV_HEADER]

@@ -575,6 +575,72 @@ test('长期模式：时长只累计有效间隔、缺口有计数、能量按�
 	assert.ok(Math.abs(h.control.overallStats().volts - 3.3) < 1e-9, '有效电压仍是 3.3 V：' + h.control.overallStats().volts)
 })
 
+test('停止采样联动：claim 队列里待入库的样点会被 control 排空后才冻结', async () => {
+	// 真的把 claim 链路与 control 拼在一起：队列由测试手动排空，模拟「点停止时队列还没走完」
+	const P = require('../js/power-protocol.js')
+	const Claim = require('../js/power-claim.js')
+	const Control = require('../js/power-control.js')
+	const Wave = require('../js/power-wave.js')
+	const writes = []
+	const host = {
+		claim: {
+			acquire: async () => ({ claimId: 'cz' }),
+			open: async () => ({ open: true }),
+			write: async (id, b) => { writes.push(Array.from(b)); return { bytes: b.length } },
+			close: async () => ({ closed: true }),
+			release: async () => ({ released: true }),
+			ack: async () => ({ ack: true }),
+		},
+	}
+	const drains = []
+	let ctl = null
+	const link = Claim.createClaimLink({
+		host: host,
+		scheduleDrain: function (fn) { drains.push(fn) },
+		// 真的接到 control 的入库路径上（模拟插件里的接线）
+		onSamples: function (s, at, meta) { if (ctl) ctl.pushSamples(s, at, meta) },
+	})
+	const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+	const wave = Wave.createWave({ store: store, chunkSize: 65536, ramCapSamples: 262144, voltage: () => 3.3, samplePeriod: () => 0.001 })
+	const control = Control.createControl({
+		link: link, wave: wave, store: store,
+		settings: { recordMode: 'wave', targetRateHz: 1000, voltageMv: 3300 },
+		options: { rxDrainMs: 0 },
+	})
+	ctl = control
+	await link.open('p1')
+	await control.startSampling()
+	// 灌 1000 个原始点（100 kHz → 1 kHz 目标：约 10 个输出点），但**不**执行 drain
+	let counter = 0
+	function words(n) {
+		const u8 = new Uint8Array(n * 4)
+		for (let i = 0; i < n; i++) {
+			const c = (counter++) & 0x3f
+			const w = (((0xff) << 24) | (c << 18) | (3 << 14) | (1000 + (i % 5))) >>> 0
+			u8[i * 4] = w & 0xff
+			u8[i * 4 + 1] = (w >>> 8) & 0xff
+			u8[i * 4 + 2] = (w >>> 16) & 0xff
+			u8[i * 4 + 3] = (w >>> 24) & 0xff
+		}
+		return u8
+	}
+	link.handleRx({ claimId: 'cz', gen: 1, seq: 1, offset: 0, at: Date.now(), bytes: words(2000) })
+	assert.ok(link.pendingSamples() > 0, '队列里必须有待入库的样点：' + link.pendingSamples())
+	assert.equal(wave.total(), 0, '还没排空 → 波形里没有样点')
+	const before = link.pendingSamples()
+	// 停止采样：control 必须先把这个队列排空，再冻结
+	await control.stopSampling()
+	assert.equal(link.pendingSamples(), 0, '停止时必须排空队列（不能静默丢）：剩 ' + link.pendingSamples() + ' / 原 ' + before)
+	assert.ok(wave.total() > 0, '排空后的样点必须真的入库：' + wave.total())
+	assert.equal(control.isSampling(), false)
+	// 停止时发 STOP（START 是开始采样时发的，这里只看停止之后有没有再发 START）
+	const beforeStop = writes.length
+	assert.ok(writes.some((w) => w[0] === 0x07), '要发 AVERAGE_STOP')
+	const after = writes.slice(beforeStop)
+	void after
+	assert.equal(writes[writes.length - 1][0], 0x07, '最后一次写入是 STOP：' + JSON.stringify(writes.map((w) => w[0])))
+})
+
 test('电压在采样中改变：摘要标出这一点', async () => {
 	const h = await connected()
 	await h.control.startSampling()
