@@ -467,5 +467,44 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		assert.equal(csv.text, undefined, '不能交出半新半旧的文件')
 	}
 
+	{
+		// 第 9 项：块内电压变更必须按边界记录，子区间用该样点当时的电压
+		const { T } = load(makeStore(), { cap: CHUNK })
+		T.env.samplePeriodSec = 1
+		T.env.voltageV = 3.3
+		for (let i = 0; i < 4; i++) T.ringPush(1000)
+		T.env.voltageV = 1.65
+		for (let i = 0; i < 4; i++) T.ringPush(1000)
+		const full = T.calcStats(0, 8)
+		// 左端点约定：样点 0..3（3.3 V）管 4 个间隔，样点 4..6（1.65 V）管 3 个
+		assert.ok(Math.abs(full.energyUWh - (1000 * (3.3 * 4 + 1.65 * 3) / 3600)) < 1e-9,
+			'整段能量按各自电压积分：' + full.energyUWh)
+		assert.ok(Math.abs(full.dur - 7) < 1e-12, '时长仍是 7 个间隔：' + full.dur)
+		// 子区间（前四点）：只能是 3.3 V，不能是整块平均的 2.475 V
+		const head = T.calcStats(0, 4)
+		assert.ok(Math.abs(head.volts - 3.3) < 1e-9, '前四点电压必须是自己那段的 3.3 V：' + head.volts)
+		assert.ok(Math.abs(head.energyUWh - (1000 * 3.3 * 3 / 3600)) < 1e-9, '前四点能量：' + head.energyUWh)
+		// 后四点：1.65 V
+		const tail = T.calcStats(4, 8)
+		assert.ok(Math.abs(tail.volts - 1.65) < 1e-9, '后四点电压 1.65 V：' + tail.volts)
+		assert.ok(Math.abs(tail.energyUWh - (1000 * 1.65 * 3 / 3600)) < 1e-9, '后四点能量：' + tail.energyUWh)
+		// 跨越边界：每半点用自己的电压
+		const cross = T.calcStats(2, 6)
+		assert.ok(Math.abs(cross.energyUWh - (1000 * (3.3 * 2 + 1.65 * 1) / 3600)) < 1e-9, '跨界子区间：' + cross.energyUWh)
+	}
+
+	{
+		// 电压未知的样点：能量必须不可用（null），不能按 0 V 编一个确定值
+		const { T } = load(makeStore(), { cap: CHUNK })
+		T.env.samplePeriodSec = 1
+		T.ringPush(1000, null)
+		T.ringPush(1000, null)
+		T.ringPush(1000, null)
+		const st = T.calcStats(0, 3)
+		assert.equal(st.energyUWh, null, '电压未知 → 能量不可用')
+		assert.ok(Math.abs(st.chargeUC - 2000) < 1e-9, '电量仍可用（只需电流）')
+		assert.equal(st.volts, 0)
+	}
+
 	console.log('power-wave-store: ok')
 })().catch(function (e) { console.error(e); process.exit(1) })

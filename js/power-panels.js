@@ -90,15 +90,14 @@
 				if (ev.mixedVolts) out.voltsMixed = true
 				rawTotal += ev.hi - ev.lo
 				const last = runs[runs.length - 1]
-				if (!newRun && last && last.hi === ev.lo) {
+				// 电压不同的两段不能合并：合并会丢掉「每个样点当时的电压」
+				if (!newRun && last && last.hi === ev.lo && last.mv === (ev.volts == null ? null : Math.round(ev.volts * 1000))) {
 					// 同一连续段：合并数值，电压按电流大小加权
 					const merged = new Float32Array(last.values.length + ev.values.length)
 					merged.set(last.values)
 					merged.set(ev.values, last.values.length)
 					const wSum = last.weight + ev.values.length
-					last.volts = (last.volts * last.weight + ev.volts * ev.values.length) / Math.max(1, wSum)
 					last.weight = wSum
-					if (Math.abs(last.volts - ev.volts) > 1e-9) out.voltsMixed = true
 					last.values = merged
 					last.hi = ev.hi
 				} else {
@@ -106,7 +105,8 @@
 						lo: ev.lo,
 						hi: ev.hi,
 						values: Float32Array.from(ev.values),
-						volts: ev.volts,
+						volts: ev.volts == null ? null : ev.volts,
+						mv: ev.volts == null ? null : Math.round(ev.volts * 1000),
 						weight: ev.values.length,
 					})
 				}

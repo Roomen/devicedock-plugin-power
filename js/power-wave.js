@@ -41,6 +41,8 @@
 		const CHUNK_SIZE = Math.max(1, cfg.chunkSize || DEFAULTS.chunkSize)
 		const ENV_STEP = Math.max(1, cfg.envelopeStep || DEFAULTS.envelopeStep)
 		const HYDRATE_CACHE_MAX = Math.max(4, cfg.hydrateCacheMax || DEFAULTS.hydrateCacheMax)
+		// 每块的电压变更边界上限：超过就退回「混合」标记（正常使用一小时内也就几次改压）
+		const VOLT_SEG_MAX = 256
 		const HYDRATE_FRAME_MAX = HYDRATE_CACHE_MAX - 4
 		const META_BUDGET = cfg.metaBudgetBytes > 0 ? cfg.metaBudgetBytes : DEFAULTS.metaBudgetBytes
 		const Store = cfg.store || null
@@ -94,6 +96,7 @@
 				n: 0, avgI: 0, avgP: 0, minI: 0, maxI: 0,
 				chargeUC: 0, chargeUAh: 0, energyUWh: 0, dur: 0,
 				volts: 0, segments: 0, gaps: 0, dropped: 0,
+				energyApproximate: false,
 			}
 		}
 
@@ -103,7 +106,8 @@
 			const out = Object.assign(emptyStats(), st)
 			if (!isFinite(out.chargeUC)) out.chargeUC = out.n ? out.avgI * out.dur : 0
 			if (!isFinite(out.chargeUAh)) out.chargeUAh = out.chargeUC / 3600
-			if (!isFinite(out.energyUWh)) out.energyUWh = out.n ? out.avgP * out.dur / 3600 : 0
+			// null = 不可用（电压未知）；只有 undefined 才补算
+			if (out.energyUWh === undefined) out.energyUWh = out.n ? out.avgP * out.dur / 3600 : 0
 			return out
 		}
 
@@ -139,6 +143,10 @@
 				// 块被写入时的源电压（V）：统计/导出都用它换算历史功率，改了设置也不改写
 				voltsUsed: null,
 				voltsMixed: false,
+				// 块内的电压变更边界：[{ off, mv }]，off 是块内样点下标，mv 是毫伏。
+				// 子区间统计与 CSV 每行都用样点**当时**的电压，不拿整块平均糊过去。
+				voltSegs: null,
+				voltsUnknown: false,
 			}
 		}
 
@@ -363,14 +371,21 @@
 						} else {
 							summary.samples += hi - lo
 							if (visit) {
-								visit({
-									kind: 'samples',
-									lo: lo,
-									hi: hi,
-									values: buf.subarray(lo - ch0, hi - ch0),
-									volts: chunkVolts(ch),
-									mixedVolts: !!ch.voltsMixed,
-								})
+								// 按块内电压边界拆开：每个事件里的样点共享同一个**当时**的电压
+								const runs = chunkVoltRuns(ch, lo - ch0, hi - ch0)
+								for (let r = 0; r < runs.length; r++) {
+									const run = runs[r]
+									if (run.hi <= run.lo) continue
+									visit({
+										kind: 'samples',
+										lo: ch0 + run.lo,
+										hi: ch0 + run.hi,
+										values: buf.subarray(run.lo, run.hi),
+										volts: run.mv == null ? null : run.mv / 1000,
+										voltsUnknown: run.mv == null,
+										mixedVolts: !!ch.voltsMixed,
+									})
+								}
 							}
 						}
 					}
@@ -558,7 +573,7 @@
 			return true
 		}
 
-		function ringPush(curUA) {
+		function ringPush(curUA, voltsIn) {
 			if (storageStop) return false
 			// 非有限值会污染 min/max/包络并导致 canvas 路径断裂（在占预算前丢弃）
 			if (!isFinite(curUA)) return true
@@ -585,12 +600,18 @@
 			const off = ch.n
 			ch.buf[off] = curUA
 			ch.n++
-			const vset = voltage()
-			if (ch.voltsUsed == null) ch.voltsUsed = vset
-			else if (Math.abs(ch.voltsUsed - vset) > 1e-9) ch.voltsMixed = true
+			// 显式传入的电压优先（导入的历史数据）；没有就取当前源电压。
+			// null 表示「电压未知」：功率与能量都不能编出来。
+			const vset = arguments.length > 1 ? voltsIn : voltage()
+			const mv = vset == null || !isFinite(vset) ? null : Math.round(vset * 1000)
+			if (ch.voltsUsed == null && mv != null) ch.voltsUsed = mv / 1000
+			if (mv == null) ch.voltsUnknown = true
+			recordVoltSeg(ch, off, mv)
+			if (ch.voltsUsed != null && mv != null && Math.abs(ch.voltsUsed * 1000 - mv) > 0.5) ch.voltsMixed = true
 			ch.sumI += curUA
 			ch.sumSqI += curUA * curUA
-			ch.sumP += curUA * vset
+			// 电压未知时不累计功率（否则会把「未知」算成 0 V 的确定值）
+			if (mv != null) ch.sumP += curUA * (mv / 1000)
 			if (off === 0) ch.firstI = curUA
 			ch.lastI = curUA
 			if (curUA < ch.minI) ch.minI = curUA
@@ -720,53 +741,76 @@
 			return n
 		}
 
+		/** 记录块内的电压变更边界（同一电压连续段只留一个边界；超过上限就退回「混合」标记） */
+		function recordVoltSeg(ch, off, mv) {
+			if (!ch.voltSegs) ch.voltSegs = []
+			const segs = ch.voltSegs
+			const last = segs.length ? segs[segs.length - 1] : null
+			if (last && last.mv === mv) return
+			if (segs.length >= VOLT_SEG_MAX) {
+				// 极端情况下（每点都变电压）不再细分：保留已记录的边界并标混合
+				ch.voltsMixed = true
+				return
+			}
+			segs.push({ off: off, mv: mv })
+		}
+
+		/**
+		 * 块内 [lo,hi) 的电压子区间（块内下标，mV；null = 未知）。
+		 * 只有一条边界时返回单段，调用方可以走快路径。
+		 */
+		function chunkVoltRuns(ch, lo, hi) {
+			const segs = ch.voltSegs
+			if (!segs || !segs.length) {
+				const fallback = ch.voltsUsed != null ? Math.round(ch.voltsUsed * 1000) : (ch.voltsUnknown ? null : null)
+				return [{ lo: lo, hi: hi, mv: fallback }]
+			}
+			const out = []
+			let i = 0
+			let curLo = lo
+			const first = segs[0] || { off: 0, mv: null }
+			let curMv = first.mv
+			for (i = 1; i < segs.length; i++) {
+				const s = segs[i]
+				if (s.off <= curLo) { curMv = s.mv; continue }
+				if (s.off >= hi) break
+				out.push({ lo: curLo, hi: s.off, mv: curMv })
+				curLo = s.off
+				curMv = s.mv
+			}
+			out.push({ lo: curLo, hi: hi, mv: curMv })
+			return out
+		}
+
 		/** 块的有效电压（V）：sumP/sumI 是采样当时的加权平均，改了源电压也不会被改写 */
 		function chunkVolts(ch) {
+			if (ch.voltsUnknown) return null
 			if (ch.sumI > 0 && isFinite(ch.sumP)) return ch.sumP / ch.sumI
 			return ch.voltsUsed != null ? ch.voltsUsed : voltage()
 		}
 
-		function addChunkStatRange(ch, lo, hi, acc) {
-			if (hi <= lo) return
-			if (ch.state === 'dropped') return
-			if (lo === 0 && hi === ch.n && ch.n > 0) {
-				acc.sumI += ch.sumI
-				acc.sumP += ch.sumP
-				if (ch.minI < acc.minI) acc.minI = ch.minI
-				if (ch.maxI > acc.maxI) acc.maxI = ch.maxI
-				acc.n += ch.n
-				return
+		/** 区间内被淘汰（dropped）的样点数 */
+		function droppedIn(start, end) {
+			let n = 0
+			const dr = droppedRanges()
+			for (let i = 0; i < dr.length; i++) {
+				const lo = Math.max(start, dr[i][0])
+				const hi = Math.min(end, dr[i][1])
+				if (hi > lo) n += hi - lo
 			}
-			const buf = getChunkBuf(ch)
-			// 部分区间也要用这一块**历史**电压，不能拿界面当前设置去改写历史能量
-			const vset = chunkVolts(ch)
-			if (buf) {
-				for (let i = lo; i < hi; i++) {
-					const v = buf[i]
-					if (!isFinite(v)) continue
-					acc.sumI += v
-					acc.sumP += v * vset
-					if (v < acc.minI) acc.minI = v
-					if (v > acc.maxI) acc.maxI = v
-					acc.n++
-				}
-				return
-			}
-			// 冷块未回读：按块级统计近似（整块区间精确，部分区间按比例，电压仍取历史值）
-			requestHydrate(ch)
-			if (ch.n > 0) {
-				const ratio = (hi - lo) / ch.n
-				acc.sumI += ch.sumI * ratio
-				acc.sumP += ch.sumP * ratio
-				if (ch.minI < acc.minI) acc.minI = ch.minI
-				if (ch.maxI > acc.maxI) acc.maxI = ch.maxI
-				acc.n += hi - lo
-			}
+			return n
 		}
 
-		/** 把 [start,end) 内某个连续段（不含 dropped 块，由 segments 保证）累加进 acc */
-		function accumulateSegment(a, b, acc) {
-			if (b <= a) return
+		/**
+		 * 把 [a,b) 拆成「电压子区间」并逐段累加。
+		 * 返回的每项：{ lo, hi, sumI, sumP, n, mv, unknown, approximate }
+		 *  - 有真实样点时按块内电压边界拆开（每个样点用它**当时**的电压算功率）；
+		 *  - 冷块未回读只能按比例近似（标 approximate）；
+		 *  - 电压未知的样点 sumP 不累加，unknown=true。
+		 */
+		function collectRuns(a, b) {
+			const out = []
+			if (b <= a) return out
 			const i0 = chunkIndexAt(a)
 			let base = waveChunks[i0] ? waveChunks[i0].base : 0
 			for (let i = i0; i < waveChunks.length; i++) {
@@ -775,32 +819,50 @@
 				const ch1 = base + ch.n
 				const lo = Math.max(a, ch0)
 				const hi = Math.min(b, ch1)
-				if (hi > lo) addChunkStatRange(ch, lo - ch0, hi - ch0, acc)
 				base = ch1
+				if (hi > lo && ch.state !== 'dropped') {
+					const buf = getChunkBuf(ch)
+					if (buf) {
+						const runs = chunkVoltRuns(ch, lo - ch0, hi - ch0)
+						for (let r = 0; r < runs.length; r++) {
+							const run = runs[r]
+							const vset = run.mv == null ? null : run.mv / 1000
+							const acc = { lo: ch0 + run.lo, hi: ch0 + run.hi, sumI: 0, sumP: 0, n: 0, minI: Infinity, maxI: -Infinity, mv: run.mv, unknown: vset == null, approximate: false }
+							for (let k = run.lo; k < run.hi; k++) {
+								const v = buf[k]
+								if (!isFinite(v)) continue
+								acc.sumI += v
+								if (vset != null) acc.sumP += v * vset
+								if (v < acc.minI) acc.minI = v
+								if (v > acc.maxI) acc.maxI = v
+								acc.n++
+							}
+							if (acc.hi > acc.lo) out.push(acc)
+						}
+					} else {
+						requestHydrate(ch)
+						const mv = ch.voltsUnknown ? null : (ch.sumI > 0 ? Math.round(ch.sumP / ch.sumI * 1000) : null)
+						const ratio = (hi - lo) / Math.max(1, ch.n)
+						out.push({
+							lo: lo, hi: hi,
+							sumI: ch.sumI * ratio, sumP: ch.sumP * ratio, n: hi - lo,
+							minI: ch.minI, maxI: ch.maxI,
+							mv: mv, unknown: mv == null, approximate: true,
+						})
+					}
+				}
 				if (base >= b) break
 			}
-		}
-
-		/** 区间内被淘汰（dropped）的样点数 */
-		function droppedIn(start, end) {
-			let n = 0
-			for (let i = 0; i < waveChunks.length; i++) {
-				const ch = waveChunks[i]
-				if (ch.state !== 'dropped') continue
-				const lo = Math.max(start, ch.base)
-				const hi = Math.min(end, ch.base + ch.n)
-				if (hi > lo) n += hi - lo
-			}
-			return n
+			return out
 		}
 
 		/**
-		 * 区间统计：**按连续段分别积分**再合并。
+		 * 区间统计：**按连续段 × 电压子区间分别积分**再合并。
 		 *
-		 * 缺口与被淘汰的块把时间轴切开，每段各自累加电流、功率与时间，绝不跨段配对：
+		 * 缺口与被淘汰的块把时间轴切开，每段各自累加；段内再按电压边界切开，
+		 * 每个子区间用自己的电压积分（左端点约定：第 i 个样点管 t_i→t_{i+1} 那一段）。
 		 *  - 时长 = 各段内的相邻样点对数 × 采样周期（dropped 段不贡献时长）；
-		 *  - 电量 / 能量 = Σ 段内均值 × 段时长（不是全区间均值 × 总时长）。
-		 * 这样孤立的单个高电流点不会凭空产生能量，缺口两侧也不会互相影响。
+		 *  - 电量 / 能量 = Σ 子区间均值 × 子区间时长。
 		 */
 		function calcStats(start, end) {
 			if (totalCount < 1 || end <= start) return emptyStats()
@@ -819,28 +881,35 @@
 			let energy = 0
 			let voltNum = 0
 			let voltDen = 0
+			let voltsUnknown = false
+			let approximate = false
 			for (let s = 0; s < segs.length; s++) {
 				const a = segs[s][0]
 				const b = segs[s][1]
-				const acc = { n: 0, sumI: 0, sumP: 0, minI: Infinity, maxI: -Infinity }
-				accumulateSegment(a, b, acc)
-				if (acc.n) {
-					sumI += acc.sumI
-					sumP += acc.sumP
-					n += acc.n
-					if (acc.minI < minI) minI = acc.minI
-					if (acc.maxI > maxI) maxI = acc.maxI
-					voltNum += acc.sumP
-					voltDen += acc.sumI
-				}
+				const runs = collectRuns(a, b)
 				const steps = Math.max(0, b - a - 1)
 				const segDur = steps * per
 				dur += segDur
-				if (acc.n) {
-					const meanI = acc.sumI / acc.n
-					const meanP = acc.sumP / acc.n
-					charge += meanI * segDur
-					energy += meanP * segDur / 3600
+				for (let r = 0; r < runs.length; r++) {
+					const run = runs[r]
+					if (run.unknown) voltsUnknown = true
+					if (run.approximate) approximate = true
+					if (!run.n) continue
+					sumI += run.sumI
+					sumP += run.sumP
+					n += run.n
+					if (run.minI < minI) minI = run.minI
+					if (run.maxI > maxI) maxI = run.maxI
+					voltNum += run.sumP
+					voltDen += run.sumI
+					// 左端点约定：区间内每个样点管到下一个样点；整段最后一个样点没有下一段
+					const isLastRunOfSegment = r === runs.length - 1
+					const span = Math.max(0, run.hi - run.lo - (isLastRunOfSegment ? 1 : 0))
+					const runDur = span * per
+					const meanI = run.sumI / run.n
+					const meanP = run.sumP / run.n
+					charge += meanI * runDur
+					energy += meanP * runDur / 3600
 				}
 			}
 			const avgI = n ? sumI / n : 0
@@ -854,7 +923,9 @@
 				dur: dur,
 				chargeUC: charge,
 				chargeUAh: charge / 3600,
-				energyUWh: energy,
+				// 电压未知 → 能量不可用（null），不编一个确定值
+				energyUWh: voltsUnknown ? null : energy,
+				energyApproximate: voltsUnknown ? false : approximate,
 				// 这段历史数据的有效电压（按电流加权）；与界面当前设置无关
 				volts: voltDen > 0 ? voltNum / voltDen : 0,
 				segments: segs.length,

@@ -123,6 +123,41 @@ const LIMIT = E.MAX_EXPORT_BYTES
 		if (planOk.ok) assert.equal(r.ok, false, '计划通过但真实超限时仍拒绝')
 	}
 
+	// ---- 块内混合电压：每行用该样点当时的电压 ----
+	{
+		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+		let v = 3.3
+		const w = Wave.createWave({ store: store, chunkSize: 1024, ramCapSamples: 1024, voltage: () => v, samplePeriod: () => 1 })
+		for (let i = 0; i < 4; i++) w.push(1000)
+		v = 1.65
+		for (let i = 0; i < 4; i++) w.push(1000)
+		const r = await E.buildCsv(w, 0, 8, { samplePeriodSec: 1 })
+		assert.equal(r.ok, true)
+		const rows = r.text.split('\n').filter((l) => /^\d+,/.test(l))
+		assert.equal(rows.length, 8)
+		// 前四行 3300 mV、功率 3300 µW；后四行 1650 mV、功率 1650 µW
+		for (let i = 0; i < 4; i++) {
+			assert.equal(rows[i], i + ',' + i + ',1000,3300,3300', '第 ' + i + ' 行：' + rows[i])
+		}
+		for (let i = 4; i < 8; i++) {
+			assert.equal(rows[i], i + ',' + i + ',1000,1650,1650', '第 ' + i + ' 行：' + rows[i])
+		}
+		assert.equal(r.unknownVolts, 0)
+	}
+
+	// ---- 电压未知：能量列为空，不编数值 ----
+	{
+		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+		const w = Wave.createWave({ store: store, chunkSize: 1024, ramCapSamples: 1024, voltage: () => 3.3, samplePeriod: () => 1 })
+		w.push(1000, null)
+		w.push(1000, null)
+		const r = await E.buildCsv(w, 0, 2, { samplePeriodSec: 1 })
+		assert.equal(r.ok, true)
+		const rows = r.text.split('\n').filter((l) => /^\d+,/.test(l))
+		assert.equal(rows[0], '0,0,1000,,', '电压未知时功率与电压列留空：' + rows[0])
+		assert.equal(r.unknownVolts, 2, '要统计出多少样点电压未知')
+	}
+
 	// ---- 导出服务：超限时既不调 saveFile 也不写文件 ----
 	{
 		let saved = 0

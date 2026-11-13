@@ -105,6 +105,7 @@
 		let gaps = 0
 		let missing = 0
 		let dropped = 0
+		let unknownVolts = 0
 		const t0 = plan.requestedSamples
 		const push = function (text) {
 			parts.push(text)
@@ -119,16 +120,20 @@
 				push('# gap ' + ev.kind + ' ' + ev.lo + '..' + ev.hi + '\n')
 				return
 			}
-			const volts = ev.volts > 0 ? ev.volts : 0
+			// 每一行用该样点**当时**的源电压（块内可以分段）；电压未知就留空列，功率也不编
+			const volts = ev.volts == null ? null : ev.volts
 			const vals = ev.values
 			let buf = ''
 			for (let k = 0; k < vals.length; k++) {
 				const li = ev.lo + k
 				const v = vals[k]
 				if (!isFinite(v)) continue
-				buf += li + ',' + num((li - start) * per) + ',' + num(v) + ',' + num(v * volts) + ',' + num(volts * 1000) + '\n'
+				const powerCol = volts == null ? '' : num(v * volts)
+				const voltCol = volts == null ? '' : num(volts * 1000)
+				buf += li + ',' + num((li - start) * per) + ',' + num(v) + ',' + powerCol + ',' + voltCol + '\n'
 			}
 			push(buf)
+			if (volts == null) unknownVolts += ev.hi - ev.lo
 		})
 		if (walk && walk.aborted) {
 			// 导出期间会话被清空 / 重新采集 / 导入：前后数据不属于同一次采集，整份作废
@@ -146,7 +151,11 @@
 				plan: plan,
 			}
 		}
-		return { ok: true, text: parts.join(''), bytes: size, plan: plan, gaps: gaps, missing: missing, dropped: dropped, samples: t0 }
+		return {
+			ok: true, text: parts.join(''), bytes: size, plan: plan,
+			gaps: gaps, missing: missing, dropped: dropped, samples: t0,
+			unknownVolts: unknownVolts,
+		}
 	}
 
 	/** 摘要导出（JSON）：含缺口数与口径，便于归档 */
