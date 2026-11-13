@@ -459,5 +459,75 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 		assert.equal(bad.unavailableReason, 'samples_unavailable')
 	}
 
+	// ---- N13：分析必须给出平方和与 RMS ----
+	{
+		const w = makeWave({ periodSec: 1, voltageV: 3.3 })
+		w.push(1000)
+		w.push(1000)
+		const pack = await P.buildPack({ wave: w, range: { a: 0, b: 1, source: 'window' }, samplePeriodSec: 1 })
+		assert.equal(pack.basic.n, 2)
+		assert.equal(pack.basic.rms, 1000, 'RMS 应为 1000 µA：' + pack.basic.rms)
+		assert.equal(pack.basic.sumSq, 2000000, '平方和应为 2×1000²：' + pack.basic.sumSq)
+		assert.equal(pack.basic.avg, 1000)
+		// 非恒定电流也要对
+		const w2 = makeWave({ periodSec: 1, voltageV: 3.3 })
+		w2.push(0)
+		w2.push(2000)
+		const p2 = await P.buildPack({ wave: w2, range: { a: 0, b: 1, source: 'window' }, samplePeriodSec: 1 })
+		assert.equal(p2.basic.sumSq, 4000000)
+		assert.equal(p2.basic.rms, Math.sqrt(2000000))
+	}
+
+	// ---- N14：精确积分不依赖回读缓存还能容纳整段（40 块、chunkSize 16、ramCapSamples 16） ----
+	{
+		const disk = new Map()
+		const store = {
+			init: async () => {}, getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				await new Promise(function (r) { setTimeout(r, 0) })
+				const v = disk.get(id)
+				if (!v) throw new Error('gone')
+				return new Float32Array(v) // 返回副本：证明回读值不依赖调用方缓存
+			},
+			removeChunk: async (id) => { disk.delete(id) },
+			clearSession: async () => { disk.clear() },
+		}
+		const w = W.createWave({ store: store, chunkSize: 16, ramCapSamples: 16, voltage: () => 3.3, samplePeriod: () => 1 })
+		// 40 块 × 16 点：每块前八点 1000 µA、后八点 0
+		const N = 640
+		for (let b = 0; b < 40; b++) {
+			for (let k = 0; k < 16; k++) w.push(k < 8 ? 1000 : 0)
+			await new Promise(function (r) { setTimeout(r, 0) })
+		}
+		await new Promise(function (r) { setTimeout(r, 120) })
+		w.clearHydrateCache()
+		assert.ok(w.chunks.filter((c) => c.state === 'cold').length >= 30, '应大部分是冷块：' + w.chunks.filter((c) => c.state === 'cold').length)
+		// 范围 1..639（首尾都是部分块）：有效左端点 1..638
+		let expectCharge = 0
+		for (let li = 1; li <= 638; li++) {
+			expectCharge += (li % 16) < 8 ? 1000 : 0
+		}
+		const pack = await P.buildPack({ wave: w, range: { a: 1, b: 639, source: 'selection' }, samplePeriodSec: 1 })
+		assert.equal(pack.complete, true, '全部块都能回读 → 分析必须完整')
+		assert.equal(pack.missing, 0)
+		assert.ok(Math.abs(pack.measure.chargeUC - expectCharge) < 1e-6,
+			'精确积分必须覆盖整段（' + expectCharge + ' µC）：' + pack.measure.chargeUC)
+		assert.ok(Math.abs(pack.measure.chargeUC - 319000) < 1e-6, '应为 319000 µC：' + pack.measure.chargeUC)
+		// 游标同样可用
+		const m = await P.measureCursorsExact(w, 1, 639, { samplePeriodSec: 1 })
+		assert.equal(m.ready, true, '游标 ready 必须为 true')
+		assert.equal(m.complete, true)
+		assert.ok(Math.abs(m.chargeUC - 319000) < 1e-6, '游标电量：' + m.chargeUC)
+		assert.equal(m.missing, 0)
+		// 块读不到时：必须标不完整，不能谎称完整
+		disk.clear()
+		w.clearHydrateCache()
+		const bad = await P.buildPack({ wave: w, range: { a: 1, b: 639, source: 'selection' }, samplePeriodSec: 1 })
+		assert.equal(bad.complete, false, '缺块 → 不完整')
+		assert.equal(bad.measure.ready, false)
+		assert.equal((await P.measureCursorsExact(w, 1, 639, { samplePeriodSec: 1 })).ready, false)
+	}
+
 	console.log('power-panels: ok')
 })().catch((e) => { console.error(e); process.exit(1) })

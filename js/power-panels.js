@@ -194,19 +194,21 @@
 		if (b < a) { const t = a; a = b; b = t }
 		const total = wave.total()
 		if (total < 1 || b > total - 1 || a < 0) return out
-		const hyd = await wave.hydrateRange(a, b + 1)
-		if (hyd && hyd.aborted) { out.aborted = true; return out }
-		out.missing = hyd ? hyd.missing : 0
-		out.dropped = hyd ? hyd.dropped : 0
-		out.gaps = hyd ? hyd.gaps : 0
-		const r = wave.integrateRange(a, b + 1, { samplePeriodSec: per })
+		// 流式精确积分：逐块回读即累加，与缓存容量无关
+		const r = await wave.integrateExactAsync(a, b + 1, { samplePeriodSec: per })
+		if (r.aborted || r.ok === false && r.missing > 0 && r.n === 0) {
+			if (r.aborted) { out.aborted = true; return out }
+		}
+		out.missing = r.missing || 0
+		out.dropped = r.dropped || 0
+		out.gaps = r.gaps || 0
 		out.a = a
 		out.b = b
 		out.samples = r.n
-		out.segments = r.segments
+		out.segments = r.segments || 0
 		out.wallSec = per > 0 ? (b - a) * per : 0
 		out.durSec = r.durSec
-		out.gapRatio = out.wallSec > 0 ? Math.max(0, 1 - out.durSec / out.wallSec) : 0
+		out.gapRatio = out.wallSec > 0 ? Math.max(0, 1 - r.durSec / out.wallSec) : 0
 		out.avgI = r.n ? r.sumI / r.n : 0
 		out.minI = r.minI
 		out.maxI = r.maxI
@@ -219,7 +221,6 @@
 		out.voltsUnknown = r.voltsUnknown
 		out.complete = out.missing === 0 && out.dropped === 0 && !r.approximate
 		out.ready = out.complete && r.n > 0
-		// 端点电流只用真值
 		const exact = typeof wave.iAtExact === 'function' ? wave.iAtExact : function () { return null }
 		out.iA = exact(a)
 		out.iB = exact(b)
@@ -389,14 +390,36 @@
 		const lo0 = Math.min(a0, b0)
 		const hi0 = Math.max(a0, b0)
 		if (hi0 - lo0 < 1) return out
-		// 1) 先把区间内所有冷块读进内存（精确路径），拿不到就如实记 missing
-		const hyd = await wave.hydrateRange(lo0, hi0 + 1)
-		if (hyd && hyd.aborted) { out.aborted = true; return out }
-		out.missing = hyd ? hyd.missing : 0
-		out.dropped = hyd ? hyd.dropped : 0
-		out.gaps = hyd ? hyd.gaps : 0
-		// 2) 统计与积分：与摘要 / 游标同一个实现（左端点逐间隔）
-		const integ = wave.integrateRange(lo0, hi0 + 1, { samplePeriodSec: per })
+		// 一次流式遍历：逐块「回读 → 立刻累加 + 交付」，所以与回读缓存容量无关。
+		const maxKeep = opts.maxSamples > 0 ? opts.maxSamples : MAX_SAMPLES_DEFAULT
+		let curSeg = null
+		const segsOut = []
+		const flushSeg = function () {
+			if (curSeg && curSeg.n > 0) segsOut.push(curSeg)
+			curSeg = null
+		}
+		const walked = await wave.walkExactWithAcc(lo0, hi0 + 1, function (ev) {
+			if (ev.kind !== 'samples') {
+				flushSeg()
+				return
+			}
+			const cnt = ev.hi - ev.lo
+			out.voltRuns++
+			if (!curSeg) curSeg = { lo: ev.lo, hi: ev.hi, n: 0, values: [], step: 1 }
+			curSeg.hi = ev.hi
+			curSeg.n += cnt
+			// 整段累积（跨块拼接），超出容量才统一抽稀并标 partial
+			if (!curSeg.truncated && curSeg.n > maxKeep) curSeg.truncated = true
+			if (!curSeg.truncated) curSeg.values.push(Float32Array.from(ev.values))
+		}, per)
+		const summary = walked ? walked.summary : null
+		const integ = walked ? walked.integral : null
+		if (!summary || !integ) return out
+		if (summary.aborted) { out.aborted = true; return out }
+		flushSeg()
+		out.missing = summary.missing
+		out.dropped = summary.dropped
+		out.gaps = summary.gaps
 		out.samples = integ.n
 		out.volts = integ.volts
 		out.voltsUnknown = integ.voltsUnknown
@@ -404,55 +427,25 @@
 		out.chargeUC = integ.chargeUC
 		// 内部 µW·s → 对外 µWh
 		out.energyUWh = integ.voltsUnknown ? null : integ.energyUW_s / 3600
-		out.segments = []
-		out.voltsMixed = false
 		out.basic = integ.n ? {
 			n: integ.n,
 			avg: integ.sumI / integ.n,
 			min: integ.minI,
 			max: integ.maxI,
 			sum: integ.sumI,
-			sumSq: 0,
+			sumSq: integ.sumSq,
 			pp: integ.maxI - integ.minI,
-			rms: 0,
+			rms: Math.sqrt(integ.sumSq / integ.n),
 			chargeUC: integ.chargeUC,
 		} : null
-		// 3) 逐段的样点样本：**跨块累积**整段（不是单个块事件），超出容量才回落成「抽稀 + partial」
-		const maxKeep = opts.maxSamples > 0 ? opts.maxSamples : MAX_SAMPLES_DEFAULT
-		let curSeg = null
-		let totalRaw = 0
-		const segsOut = []
-		const flushSeg = function () {
-			if (curSeg && curSeg.n > 0) segsOut.push(curSeg)
-			curSeg = null
-		}
-		const walk = await wave.walkExact(lo0, hi0 + 1, function (ev) {
-			if (ev.kind !== 'samples') {
-				flushSeg()
-				return
-			}
-			const cnt = ev.hi - ev.lo
-			totalRaw += cnt
-			if (!curSeg) curSeg = { lo: ev.lo, hi: ev.hi, n: 0, values: [], step: 1 }
-			curSeg.hi = ev.hi
-			curSeg.n += cnt
-			// 先整段累积；超过容量再统一抽稀（同一段内跨块拼接，绝不只留第一块）
-			if (curSeg.values.length < maxKeep) {
-				curSeg.values.push(Float32Array.from(ev.values))
-			} else {
-				curSeg.truncated = true
-			}
-		})
-		if (walk && walk.aborted) { out.aborted = true; return out }
-		flushSeg()
-		// 合并每段的数组，并在超容量时按全段统一抽稀
+		// 逐段合并样本，并在超容量时按全段统一抽稀
 		let longest = null
 		for (let s = 0; s < segsOut.length; s++) {
 			const seg = segsOut[s]
-			let total = 0
-			for (let k = 0; k < seg.values.length; k++) total += seg.values[k].length
+			let totalCountOfSeg = 0
+			for (let k = 0; k < seg.values.length; k++) totalCountOfSeg += seg.values[k].length
 			let step = 1
-			if (seg.truncated || total > maxKeep) {
+			if (seg.truncated || totalCountOfSeg > maxKeep) {
 				out.partial = true
 				step = Math.max(1, Math.ceil(seg.n / maxKeep))
 			}
@@ -478,15 +471,14 @@
 		out.longest = longest
 		out.partial = out.partial || out.missing > 0 || out.dropped > 0
 		out.ok = integ.n > 0
-		out.complete = out.missing === 0 && out.dropped === 0 && !out.aborted
-		// 4) 第二遍：边沿（段内配对，绝不跨段）
+		out.complete = out.missing === 0 && out.dropped === 0 && !out.aborted && !integ.approximate
+		// 第二遍：边沿（段内配对，绝不跨段）
 		if (opts.edges && out.ok && out.complete) {
 			if (!isFinite(opts.thr) && out.basic) opts = Object.assign({}, opts, { thr: (out.basic.min + out.basic.max) * 0.5 })
 			if (!(opts.hyst > 0) && out.basic) opts = Object.assign({}, opts, { hyst: Math.max(out.basic.pp * 0.02, Math.abs(opts.thr) * 0.005, 1e-9) })
 			out.edges = await scanEdgesExact(wave, lo0, hi0 + 1, per, opts)
 			if (out.edges && out.edges.aborted) { out.aborted = true; out.edges = null }
 		}
-		void totalRaw
 		return out
 	}
 
