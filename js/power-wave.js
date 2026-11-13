@@ -303,8 +303,12 @@
 		async function walkExact(start, end, visit) {
 			const a0 = Math.max(0, Math.min(totalCount, start | 0))
 			const b0 = Math.max(a0, Math.min(totalCount, end | 0))
-			const summary = { samples: 0, missing: 0, dropped: 0, gaps: 0 }
+			const summary = { samples: 0, missing: 0, dropped: 0, gaps: 0, aborted: false }
 			if (b0 <= a0) return summary
+			// 绑定开始时的会话 epoch：遍历跨 await，期间清空 / 重新采集 / 导入都会推进 epoch。
+			// 一旦变化就必须立刻取消（否则会把旧会话前半段和新会话后半段拼进同一份结果）。
+			const epoch = waveEpoch
+			const changed = function () { return epoch !== waveEpoch }
 			// 先把断点算好并按位置排序：断点必须与样点**交错**交付，
 			// 否则调用方（分析 / 导出）无法知道哪一处该开新段。
 			const breaks = []
@@ -348,6 +352,11 @@
 					if (hi > lo) {
 						flushBreaksBefore(lo)
 						const buf = await hydrateChunk(ch)
+						if (changed()) {
+							// 会话已经换了：这份结果没有意义，交给调用方丢弃
+							summary.aborted = true
+							return summary
+						}
 						if (!buf) {
 							summary.missing += hi - lo
 							if (visit) visit({ kind: 'missing', lo: lo, hi: hi })
@@ -368,8 +377,14 @@
 					if (base >= segB) break
 				}
 			}
-			flushBreaksBefore(b0)
+			if (changed()) summary.aborted = true
+			if (!summary.aborted) flushBreaksBefore(b0)
 			return summary
+		}
+
+		/** 当前会话序号：调用方可据此判断一次异步分析是否还有效 */
+		function epoch() {
+			return waveEpoch
 		}
 
 		/**
@@ -1053,6 +1068,7 @@
 			iAt: ringIAt,
 			iAtExact: iAtExact,
 			walkExact: walkExact,
+			epoch: epoch,
 			hydrateChunk: hydrateChunk,
 			droppedRanges: droppedRanges,
 			chunkVolts: chunkVolts,

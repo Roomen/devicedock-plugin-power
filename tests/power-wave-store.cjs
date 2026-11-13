@@ -98,6 +98,7 @@ function load(store, opts) {
 		setCap: wave.setRamCap,
 		frameReset: wave.frameReset,
 		env: env,
+		wave: wave,
 	}
 	return { T, logs, stops: () => stops }
 }
@@ -399,6 +400,71 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		env.voltageV = 5
 		const st2 = T.calcStats(0, 8)
 		assert.ok(Math.abs(st2.energyUWh - before) < 1e-12, '改当前电压不能改写历史能量')
+	}
+
+	{
+		// N2：精确遍历绑定会话 epoch——遍历期间清空 / 重新采集必须取消，不能拼两段数据
+		const disk = new Map()
+		const slowStore = {
+			init: async () => {},
+			getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				// 回读是慢的：遍历会在这里挂住，正好留出「中途重置会话」的窗口
+				await new Promise(function (r) { setTimeout(r, 12) })
+				const v = disk.get(id)
+				if (!v) throw new Error('gone')
+				return v
+			},
+			removeChunk: async (id) => { disk.delete(id) },
+			clearSession: async () => { disk.clear() },
+		}
+		const w = Wave.createWave({ store: slowStore, chunkSize: 16, ramCapSamples: 16, voltage: () => 3.3, samplePeriod: () => 1 })
+		// 128 点 → 多块冷数据，遍历要分很多次 await
+		for (let i = 0; i < 128; i++) w.push(100)
+		await new Promise(function (r) { setTimeout(r, 80) })
+		w.clearHydrateCache()
+		const seen = []
+		const done = w.walkExact(0, 128, function (ev) {
+			if (ev.kind === 'samples') seen.push({ lo: ev.lo, hi: ev.hi })
+		})
+		await new Promise(function (r) { setTimeout(r, 20) })
+		// 中途清空并重新采集：遍历必须作废，不能把旧块和新数据拼在一份结果里
+		w.reset()
+		for (let i = 0; i < 32; i++) w.push(900)
+		const summary = await done
+		assert.equal(summary.aborted, true, '会话变化后必须取消遍历')
+		assert.ok(seen.length < 8, '不该把整个区间的旧数据都读完：' + seen.length)
+		assert.equal(w.total(), 32, '新会话的数据不受影响')
+
+		// 导出同理：期间重置会话必须整份作废（不能交出半新半旧的文件）
+		const E = require('../js/power-export.js')
+		const disk2 = new Map()
+		const slowStore2 = {
+			init: async () => {},
+			getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk2.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				await new Promise(function (r) { setTimeout(r, 12) })
+				const v = disk2.get(id)
+				if (!v) throw new Error('gone')
+				return v
+			},
+			removeChunk: async (id) => { disk2.delete(id) },
+			clearSession: async () => { disk2.clear() },
+		}
+		const w2 = Wave.createWave({ store: slowStore2, chunkSize: 16, ramCapSamples: 16, voltage: () => 3.3, samplePeriod: () => 1 })
+		for (let i = 0; i < 128; i++) w2.push(100)
+		await new Promise(function (r) { setTimeout(r, 80) })
+		w2.clearHydrateCache()
+		const csvPromise = E.buildCsv(w2, 0, 128, { samplePeriodSec: 1 })
+		await new Promise(function (r) { setTimeout(r, 20) })
+		w2.reset()
+		for (let i = 0; i < 32; i++) w2.push(900)
+		const csv = await csvPromise
+		assert.equal(csv.ok, false, '导出期间会话变化必须失败')
+		assert.equal(csv.code, 'session_changed')
+		assert.equal(csv.text, undefined, '不能交出半新半旧的文件')
 	}
 
 	console.log('power-wave-store: ok')

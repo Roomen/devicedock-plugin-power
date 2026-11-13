@@ -78,13 +78,14 @@
 			gaps: 0,
 			volts: 0,
 			voltsMixed: false,
+			aborted: false,
 		}
 		// 每段先收原始值（Float32Array 拼装），再按全区间统一抽稀比降采样，保证速率一致
 		let rawTotal = 0
 		const runs = []
 		// 断点事件之后的第一个样点必须开新段：缺口是零宽的，按「下标相接」判定会把它吞掉
 		let newRun = true
-		await wave.walkExact(lo0, hi0 + 1, function (ev) {
+		const summary = await wave.walkExact(lo0, hi0 + 1, function (ev) {
 			if (ev.kind === 'samples') {
 				if (ev.mixedVolts) out.voltsMixed = true
 				rawTotal += ev.hi - ev.lo
@@ -124,6 +125,11 @@
 				newRun = true
 			}
 		})
+		if (summary && summary.aborted) {
+			// 遍历期间会话变了：整份结果作废（不能让旧分析结果覆盖新会话）
+			out.aborted = true
+			return out
+		}
 		if (!rawTotal) return out
 		const step = rawTotal > maxPts ? Math.ceil(rawTotal / maxPts) : 1
 		let voltNum = 0

@@ -110,7 +110,7 @@
 			parts.push(text)
 			size += text.length
 		}
-		await wave.walkExact(start, end, function (ev) {
+		const walk = await wave.walkExact(start, end, function (ev) {
 			if (ev.kind !== 'samples') {
 				// 缺口 / 淘汰 / 回读失败：写标记行（消费方据此知道这段不连续，不会当成连续能流）
 				if (ev.kind === 'gap') gaps++
@@ -130,6 +130,14 @@
 			}
 			push(buf)
 		})
+		if (walk && walk.aborted) {
+			// 导出期间会话被清空 / 重新采集 / 导入：前后数据不属于同一次采集，整份作废
+			return {
+				ok: false, code: 'session_changed',
+				message: '导出期间会话已变化（清空 / 重新采集 / 导入），本次导出已取消，请重试。',
+				plan: plan,
+			}
+		}
 		// 长度复核：按**最终文本**（含 gap 行）判断，而不是按估算
 		if (size > limit) {
 			return {

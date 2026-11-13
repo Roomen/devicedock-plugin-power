@@ -1166,6 +1166,12 @@
 			spikes: true,
 		})
 		if (seq !== analysisSeq) return
+		if (pack && pack.aborted) {
+			// 会话在分析途中变了（清空 / 重新采集 / 导入）：这次结果直接作废
+			analysis.pack = null
+			renderAnalysisPanel(null)
+			return
+		}
 		analysis.pack = pack
 		renderAnalysisPanel(pack)
 	}
