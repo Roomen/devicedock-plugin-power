@@ -9,6 +9,7 @@
 	'use strict'
 	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
 	const tr = I18N.t
+	const msg = I18N.msg
 
 	const BYTES_PER_SAMPLE = 4
 	// 每个块描述符、字符串与完整包络按 4 KiB 预留；这不是 JS 引擎堆的精确测量。
@@ -118,7 +119,7 @@
 				return new Float32Array(CHUNK_SIZE)
 			} catch (e) {
 				growBlocked = true
-				log(tr('wav.alloc_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+				log(msg('wav.alloc_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				return null
 			}
 		}
@@ -243,7 +244,7 @@
 				return got
 			}).catch(function (e) {
 				if (epoch !== waveEpoch) return null
-				log(tr('wav.cold_read_failed', { id: ch.id, err: (e && e.message ? e.message : e) }), 'warn')
+				log(msg('wav.cold_read_failed', { id: ch.id, err: (e && e.message ? e.message : e) }), 'warn')
 				return null
 			}).finally(function () {
 				hydrateInFlight--
@@ -515,7 +516,7 @@
 			if (isFinite(rawBudgetBytes) && diskUsedBytes() + rawBytes > rawBudgetBytes) return false
 			// 归档队列里的数据仍在内存里：不能让队列无限长
 			if (archiveQueuedSamples + ch.n > archiveQueueMax()) {
-				triggerStorageStop(tr('wav.archive_lagging', { n: archiveQueue.length }))
+				triggerStorageStop(msg('wav.archive_lagging', { n: archiveQueue.length }))
 				return false
 			}
 			const samples = ch.buf.subarray(0, ch.n)
@@ -533,7 +534,7 @@
 			archiveQueue.push({ ch: ch, samples: samples })
 			if (!ramArchiveNoted) {
 				ramArchiveNoted = true
-				log(tr('wav.archive_start'))
+				log(msg('wav.archive_start'))
 			}
 			pumpArchiveQueue()
 			return true
@@ -561,7 +562,7 @@
 					if (res && res.evicted && res.evicted.length) noteEvictions(res.evicted)
 				} catch (e) {
 					if (epoch !== waveEpoch) return
-					const msg = e && e.message ? e.message : String(e)
+					const detail = e && e.message ? e.message : String(e)
 					// 写失败：尽量把数据救回 RAM，避免丢细节
 					if (!ch.buf && ch.state === 'pending') {
 						try {
@@ -574,11 +575,11 @@
 							ch.state = 'dropped'
 							droppedSamples += ch.n
 							noteGap(ch.base)
-							log(tr('wav.archive_lost'), 'error')
+							log(msg('wav.archive_lost'), 'error')
 						}
 					}
-					log(tr('wav.archive_failed', { err: msg }), 'error')
-					triggerStorageStop(tr('wav.archive_failed_stop'))
+					log(msg('wav.archive_failed', { err: detail }), 'error')
+					triggerStorageStop(msg('wav.archive_failed_stop'))
 				} finally {
 					// 含正在压缩/写入的块；它的缓冲到这里才可释放
 					if (epoch === waveEpoch) archiveQueuedSamples = Math.max(0, archiveQueuedSamples - samples.length)
@@ -609,7 +610,7 @@
 				n += ch.n
 			}
 			if (n > 0) {
-				log(tr('wav.evicted', { blocks: list.length, n: n }), 'warn')
+				log(msg('wav.evicted', { blocks: list.length, n: n }), 'warn')
 				clearBucketCache()
 				scheduleUI()
 			}
@@ -620,12 +621,12 @@
 			needSamples = needSamples || 1
 			while (hotCount + needSamples > RING_CAP_MAX && !growBlocked) {
 				if (!enqueueOldestHotArchive()) {
-					triggerStorageStop(tr('wav.hot_full_stop'))
+					triggerStorageStop(msg('wav.hot_full_stop'))
 					return false
 				}
 			}
 			if (growBlocked && hotCount + needSamples > RING_CAP_MAX) {
-				triggerStorageStop(tr('wav.oom_stop'))
+				triggerStorageStop(msg('wav.oom_stop'))
 				return false
 			}
 			return true
@@ -640,14 +641,14 @@
 			let ch = waveChunks.length ? waveChunks[waveChunks.length - 1] : null
 			if (!ch || ch.state !== 'hot' || !ch.buf || ch.n >= CHUNK_SIZE) {
 				if (waveChunks.length >= metadataChunkLimit()) {
-					triggerStorageStop(tr('wav.index_full_stop'))
+					triggerStorageStop(msg('wav.index_full_stop'))
 					return false
 				}
 				ch = newHotChunk()
 				if (!ch) {
 					if (enqueueOldestHotArchive()) ch = newHotChunk()
 					if (!ch) {
-						triggerStorageStop(tr('wav.alloc_stop'))
+						triggerStorageStop(msg('wav.alloc_stop'))
 						return false
 					}
 				}
@@ -688,7 +689,7 @@
 					const j = archiveQueue[i]
 					if (j && j.ch) pts += j.ch.n || 0
 				}
-				log(tr('wav.clear_drop', { blocks: archiveQueue.length, n: pts }), 'warn')
+				log(msg('wav.clear_drop', { blocks: archiveQueue.length, n: pts }), 'warn')
 				archiveQueue.length = 0
 			}
 			archiveQueuedSamples = 0

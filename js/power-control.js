@@ -13,6 +13,7 @@
 	const VIEW = global.PowerView || (typeof require === 'function' ? require('./power-view.js') : null)
 	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
 	const tr = I18N.t
+	const msg = I18N.msg
 
 	const DEFAULTS = {
 		rxDrainMs: 50,
@@ -99,10 +100,10 @@
 		function runOp(fn, o) {
 			o = o || {}
 			if (o.failFast && opDepth > 0) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_running') })
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_running'), ref: msg('ctl.busy_running') })
 			}
 			if (opDepth >= opts.maxQueueDepth) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_queue') })
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_queue'), ref: msg('ctl.busy_queue') })
 			}
 			opDepth++
 			const run = opChain.then(fn, fn)
@@ -260,14 +261,14 @@
 						if (feedAcq(ua, 'start')) {
 							acq.storeEnabled = true
 							acq.startLatched = true
-							log(tr('ctl.acq_start_hit'), 'success')
+							log(msg('ctl.acq_start_hit'), 'success')
 						}
 						continue
 					}
 					if (ingest(outs[k].tMs, ua, s)) stored++
 					// 停沿：入库之后生效，STOP 排到回调外异步发
 					if (acq && acq.stop !== 'off' && acq.storeEnabled && feedAcq(ua, 'stop')) {
-						requestStop(tr('ctl.acq_stop_hit'))
+						requestStop(msg('ctl.acq_stop_hit'))
 						break
 					}
 				}
@@ -301,7 +302,7 @@
 				if (!sampling) return
 				// stopSampling 内部只发一条 STOP，失败会自己记日志
 				stopSampling().catch(function (e) {
-					log(tr('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
+					log(msg('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				})
 			}, 0)
 		}
@@ -342,7 +343,7 @@
 			try {
 				onSampleStored(wave.total() - 1, tMs)
 			} catch (e) {
-				log(tr('ctl.anchor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+				log(msg('ctl.anchor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 			}
 			return true
 		}
@@ -351,7 +352,7 @@
 		function errText(w) {
 			const e = w && w.error
 			if (!e) return ''
-			return tr('ctl.err_detail', { msg: (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') })
+			return msg('ctl.err_detail', { msg: (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') })
 		}
 
 		function writeRaw(bytes, note) {
@@ -365,73 +366,73 @@
 		 */
 		async function applyVoltageMv(mv, guard) {
 			if (mv == null || !isFinite(mv)) {
-				log(tr('ctl.voltage_required'), 'error')
+				log(msg('ctl.voltage_required'), 'error')
 				return { ok: false, stale: false }
 			}
 			const clamped = Math.max(PROTO.VDD_LOW_MV, Math.min(PROTO.VDD_HIGH_MV, Math.round(mv)))
 			if (!isConnected()) {
 				toggleVoltageSource(clamped)
-				log(tr('ctl.voltage_pending', { mv: clamped }))
+				log(msg('ctl.voltage_pending', { mv: clamped }))
 				return { ok: false, stale: false }
 			}
 			if (guardStep(guard)) return { ok: false, stale: false }
 			const w = await writeRaw(PROTO.cmdRegulatorSet(clamped), 'REGULATOR ' + clamped + ' mV')
 			if (!w.ok) {
-				if (!w.stale) log(tr('ctl.voltage_write_failed_log'), 'error')
+				if (!w.stale) log(msg('ctl.voltage_write_failed_log'), 'error')
 				onChange()
 				return { ok: false, stale: !!w.stale }
 			}
 			if (voltageMv !== clamped && sampling) voltageChanges++
 			toggleVoltageSource(clamped)
-			log(tr('ctl.voltage_set', { mv: clamped }), 'success')
+			log(msg('ctl.voltage_set', { mv: clamped }), 'success')
 			return { ok: true, stale: false }
 		}
 
 		async function doPowerOn(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 			const mv = readVoltageMv()
 			if (mv == null || !isFinite(mv) || mv < PROTO.VDD_LOW_MV) {
-				log(tr('ctl.voltage_required_open'), 'error')
-				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown') }
+				log(msg('ctl.voltage_required_open'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown'), ref: msg('ctl.voltage_unknown') }
 			}
 			const gen = genOf()
 			const v = await applyVoltageMv(mv, guard)
 			if (!v.ok) {
-				if (v.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed_voltage'), executed: 'unknown', powered: powerPayload() }
-				log(tr('ctl.power_on_aborted'), 'error')
-				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), voltageMv: voltageMv, powered: powerPayload() }
+				if (v.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed_voltage'), ref: msg('ctl.power_on_conn_changed_voltage'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_on_aborted'), 'error')
+				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), ref: msg('ctl.power_on_voltage_failed'), voltageMv: voltageMv, powered: powerPayload() }
 			}
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.power_on_cancelled'), executed: false, powered: powerPayload() }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.power_on_cancelled'), ref: msg('ctl.power_on_cancelled'), executed: false, powered: powerPayload() }
 			if (!stillSameConn(gen)) {
-				return { ok: false, code: 'disconnected', message: tr('ctl.power_on_device_changed'), executed: false, powered: powerPayload() }
+				return { ok: false, code: 'disconnected', message: tr('ctl.power_on_device_changed'), ref: msg('ctl.power_on_device_changed'), executed: false, powered: powerPayload() }
 			}
 			const w = await writeRaw(PROTO.cmdDutPower(true), tr('ctl.note_power_on'))
 			if (!w.ok) {
 				// 连接已经变了：这次结果不属于新连接，不能改它的供电状态
-				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed'), executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed'), ref: msg('ctl.power_on_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				// 同一连接写失败：不知道设备收没收到，标未知
 				markPowered(null, 'unknown')
-				log(tr('ctl.power_on_write_failed_log'), 'error')
-				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_on_write_failed_log'), 'error')
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), ref: msg('ctl.power_on_write_failed'), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(true, 'commanded')
-			log(tr('ctl.power_on_done'), 'success')
+			log(msg('ctl.power_on_done'), 'success')
 			return { ok: true, changed: true, powered: powerPayload(), voltageMv: voltageMv }
 		}
 
 		async function doPowerOff(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.cancelled_nothing_done'), executed: false, powered: powerPayload() }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.cancelled_nothing_done'), ref: msg('ctl.cancelled_nothing_done'), executed: false, powered: powerPayload() }
 			const gen = genOf()
 			const w = await writeRaw(PROTO.cmdDutPower(false), tr('ctl.note_power_off'))
 			if (!w.ok) {
-				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), ref: msg('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				markPowered(null, 'unknown')
-				log(tr('ctl.power_off_write_failed_log'), 'error')
-				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_off_write_failed_log'), 'error')
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), ref: msg('ctl.power_off_write_failed'), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(false, 'commanded')
-			log(tr('ctl.power_off_done'))
+			log(msg('ctl.power_off_done'))
 			return { ok: true, changed: true, powered: powerPayload() }
 		}
 
@@ -451,7 +452,7 @@
 				metaBuf = ''
 				modifiers = PROTO.defaultModifiers()
 				modifiersOk = false
-				log(tr('ctl.meta_write_failed', { err: errText(mw) }), 'error')
+				log(msg('ctl.meta_write_failed', { err: errText(mw) }), 'error')
 				onChange()
 				return false
 			}
@@ -469,13 +470,13 @@
 				metaBuf = ''
 				if (link && typeof link.setConverterModifiers === 'function') link.setConverterModifiers(modifiers)
 				const saved = modifiers.savedVddMv || 0
-				log(tr('ctl.meta_done', { details:
+				log(msg('ctl.meta_done', { details:
 					(modifiers.deviceSn ? ' · SN ' + modifiers.deviceSn : '') +
 					(saved ? ' · VDD ' + saved + ' mV' : '') +
 					(modifiers.Calibrated != null ? ' · Calibrated=' + modifiers.Calibrated : '') }), 'success')
 				if (saved >= PROTO.VDD_LOW_MV && saved <= PROTO.VDD_HIGH_MV) toggleVoltageSource(Math.round(saved))
 				else {
-					log(tr('ctl.meta_no_vdd'), 'warn')
+					log(msg('ctl.meta_no_vdd'), 'warn')
 					toggleVoltageSource(null)
 				}
 				return true
@@ -484,7 +485,7 @@
 			modifiers = PROTO.defaultModifiers()
 			modifiersOk = false
 			metaBuf = ''
-			log(tr('ctl.meta_timeout'), 'warn')
+			log(msg('ctl.meta_timeout'), 'warn')
 			onChange()
 			return false
 		}
@@ -517,21 +518,21 @@
 		}
 
 		async function startSampling(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 			if (sampling) return { ok: true, changed: false, sampling: true }
 			const mv = readVoltageMv()
 			if (!isFinite(mv) || mv == null || mv < PROTO.VDD_LOW_MV) {
-				log(tr('ctl.voltage_required_start'), 'error')
-				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown') }
+				log(msg('ctl.voltage_required_start'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown'), ref: msg('ctl.voltage_unknown') }
 			}
 			// 先 STOP → 排空残留 → 再 START
 			link.setDrop(true)
 			const gen0 = genOf()
 			await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
 			await drainSampleRx(opts.rxDrainMs)
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), ref: msg('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
 			}
 
 			const baseHz = deviceStreamHz > 1000 ? deviceStreamHz : PROTO.NOMINAL_BASE_HZ
@@ -542,13 +543,13 @@
 				try {
 					await store.init()
 				} catch (e) {
-					log(tr('ctl.store_init_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+					log(msg('ctl.store_init_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				}
 			}
 			// 存储初始化等 await 之后重新确认：取消 / 断开 / 换设备都不能继续
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), ref: msg('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
 			}
 
 			link.resetParser(true)
@@ -567,7 +568,7 @@
 				acq.storeEnabled = acq.start === 'off'
 				acq.preMin = Infinity
 				acq.preMax = -Infinity
-				if (acq.start !== 'off') log(tr('ctl.acq_armed', { edge: tr('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : tr('ctl.level_auto') }))
+				if (acq.start !== 'off') log(msg('ctl.acq_armed', { edge: tr('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : tr('ctl.level_auto') }))
 			}
 			stopScheduled = false
 			sampling = true
@@ -576,18 +577,18 @@
 			const startW = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START')
 			if (!startW.ok) {
 				if (startW.stale) {
-					return { ok: false, code: 'disconnected', message: tr('ctl.start_conn_changed'), executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.start_conn_changed'), ref: msg('ctl.start_conn_changed'), executed: 'unknown' }
 				}
 				sampling = false
 				link.setDrop(true)
-				log(tr('ctl.start_write_failed_log', { err: errText(startW) }), 'error')
+				log(msg('ctl.start_write_failed_log', { err: errText(startW) }), 'error')
 				onChange()
-				return { ok: false, code: 'capture_start_failed', message: tr('ctl.start_write_failed', { err: errText(startW) }) }
+				return { ok: false, code: 'capture_start_failed', message: tr('ctl.start_write_failed', { err: errText(startW) }), ref: msg('ctl.start_write_failed', { err: errText(startW) }) }
 			}
 			// START 已下发后再接收样点（此前 drop 挡住 STOP 尾包与竞态）
 			link.setDrop(false)
 			const warmMs = targetRateHz > 0 ? Math.round(warmupLeft / targetRateHz * 1000) : 0
-			log(tr('ctl.started', {
+			log(msg('ctl.started', {
 				hz: targetRateHz, mode: tr(recordMode === 'long' ? 'ctl.mode_long' : 'ctl.mode_wave'),
 				ms: warmMs, n: warmupLeft, mods: modifiersOk ? '' : tr('ctl.default_mods'),
 			}), 'success')
@@ -609,7 +610,7 @@
 			if (flushed.remaining > 0) {
 				// 确实排不完的（例如冷存储卡住）：计数 + 标缺口，绝不静默丢
 				noteGap({ reason: 'stop_drain', missedSamples: flushed.remaining, bytes: flushed.remainingBytes })
-				log(tr('ctl.stop_undrained', { n: flushed.remaining }), 'warn')
+				log(msg('ctl.stop_undrained', { n: flushed.remaining }), 'warn')
 			}
 			sampling = false
 			onChange()
@@ -621,12 +622,12 @@
 			}
 			link.resetParser(false)
 			const stopped = !!(wave && wave.storageStop && wave.storageStop())
-			log(tr(stopped ? 'ctl.stopped_storage' : 'ctl.stopped'))
-			if (!stopW.ok) log(tr('ctl.stop_write_failed_log'), 'warn')
+			log(msg(stopped ? 'ctl.stopped_storage' : 'ctl.stopped'))
+			if (!stopW.ok) log(msg('ctl.stop_write_failed_log'), 'warn')
 			onChange()
 			if (stopW.ok) return { ok: true, changed: true, sampling: false }
-			if (stopW.stale) return { ok: false, code: 'disconnected', message: tr('ctl.stop_conn_changed'), executed: 'unknown', sampling: false }
-			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), sampling: false }
+			if (stopW.stale) return { ok: false, code: 'disconnected', message: tr('ctl.stop_conn_changed'), ref: msg('ctl.stop_conn_changed'), executed: 'unknown', sampling: false }
+			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), ref: msg('ctl.stop_write_failed'), sampling: false }
 		}
 
 		// ---- 对外（界面 / 测试）----
@@ -635,7 +636,7 @@
 			return runOp(async function () {
 				const g = await guardStart(guard)
 				if (g) return g
-				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
+				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 				const gen = genOf()
 				// 只有「上次命令」的状态才能跳过；实测 / 未知都不足以代替一次显式命令
 				if (power.source === 'commanded' && power.on === want) {
@@ -643,7 +644,7 @@
 				}
 				const r = want ? await doPowerOn(guard) : await doPowerOff(guard)
 				if (!stillSameConn(gen) && r && r.ok) {
-					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), executed: 'unknown', powered: powerPayload() }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), ref: msg('ctl.op_disconnected'), executed: 'unknown', powered: powerPayload() }
 				}
 				return r
 			}, { failFast: !!guard })
@@ -659,17 +660,17 @@
 						toggleVoltageSource(requested)
 						return { ok: true, pending: true, requestedMv: requested }
 					}
-					return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
+					return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 				}
 				if (!isFinite(requested) || requested < PROTO.VDD_LOW_MV || requested > PROTO.VDD_HIGH_MV) {
-					return { ok: false, code: 'out_of_range', message: tr('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }) }
+					return { ok: false, code: 'out_of_range', message: tr('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }), ref: msg('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }) }
 				}
 				const gen = genOf()
 				const applied = await applyVoltageMv(requested, guard)
 				if (!stillSameConn(gen) || applied.stale) {
-					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), ref: msg('ctl.op_disconnected'), executed: 'unknown' }
 				}
-				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), voltageMv: voltageMv, requestedMv: requested }
+				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), ref: msg('ctl.voltage_not_applied'), voltageMv: voltageMv, requestedMv: requested }
 				return { ok: true, requestedMv: requested, appliedMv: voltageMv, clamped: voltageMv !== requested }
 			}, { failFast: !!guard })
 		}
@@ -692,7 +693,7 @@
 		}
 
 		function togglePower() {
-			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') })
+			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') })
 			return setPower(power.on !== true)
 		}
 
@@ -707,20 +708,20 @@
 				pw = await writeRaw(PROTO.cmdAverageStart(), tr('ctl.note_probe_start'))
 				if (!pw || !pw.ok) {
 					probe = null
-					log(tr('ctl.probe_write_failed', { err: errText(pw) }), 'error')
+					log(msg('ctl.probe_write_failed', { err: errText(pw) }), 'error')
 					return null
 				}
 				await new Promise(function (r) { clock.setTimeout(r, opts.probeMs) })
 			} catch (e) {
 				probe = null
-				log(tr('ctl.probe_error', { err: (e && e.message ? e.message : e) }), 'error')
+				log(msg('ctl.probe_error', { err: (e && e.message ? e.message : e) }), 'error')
 				return null
 			}
 			try { await writeRaw(PROTO.cmdAverageStop(), tr('ctl.note_probe_stop')) } catch (e) { /* 忽略 */ }
 			const vals = probe ? probe.vals.slice() : []
 			probe = null
 			if (vals.length < 200) {
-				log(tr('ctl.probe_empty', { ms: opts.probeMs, n: vals.length }), 'warn')
+				log(msg('ctl.probe_empty', { ms: opts.probeMs, n: vals.length }), 'warn')
 				return null
 			}
 			vals.sort(function (a, b) { return a - b })
@@ -833,7 +834,7 @@
 			lastTMs = 0
 			lastTMsValid = false
 			gapPending = false
-			if (wasSampling) log(tr('ctl.session_ended', { reason: reason }), 'warn')
+			if (wasSampling) log(msg('ctl.session_ended', { reason: reason }), 'warn')
 			onChange()
 			return { wasSampling: wasSampling }
 		}
@@ -878,7 +879,7 @@
 		async function importSeries(parsed, o) {
 			o = o || {}
 			if (!parsed || !parsed.ok || !parsed.rows || !parsed.rows.length) {
-				return { ok: false, code: 'empty', message: tr('ctl.import_empty') }
+				return { ok: false, code: 'empty', message: tr('ctl.import_empty'), ref: msg('ctl.import_empty') }
 			}
 			if (sampling) await stopSampling()
 			clearSessionState()
@@ -919,25 +920,25 @@
 					if (wave && typeof wave.waitIdle === 'function') await wave.waitIdle(200)
 					// 每次 await 之后校验会话：变了就停止，绝不把旧导入写进新会话
 					if (epochOf() !== importEpoch) {
-						log(tr('ctl.import_cancelled_log'), 'warn')
+						log(msg('ctl.import_cancelled_log'), 'warn')
 						return {
 							ok: false, code: 'session_changed', cancelled: true,
 							stored: stored, requested: requested, gaps: gapsApplied,
-							message: tr('ctl.import_cancelled', { stored: stored, requested: requested }),
+							message: tr('ctl.import_cancelled', { stored: stored, requested: requested }), ref: msg('ctl.import_cancelled', { stored: stored, requested: requested }),
 						}
 					}
 				}
 			}
 			onChange()
 			if (storageStopped || stored < requested) {
-				log(tr('ctl.import_partial_log', { stored: stored, requested: requested }), 'warn')
+				log(msg('ctl.import_partial_log', { stored: stored, requested: requested }), 'warn')
 				return {
 					ok: false, code: 'incomplete',
 					stored: stored, requested: requested, gaps: gapsApplied,
-					message: tr('ctl.import_partial', { stored: stored, requested: requested }),
+					message: tr('ctl.import_partial', { stored: stored, requested: requested }), ref: msg('ctl.import_partial', { stored: stored, requested: requested }),
 				}
 			}
-			log(tr('ctl.imported', {
+			log(msg('ctl.imported', {
 				n: stored,
 				rate: samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : tr('ctl.period_unknown'),
 				extra: (estimated ? tr('ctl.import_estimated') : '') +

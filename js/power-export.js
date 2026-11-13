@@ -4,6 +4,7 @@
 	'use strict'
 	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
 	const tr = I18N.t
+	const msg = I18N.msg
 
 	// 与宿主 js/plugin-rpc.js 的 LIMITS.maxExportChars 对齐（按字符数计，UTF-8 下 CSV 全是 ASCII）
 	const MAX_EXPORT_BYTES = 8 * 1024 * 1024
@@ -56,7 +57,7 @@
 			return {
 				ok: false, kind: kind, limitBytes: limit, requestedSamples: 0, estimatedBytes: estimate,
 				maxSamples: maxSamples, reason: 'empty',
-				message: tr('exp.empty'),
+				message: tr('exp.empty'), ref: msg('exp.empty'),
 			}
 		}
 		if (estimate > limit) {
@@ -64,7 +65,7 @@
 			return {
 				ok: false, kind: kind, limitBytes: limit, requestedSamples: n, estimatedBytes: estimate,
 				maxSamples: maxSamples, reason: 'too_large',
-				message: tr('exp.too_large_estimate', { size: formatBytes(estimate), limit: formatBytes(limit), n: allowedSec }),
+				message: tr('exp.too_large_estimate', { size: formatBytes(estimate), limit: formatBytes(limit), n: allowedSec }), ref: msg('exp.too_large_estimate', { size: formatBytes(estimate), limit: formatBytes(limit), n: allowedSec }),
 				suggestions: ['shorten_range', 'export_summary'],
 			}
 		}
@@ -147,7 +148,7 @@
 			// 导出期间会话被清空 / 重新采集 / 导入：前后数据不属于同一次采集，整份作废
 			return {
 				ok: false, code: 'session_changed',
-				message: tr('exp.session_changed'),
+				message: tr('exp.session_changed'), ref: msg('exp.session_changed'),
 				plan: plan,
 			}
 		}
@@ -155,7 +156,7 @@
 		if (size > limit) {
 			return {
 				ok: false, code: 'too_large',
-				message: tr('exp.too_large', { size: formatBytes(size), limit: formatBytes(limit) }),
+				message: tr('exp.too_large', { size: formatBytes(size), limit: formatBytes(limit) }), ref: msg('exp.too_large', { size: formatBytes(size), limit: formatBytes(limit) }),
 				plan: plan,
 			}
 		}
@@ -207,22 +208,22 @@
 			try {
 				await saveFile({ name: name, mime: 'text/csv;charset=utf-8', text: csv.text })
 			} catch (err) {
-				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }) }
+				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }), ref: msg('exp.save_failed', { err: err && err.message ? err.message : err }) }
 			}
-			log(tr('exp.exported', { name: name, size: formatBytes(csv.bytes), gaps: csv.gaps ? tr('exp.exported_gaps', { n: csv.gaps }) : '' }), 'success')
+			log(msg('exp.exported', { name: name, size: formatBytes(csv.bytes), gaps: csv.gaps ? tr('exp.exported_gaps', { n: csv.gaps }) : '' }), 'success')
 			return { ok: true, name: name, bytes: csv.bytes, samples: e - s, gaps: csv.gaps, missing: csv.missing, dropped: csv.dropped }
 		}
 
 		async function exportSummary(opts) {
 			opts = opts || {}
-			if (!control) return { ok: false, code: 'no_control', message: tr('exp.no_summary') }
+			if (!control) return { ok: false, code: 'no_control', message: tr('exp.no_summary'), ref: msg('exp.no_summary') }
 			const summary = control.captureSummary()
 			const built = buildSummary(summary, { gaps: summary.gaps, note: summary.reason })
 			const name = sanitizeFileName(opts.name || 'power-summary.json')
 			try {
 				await saveFile({ name: name, mime: 'application/json;charset=utf-8', text: built.text })
 			} catch (err) {
-				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }) }
+				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }), ref: msg('exp.save_failed', { err: err && err.message ? err.message : err }) }
 			}
 			return { ok: true, name: name, bytes: built.text.length, summary: summary }
 		}

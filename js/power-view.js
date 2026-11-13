@@ -728,12 +728,12 @@
 		const rx = Math.max(0, Number(o.rxBytes) || 0)
 		const n = Math.max(0, Number(o.samples) || 0)
 		if (rx === 0) {
-			return { kind: 'no_response', level: 'error', message: tr('view.no_response', { sec: sec }) }
+			return { kind: 'no_response', level: 'error', message: tr('view.no_response', { sec: sec }), ref: I18N.msg('view.no_response', { sec: sec }) }
 		}
 		if (n === 0) {
-			return { kind: 'undecodable', level: 'error', message: tr('view.undecodable', { bytes: rx }) }
+			return { kind: 'undecodable', level: 'error', message: tr('view.undecodable', { bytes: rx }), ref: I18N.msg('view.undecodable', { bytes: rx }) }
 		}
-		return { kind: 'stall', level: 'warn', message: tr('view.stall', { sec: sec }) }
+		return { kind: 'stall', level: 'warn', message: tr('view.stall', { sec: sec }), ref: I18N.msg('view.stall', { sec: sec }) }
 	}
 
 	// ---------- 总览条（minimap） ----------

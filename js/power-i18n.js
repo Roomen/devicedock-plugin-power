@@ -896,6 +896,27 @@
 		return format(s, vars)
 	}
 
+	/**
+	 * 惰性消息：保存键与参数，toString() 时才按**当前**语言取词。
+	 * 参数里嵌套的惰性消息同样按当前语言展开（format 里 String(v) 会再调它的 toString）。
+	 * 状态条 / 诊断这类「语言切换要重绘」的地方存它，而不是存已翻译的文本。
+	 */
+	function Msg(key, vars) {
+		this.key = key
+		this.vars = vars || null
+	}
+	Msg.prototype.toString = function () { return t(this.key, this.vars) }
+	Msg.prototype.valueOf = Msg.prototype.toString
+	Msg.prototype.toJSON = Msg.prototype.toString
+
+	function msg(key, vars) {
+		return new Msg(key, vars)
+	}
+
+	function isMsg(v) {
+		return v instanceof Msg
+	}
+
 	function has(key) {
 		return Object.prototype.hasOwnProperty.call(en, key)
 	}
@@ -954,6 +975,8 @@
 		LOCALES: LOCALES,
 		DICTS: DICTS,
 		t: t,
+		msg: msg,
+		isMsg: isMsg,
 		has: has,
 		normalize: normalize,
 		fallbackLocale: fallbackLocale,

@@ -50,14 +50,14 @@ const en = I18N.DICTS.en
 	}
 }
 
-// ---- 各模块里字面量 tr('...') 引用的键都存在 ----
+// ---- 各模块里字面量 tr('...') / msg('...') / M('...') 引用的键都存在 ----
 {
 	const files = fs.readdirSync(path.join(root, 'js')).filter((f) => f.endsWith('.js') && f !== 'power-i18n.js')
 	const missing = []
 	let refs = 0
 	for (const f of files) {
 		const src = fs.readFileSync(path.join(root, 'js', f), 'utf8')
-		const re = /\btr\('([^']+)'/g
+		const re = /(?:\btr|\bmsg|\bM|I18N\.msg)\('([^']+)'/g
 		let m
 		while ((m = re.exec(src))) {
 			refs++
@@ -69,7 +69,7 @@ const en = I18N.DICTS.en
 			if (!I18N.has(m[1])) missing.push(f + ': ' + m[1])
 		}
 	}
-	assert.ok(refs > 250, '模块里的文案都走 tr()：' + refs)
+	assert.ok(refs > 250, '模块里的文案都走 tr() / msg()：' + refs)
 	assert.deepEqual(missing, [], '引用了不存在的键：\n' + missing.join('\n'))
 	// 拼接键的全集
 	for (const e of ['off', 'rise', 'fall', 'either']) assert.ok(I18N.has('ui.edge_' + e), 'ui.edge_' + e)

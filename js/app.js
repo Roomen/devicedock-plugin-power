@@ -16,6 +16,8 @@
 	const ImportMod = window.PowerImport
 	const I18N = window.PowerI18n
 	const tr = I18N.t
+	// 惰性消息：日志 / 状态条存它，切语言时状态条按新语言重绘
+	const M = I18N.msg
 
 	const $ = function (id) { return document.getElementById(id) }
 	const MIB = 1024 * 1024
@@ -118,13 +120,16 @@
 		list.scrollTop = list.scrollHeight
 		setText('log-meta', tr('ui.log_lines', { n: logLines }))
 		// 日志区在页面下方，常常看不到：错误 / 警告 / 成功同步到顶部状态条，失败不能静默
-		if (level === 'error' || level === 'warn' || level === 'success') setStatus(String(message), level)
+		if (level === 'error' || level === 'warn' || level === 'success') setStatus(message, level)
 	}
 
+	// 状态条保存消息本身（惰性消息带键与参数），不是翻译后的文本：语言切换时重绘
+	let statusMsg = null
 	function setStatus(message, level) {
 		const el = $('status-line')
 		if (!el) return
-		el.textContent = message
+		statusMsg = message
+		el.textContent = String(message)
 		el.dataset.level = level || ''
 		el.hidden = false
 	}
@@ -159,6 +164,11 @@
 
 	function relocalize() {
 		I18N.apply(document)
+		// 状态条：按保存的消息（键 + 参数）用新语言重绘
+		if (statusMsg != null) {
+			const sl = $('status-line')
+			if (sl) sl.textContent = String(statusMsg)
+		}
 		Object.keys(hintFns).forEach(function (id) {
 			const el = $(id)
 			if (el) el.textContent = hintFns[id]()
@@ -215,7 +225,7 @@
 			gen: link.streamGen(),
 			mode: tr(link.isDropping() ? 'ui.link_dropping' : 'ui.link_receiving'),
 		}))
-		setText('diag-error', st.lastError ? new Date(st.lastError.at).toLocaleTimeString() + ' ' + st.lastError.message : tr('ui.none'))
+		setText('diag-error', st.lastError ? new Date(st.lastError.at).toLocaleTimeString() + ' ' + String(st.lastError.ref || st.lastError.message) : tr('ui.none'))
 	}
 
 	function toggleDiagnostics() {
@@ -257,7 +267,7 @@
 		saveTimer = setTimeout(function () {
 			saveTimer = 0
 			sdk.app.storageSet('settings', settings).catch(function (e) {
-				log(tr('app.save_settings_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+				log(M('app.save_settings_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 			})
 		}, 400)
 	}
@@ -308,7 +318,7 @@
 				if (control) control.noteGap(info)
 				updateGapChip()
 				if (info.reason === 'overflow' || info.reason === 'closing') {
-					log(tr('app.host_dropped', { bytes: info.bytes, reason: info.reason }), 'warn')
+					log(M('app.host_dropped', { bytes: info.bytes, reason: info.reason }), 'warn')
 					hostLog('host dropped ' + info.bytes + ' bytes (' + info.reason + '), marked as a gap')
 				}
 			},
@@ -335,7 +345,7 @@
 		if (typeof sdk.setClaimErrorHandler === 'function') {
 			sdk.setClaimErrorHandler(function (err, info) {
 				const where = info && info.claimId ? ' (claim ' + info.claimId + ' gen ' + info.gen + ' seq ' + info.seq + ')' : ''
-				log(tr('app.rx_handler_threw', { where: where, err: err && err.message ? err.message : err }), 'error')
+				log(M('app.rx_handler_threw', { where: where, err: err && err.message ? err.message : err }), 'error')
 				hostLog('claim.rx handler threw' + where + ': ' + (err && err.message ? err.message : err))
 			})
 		}
@@ -431,7 +441,7 @@
 			lastPorts = Claim.filterAnalyzerPorts(await link.listPorts())
 			renderPortOptions(sel.value)
 		} catch (e) {
-			log(tr('app.list_ports_failed', { err: e && e.message ? e.message : e }), 'error')
+			log(M('app.list_ports_failed', { err: e && e.message ? e.message : e }), 'error')
 		}
 	}
 
@@ -500,14 +510,14 @@
 		if (linkWasOpen && !isOpen && !closingByUs) {
 			const wasSampling = control ? control.isSampling() : false
 			sampleAlert = null
-			if (control) control.abortSession(tr('app.reason_disconnected'))
+			if (control) control.abortSession(M('app.reason_disconnected'))
 			releaseBusy()
 			if (stall) stall.stop()
 			View.resetScopeTrigger(trig)
 			trigScanFrom = null
 			updateSampleButton()
 			renderSessionPanel()
-			log(tr('app.disconnected_unexpected'), 'warn')
+			log(M('app.disconnected_unexpected'), 'warn')
 			hostLog('serial session terminated after an unexpected disconnect')
 			void wasSampling
 		}
@@ -529,12 +539,12 @@
 				releaseBusy()
 				if (stall) stall.stop()
 				setSampleAlert(null)
-				log(tr('app.released'))
+				log(M('app.released'))
 				hostLog('released the analyzer port')
 			} else {
 				const key = $('port').value
 				if (!key) {
-					log(tr('app.choose_port'), 'warn')
+					log(M('app.choose_port'), 'warn')
 					return
 				}
 				await link.open(key)
@@ -543,7 +553,7 @@
 				linkWasOpen = true
 				const sel = $('port')
 				const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : key
-				log(tr('app.claimed'), 'success')
+				log(M('app.claimed'), 'success')
 				hostLog('claimed ' + label + ' exclusively')
 				const ok = await control.fetchModifiers()
 				if (ok) {
@@ -553,11 +563,11 @@
 				const probe = await control.probeDutPower()
 				if (probe) {
 					control.markPowered(probe.on, 'probed')
-					log(tr('app.probe_result', { state: tr(probe.on ? 'app.probe_on' : 'app.probe_off'), median: probe.medianUA.toFixed(2), n: probe.n }))
+					log(M('app.probe_result', { state: M(probe.on ? 'app.probe_on' : 'app.probe_off'), median: probe.medianUA.toFixed(2), n: probe.n }))
 				}
 			}
 		} catch (e) {
-			log(tr('app.port_op_failed', { err: (e && e.message ? e.message : e) }), 'error')
+			log(M('app.port_op_failed', { err: (e && e.message ? e.message : e) }), 'error')
 		} finally {
 			btn.disabled = false
 			renderConnState()
@@ -573,7 +583,7 @@
 			const res = await sdk.app.busyAcquire('Power capture')
 			busyId = res && res.busyId ? res.busyId : null
 		} catch (e) {
-			log(tr('app.busy_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+			log(M('app.busy_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 			busyId = null
 		}
 		return busyId
@@ -588,12 +598,12 @@
 
 	async function startCapture() {
 		if (!link.isOpen()) {
-			log(tr('app.start_not_connected'), 'error')
+			log(M('app.start_not_connected'), 'error')
 			return
 		}
 		let failed = ''
 		sampleAlert = null
-		setStatus(tr('app.starting'), '')
+		setStatus(M('app.starting'), '')
 		await acquireBusy()
 		try {
 			const r = await control.startCapture()
@@ -612,17 +622,17 @@
 				if (stall) stall.start()
 				const typed = Math.round(Number($('voltage').value))
 				if (isFinite(typed) && st.voltageMv != null && typed !== st.voltageMv) {
-					log(tr('app.voltage_not_applied', { typed: typed, mv: st.voltageMv }), 'warn')
+					log(M('app.voltage_not_applied', { typed: typed, mv: st.voltageMv }), 'warn')
 				}
 			}
 			if (!r || !r.ok) {
-				failed = tr('app.start_failed', { why: (r && (r.message || r.code)) || tr('ui.unknown_reason') })
+				failed = M('app.start_failed', { why: (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason') })
 				log(failed, 'error')
 				releaseBusy()
 			}
 		} catch (e) {
 			releaseBusy()
-			failed = tr('app.start_error', { err: (e && e.message ? e.message : e) })
+			failed = M('app.start_error', { err: (e && e.message ? e.message : e) })
 			log(failed, 'error')
 		}
 		if (failed) sampleAlert = { state: 'error', key: 'ui.alert_start_failed' }
@@ -637,13 +647,13 @@
 		sampleAlert = null
 		try {
 			const r = await control.stopCapture()
-			if (r && !r.ok) log(tr('app.stop_result', { why: r.message || r.code }), 'warn')
+			if (r && !r.ok) log(M('app.stop_result', { why: r.ref || r.message || r.code }), 'warn')
 		} catch (e) {
-			log(tr('app.stop_error', { err: (e && e.message ? e.message : e) }), 'error')
+			log(M('app.stop_error', { err: (e && e.message ? e.message : e) }), 'error')
 		} finally {
 			releaseBusy()
 			if (stall) stall.stop()
-			if (reason === 'storage') log(tr('app.stopped_storage'), 'warn')
+			if (reason === 'storage') log(M('app.stopped_storage'), 'warn')
 			const s = control.captureSummary()
 			hostLog('capture stopped: ' + fmtCount(s.totalSamples) + ' samples, ' + s.gaps + ' gap(s)')
 			renderSessionPanel()
@@ -708,7 +718,7 @@
 		viewStatsCache = null
 		scheduleDraw()
 		renderSessionPanel()
-		log(tr('app.view_reset'))
+		log(M('app.view_reset'))
 	}
 
 	function markUserView() {
@@ -1302,7 +1312,7 @@
 			$('cur-dt').dataset.warn = (m.gaps > 0 || m.voltsUnknown) ? '1' : '0'
 		}).catch(function (e) {
 			if (seq !== cursorSeq) return
-			log(tr('app.cursor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+			log(M('app.cursor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 		})
 	}
 
@@ -1453,7 +1463,7 @@
 	// ---------- 导出 ----------
 	async function doExport(kind) {
 		if (!wave || wave.total() === 0) {
-			log(tr('app.export_nothing'), 'warn')
+			log(M('app.export_nothing'), 'warn')
 			return
 		}
 		const hint = $('export-hint')
@@ -1467,10 +1477,10 @@
 			r = await exportSvc.exportRange(0, wave.total(), { name: 'power-session.csv' })
 		}
 		if (!r || !r.ok) {
-			const msg = (r && r.message) ? r.message : tr('app.export_failed')
-			setHintFn('export-hint', function () { return msg })
+			const msg = (r && (r.ref || r.message)) || M('app.export_failed')
+			setHintFn('export-hint', function () { return String(msg) })
 			hint.dataset.warn = '1'
-			log(tr('app.export_refused', { why: msg }), 'error')
+			log(M('app.export_refused', { why: msg }), 'error')
 			return
 		}
 		hint.dataset.warn = '0'
@@ -1494,17 +1504,17 @@
 			if (!parsed.ok) {
 				setHintFn('import-hint', function () { return ImportMod.summarize(parsed).text })
 				hint.dataset.warn = '1'
-				log(tr('app.import_failed', { why: reasonText(parsed.reason) }), 'error')
+				log(M('app.import_failed', { why: reasonText(parsed.reason) }), 'error')
 				return
 			}
 			if (control.isSampling()) await control.stopCapture()
 			const res = await control.importSeries(parsed)
 			if (!res || !res.ok) {
 				// 装不下就如实说不完整（实际 N / 请求 M），不能报完整成功
-				const why = (res && res.message) ? res.message : tr('ui.unknown')
+				const why = (res && (res.ref || res.message)) || M('ui.unknown')
 				setHintFn('import-hint', function () { return tr('ui.import_incomplete_hint', { why: why }) })
 				hint.dataset.warn = '1'
-				log(tr('app.import_partial', { why: why }), 'warn')
+				log(M('app.import_partial', { why: why }), 'warn')
 				hostLog('csv import incomplete: ' + why)
 				if (res && res.stored) {
 					// 已经写进去的部分照样可以看，只是要标清楚是不完整的导入
@@ -1556,7 +1566,7 @@
 			const ierr = (e && e.message ? e.message : e)
 			setHintFn('import-hint', function () { return tr('ui.import_failed_hint', { err: ierr }) })
 			hint.dataset.warn = '1'
-			log(tr('app.import_error', { err: (e && e.message ? e.message : e) }), 'error')
+			log(M('app.import_error', { err: (e && e.message ? e.message : e) }), 'error')
 		}
 	}
 
@@ -1701,7 +1711,7 @@
 					const c = View.centerOnIndex({ total: totalSamples(), xZoom: view.xZoom, index: Math.round((sel.a + sel.b) / 2) })
 					view.xOffset = c.xOffset
 					markUserView()
-					log(tr('app.box_zoom', { a: sel.a, b: sel.b, n: n }))
+					log(M('app.box_zoom', { a: sel.a, b: sel.b, n: n }))
 				}
 			}
 			renderCursorPanel()
@@ -1936,7 +1946,7 @@
 			renderSessionPanel()
 			updateStoragePanel()
 			scheduleDraw()
-			log(tr('app.cleared'))
+			log(M('app.cleared'))
 		})
 		$('btn-apply-voltage').addEventListener('click', async function () {
 			const mv = Math.round(Number($('voltage').value))
@@ -1944,16 +1954,16 @@
 			if (r && r.ok) {
 				settings.voltageMv = control.readVoltageMv()
 				saveSettingsSoon()
-				log(tr('app.voltage_applied', { mv: settings.voltageMv }), 'success')
+				log(M('app.voltage_applied', { mv: settings.voltageMv }), 'success')
 			} else {
-				log(tr('app.voltage_failed', { why: (r && r.message) || tr('ui.unknown_reason') }), 'error')
+				log(M('app.voltage_failed', { why: (r && (r.ref || r.message)) || M('ui.unknown_reason') }), 'error')
 			}
 			renderSessionPanel()
 		})
 		$('btn-power').addEventListener('click', async function () {
 			const want = control.state().powered.state !== 'on'
 			const r = await control.setPower(want)
-			if (!r || !r.ok) log(tr('app.power_failed', { why: (r && r.message) || tr('ui.unknown_reason') }), 'error')
+			if (!r || !r.ok) log(M('app.power_failed', { why: (r && (r.ref || r.message)) || M('ui.unknown_reason') }), 'error')
 			renderSessionPanel()
 		})
 		$('btn-mode-wave').addEventListener('click', function () { setMode('wave') })
@@ -1963,7 +1973,7 @@
 			control.setTargetRateHz(settings.rateHz)
 			saveSettingsSoon()
 			renderSessionPanel()
-			log(tr('app.rate_set', { hz: fmtCount(settings.rateHz) }))
+			log(M('app.rate_set', { hz: fmtCount(settings.rateHz) }))
 		})
 		$('view').addEventListener('change', function () {
 			settings.viewSec = Number($('view').value) || 10
@@ -1978,14 +1988,14 @@
 		$('btn-apply-cap').addEventListener('click', function () {
 			const mib = Math.round(Number($('cap').value))
 			if (!isFinite(mib) || mib < 16) {
-				log(tr('app.cap_min'), 'warn')
+				log(M('app.cap_min'), 'warn')
 				return
 			}
 			settings.capMiB = mib
 			store.setCapBytes(mib * MIB)
 			saveSettingsSoon()
 			updateStoragePanel()
-			log(tr('app.cap_set', { mib: mib }))
+			log(M('app.cap_set', { mib: mib }))
 		})
 		$('btn-export-view').addEventListener('click', function () { doExport('view') })
 		$('btn-export-all').addEventListener('click', function () { doExport('all') })
@@ -2020,7 +2030,7 @@
 			trigUserOverride = false
 			updateTriggerChip(control ? control.trigLevel() : 0)
 			scheduleDraw()
-			log(tr('app.trig_mode', { mode: tr('ui.edge_' + trigUI.mode) }))
+			log(M('app.trig_mode', { mode: M('ui.edge_' + trigUI.mode) }))
 		})
 		$('trig-level').addEventListener('change', function () {
 			const raw = String($('trig-level').value || '').trim()
@@ -2031,7 +2041,7 @@
 			} else {
 				const n = Number(raw)
 				if (!isFinite(n)) {
-					log(tr('app.trig_level_nan'), 'warn')
+					log(M('app.trig_level_nan'), 'warn')
 					return
 				}
 				trigUI.levelAuto = false
@@ -2052,12 +2062,12 @@
 		// 采样沿触发
 		$('acq-start').addEventListener('change', function () {
 			control.setAcqTriggers($('acq-start').value, $('acq-stop').value)
-			log(tr('app.acq_start_set', { edge: tr('ui.edge_' + $('acq-start').value), when: tr(control.isSampling() ? 'app.acq_now' : 'app.acq_next') }))
+			log(M('app.acq_start_set', { edge: M('ui.edge_' + $('acq-start').value), when: M(control.isSampling() ? 'app.acq_now' : 'app.acq_next') }))
 			renderSessionPanel()
 		})
 		$('acq-stop').addEventListener('change', function () {
 			control.setAcqTriggers($('acq-start').value, $('acq-stop').value)
-			log(tr('app.acq_stop_set', { edge: tr('ui.edge_' + $('acq-stop').value) }))
+			log(M('app.acq_stop_set', { edge: M('ui.edge_' + $('acq-stop').value) }))
 			renderSessionPanel()
 		})
 		$('btn-reset').addEventListener('click', function () { resetView() })
@@ -2113,7 +2123,7 @@
 		$('btn-ysym').setAttribute('aria-pressed', String(view.yMode === 'symlog'))
 		saveSettingsSoon()
 		scheduleDraw()
-		log(tr('app.y_mode', { mode: tr('ui.ymode_' + view.yMode), extra: view.yMode === 'log' ? tr('app.y_log_note') : '' }))
+		log(M('app.y_mode', { mode: M('ui.ymode_' + view.yMode), extra: view.yMode === 'log' ? M('app.y_log_note') : '' }))
 	}
 
 	function setMode(mode) {
@@ -2124,7 +2134,7 @@
 		saveSettingsSoon()
 		renderSessionPanel()
 		scheduleDraw()
-		log(tr('app.record_mode', { mode: tr(settings.recordMode === 'wave' ? 'app.record_wave' : 'app.record_long') }))
+		log(M('app.record_mode', { mode: M(settings.recordMode === 'wave' ? 'app.record_wave' : 'app.record_long') }))
 	}
 
 	// ---------- 启动 ----------
@@ -2154,12 +2164,12 @@
 					// 从来没收到过样点：不是缺口，是设备无应答 / 解析失败
 					setSampleAlert('error', d.kind === 'no_response' ? 'ui.alert_no_response' : 'ui.alert_decode_failed')
 				}
-				log(d.message, d.level)
+				log(d.ref || d.message, d.level)
 				hostLog('capture watchdog: ' + d.kind + ' after ' + idle + ' ms (rx ' + (ls.bytes - base.bytes) + ' B since start)')
 				renderDiagnostics()
 			},
 			onResume: function () {
-				log(tr('app.resumed'), 'success')
+				log(M('app.resumed'), 'success')
 				$('gaps-hint').dataset.warn = '0'
 				setSampleAlert(null)
 			},
@@ -2177,7 +2187,7 @@
 			const saved = await sdk.app.storageGet('settings')
 			settings = normalizeSettings(saved)
 		} catch (e) {
-			log(tr('app.settings_read_failed', { err: (e && e.message ? e.message : e) }), 'warn')
+			log(M('app.settings_read_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 		}
 		syncViewFromSettings()
 		$('rate').value = String(settings.rateHz)
@@ -2208,7 +2218,7 @@
 		updateGapChip()
 		updateTriggerChip(0)
 		scheduleDraw()
-		log(tr('app.ready'))
+		log(M('app.ready'))
 		readoutTimer = setInterval(function () {
 			renderSessionPanel()
 			updateStoragePanel()

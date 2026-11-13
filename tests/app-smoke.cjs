@@ -203,7 +203,14 @@ function makeFakeSdk(state) {
 				state.acquires.push([portKey, mode])
 				return { claimId: id, mode: mode }
 			},
-			open: async (id) => { const c = claims.get(id); if (c) c.open = true; return { claimId: id, open: true } },
+			open: async (id) => {
+				const c = claims.get(id)
+				if (c) c.open = true
+				// 与宿主一致：每个新声明的字节流从 offset 0、seq 1 开始（gen 从 1 起）
+				state.rxOffset = 0
+				state.rxSeq = 0
+				return { claimId: id, open: true }
+			},
 			close: async (id) => { const c = claims.get(id); if (c) c.open = false; return { closed: true } },
 			release: async (id) => { claims.delete(id); return { released: true } },
 			write: async (id, bytes) => {
@@ -352,7 +359,8 @@ const fireKey = (win, key, props) => {
 		const offset = state.rxOffset
 		state.rxOffset += bytes.length
 		if (!state.rxHandler) return
-		state.rxHandler({ claimId: state.claimIds[0] || 'claim1', gen: state.gen, seq: state.rxSeq, offset: offset, at: Date.now(), bytes: bytes })
+		// 用当前声明的 id（重连后是新声明，旧 id 的数据会被插件正确丢弃）
+		state.rxHandler({ claimId: state.claimIds[state.claimIds.length - 1] || 'claim1', gen: state.gen, seq: state.rxSeq, offset: offset, at: Date.now(), bytes: bytes })
 	}
 	state.pushRxText = function (s) {
 		const bytes = new Uint8Array(s.length)
@@ -736,6 +744,15 @@ const fireKey = (win, key, props) => {
 		assert.equal(sl.dataset.level, 'error')
 		assert.match(sl.textContent, /START could not be written.*USB 写超时/, '状态条写明原因：' + sl.textContent)
 		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		// 阻塞 4：语言切换时状态条按保存的键与参数重绘（不是保留旧语言的文本）
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(sl.textContent, /^开始采样失败：START 写入失败.*USB 写超时/, '状态条切到中文：' + sl.textContent)
+		assert.equal(sl.dataset.level, 'error', '级别不变')
+		assert.equal(text(document, 'chip-sampling'), '启动失败')
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(sl.textContent, /^Starting the capture failed: START could not be written/)
 		// 诊断面板：发送失败计数与最近错误
 		click(document, 'btn-diag')
 		await tick(10)
@@ -743,6 +760,14 @@ const fireKey = (win, key, props) => {
 		assert.match(text(document, 'diag-tx'), /writes .* [1-9]\d* failed/, '诊断显示发送统计：' + text(document, 'diag-tx'))
 		assert.match(text(document, 'diag-rx'), /batches .* B/)
 		assert.match(text(document, 'diag-error'), /USB 写超时/, '诊断显示最近错误：' + text(document, 'diag-error'))
+		// 阻塞 4：诊断里的最近错误也跟着切语言
+		const diagEn = text(document, 'diag-error')
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(text(document, 'diag-error'), /写入失败.*USB 写超时/, '诊断最近错误切到中文：' + text(document, 'diag-error'))
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(text(document, 'diag-error'), diagEn)
 		// 2) 设备无应答：START 写成功但一个字节都不回 → 看门狗报「无应答」，不是缺口
 		state.silent = true
 		const gapsBefore = text(document, 'chip-gaps')
@@ -802,6 +827,17 @@ const fireKey = (win, key, props) => {
 		click(document, 'btn-import')
 		await tick(40)
 		assert.match(text(document, 'import-hint'), /Choose a CSV file/)
+		// 阻塞 4：已显示的导出 / 导入提示跟着切语言
+		const exportEn = text(document, 'export-hint')
+		assert.match(exportEn, /^Saved /, '导出提示：' + exportEn)
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(text(document, 'import-hint'), '请先选择 CSV 文件。')
+		assert.match(text(document, 'export-hint'), /^已保存 /, '导出提示切到中文：' + text(document, 'export-hint'))
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(text(document, 'import-hint'), /Choose a CSV file/)
+		assert.equal(text(document, 'export-hint'), exportEn)
 	}
 
 	// ---- 冷区上限 ----
