@@ -229,6 +229,12 @@ function makeFakeSdk(state) {
 				state.writes.push(Array.from(bytes))
 				// 宿主永不确认这一条写入（卡死）：插件靠写入超时结束它
 				if (state.hangOnByte != null && bytes[0] === state.hangOnByte) return new Promise(function () {})
+				// 宿主迟迟不确认、由用例决定何时兑现（插件超时之后迟到完成）
+				if (typeof state.defer === 'function' && state.defer(bytes)) {
+					return new Promise(function (resolve, reject) {
+						state.deferred.push({ bytes: Array.from(bytes), resolve: function () { resolve({ bytes: bytes.length }) }, reject: reject })
+					})
+				}
 				if (bytes[0] === 0x19) state.pushRxText('R0=1031.64\r\nVDD=3300 mV\r\nEND\r\n')
 				if (bytes[0] === 0x06 && !state.silent) state.pushRxSamples(300, 1000)
 				return { bytes: bytes.length }
@@ -914,6 +920,30 @@ const fireKey = (win, key, props) => {
 		assert.match(sl.textContent, /^设定电压失败：.*3000 ms 内未确认 \[timeout\]/, '状态条切到中文：' + sl.textContent)
 		state.emit('app.locale', { locale: 'en' })
 		await tick(20)
+		// 4) START 写入超时：结果未知（宿主仍可能写出），不能显示成确定的未采样 / 启动失败
+		state.deferred = []
+		state.defer = function (b) { return b[0] === 0x06 }
+		state.writes.length = 0
+		click(document, 'btn-sample')
+		await tick(3300)
+		assert.equal(text(document, 'chip-sampling'), 'start unknown', 'chip：' + text(document, 'chip-sampling'))
+		assert.equal(document.getElementById('chip-sampling').dataset.state, 'warn')
+		assert.equal(document.getElementById('btn-sample').disabled, true, '结果未知期间不能再开始')
+		assert.equal(sl.dataset.level, 'warn')
+		assert.match(sl.textContent, /^START timed out and its outcome is unknown/, '状态条说明结果未知：' + sl.textContent)
+		assert.deepEqual(state.writes.map((w) => w[0]).filter((b) => b === 0x06 || b === 0x07), [0x07, 0x06, 0x07], '超时当下就补了 STOP')
+		// 绕过禁用（快捷键等入口）也不会再发 START
+		fire(document.getElementById('btn-sample'), 'click', { detail: 1 })
+		await tick(100)
+		assert.equal(state.writes.filter((w) => w[0] === 0x06).length, 1, '没有再发 START')
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		// START 在宿主侧迟到兑现 → 补的 STOP 已确认 → 收尾：放开 Start，说明设备已停
+		state.deferred[0].resolve()
+		await tick(60)
+		state.defer = null
+		assert.equal(text(document, 'chip-sampling'), 'idle')
+		assert.equal(document.getElementById('btn-sample').disabled, false, '收尾后放开 Start')
+		assert.match(sl.textContent, /^The timed-out START reached the device and the following STOP was confirmed/, '状态条：' + sl.textContent)
 		click(document, 'btn-diag')
 		click(document, 'btn-connect')
 		await tick(150)

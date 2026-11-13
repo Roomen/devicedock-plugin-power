@@ -87,6 +87,10 @@
 		let stopPending = null
 		// 停止沿命中后数据侧立即截止：之后到达的样点不再进本次采集（STOP 命令按队列再发）
 		let stopCut = false
+		// START 写入超时：设备可能已经开始采样（宿主仍会写出去），结果未知。
+		// 收尾（补 STOP、等宿主写入兑现）完成前禁止再次开始；token 让断开 / 新连接作废旧的收尾
+		let startUnknown = false
+		let unknownToken = 0
 		// 缺口计数（长跑模式没有波形环，摘要里也得有数）
 		let gapCount = 0
 		// 长期模式的折叠总览（minimap）：长跑时不进波形环，只留 min/max 总览
@@ -430,6 +434,46 @@
 			return link.write(bytes, note)
 		}
 
+		/** 写入的最终结果：超时的写入等宿主兑现 / 失败（{ ok, error, unknown }），其余直接取当下结果 */
+		function settleOf(w) {
+			if (w && w.timedOut && w.settled && typeof w.settled.then === 'function') return w.settled
+			return Promise.resolve({ ok: !!(w && w.ok), error: w && w.error, unknown: !!(w && w.timedOut) })
+		}
+
+		/**
+		 * START 超时后的收尾（不在操作队列里跑：可能要等宿主十几秒）：
+		 *  1) 当下就排一条 STOP——宿主写队列串行，它一定落在 START 之后；
+		 *  2) 等 START 在宿主侧最终兑现 / 失败；
+		 *  3) STOP 已确认 → 设备停着；STOP 没确认而 START 兑现了（或仍未知）→ 再补一条 STOP；
+		 *  4) 都没有确定结果 → 明说设备状态未知，请检查或重连。
+		 */
+		function reconcileStart(startW, gen0) {
+			const token = ++unknownToken
+			startUnknown = true
+			onChange()
+			const finish = function (key, level) {
+				if (token !== unknownToken) return
+				startUnknown = false
+				if (key) log(msg(key), level)
+				onChange()
+			}
+			;(async function () {
+				const stopW = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+				const startFinal = await settleOf(startW)
+				let stopFinal = await settleOf(stopW)
+				if (token !== unknownToken) return
+				if (!stillSameConn(gen0)) return finish(null)
+				if (stopFinal.ok) return finish(startFinal.ok ? 'ctl.start_settled_stopped' : (startFinal.unknown ? 'ctl.start_settled_stop_confirmed' : 'ctl.start_settled_failed'), startFinal.ok ? 'warn' : '')
+				if (!startFinal.ok && !startFinal.unknown) return finish('ctl.start_settled_failed', '')
+				// START 兑现了（或仍未知）而 STOP 没确认：再补一条 STOP
+				const again = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+				stopFinal = await settleOf(again)
+				if (token !== unknownToken) return
+				if (!stillSameConn(gen0)) return finish(null)
+				return finish(stopFinal.ok ? 'ctl.start_settled_stopped' : 'ctl.start_settled_unknown', stopFinal.ok ? 'warn' : 'error')
+			})().catch(function () { finish('ctl.start_settled_unknown', 'error') })
+		}
+
 		/**
 		 * 写源电压。已连接时只有设备写入成功才算「已施加」：失败保持上一次有效值，
 		 * 不把请求值当成事实。
@@ -449,6 +493,16 @@
 			const w = await writeRaw(PROTO.cmdRegulatorSet(clamped), 'REGULATOR ' + clamped + ' mV')
 			if (!w.ok) {
 				if (!w.stale) log(msg('ctl.voltage_write_failed_log'), 'error')
+				if (w.timedOut) {
+					// 超时 ≠ 没执行：宿主稍后写出去就以设备为准更新电压
+					const gen = genOf()
+					settleOf(w).then(function (f) {
+						if (!f.ok || !stillSameConn(gen)) return
+						if (voltageMv !== clamped && sampling) voltageChanges++
+						toggleVoltageSource(clamped)
+						log(msg('ctl.voltage_applied_late', { mv: clamped }), 'warn')
+					})
+				}
 				onChange()
 				return { ok: false, stale: !!w.stale, error: w.error }
 			}
@@ -456,6 +510,15 @@
 			toggleVoltageSource(clamped)
 			log(msg('ctl.voltage_set', { mv: clamped }), 'success')
 			return { ok: true, stale: false }
+		}
+
+		/** 上 / 下电写入超时：宿主稍后写出去了就按命令记状态（期间没有新的命令改过它） */
+		function lateDutPower(w, on, gen) {
+			settleOf(w).then(function (f) {
+				if (!f.ok || !stillSameConn(gen) || power.source !== 'unknown') return
+				markPowered(on, 'commanded')
+				log(msg(on ? 'ctl.power_on_late' : 'ctl.power_off_late'), 'warn')
+			})
 		}
 
 		async function doPowerOn(guard) {
@@ -483,6 +546,7 @@
 				// 同一连接写失败：不知道设备收没收到，标未知
 				markPowered(null, 'unknown')
 				log(msg('ctl.power_on_write_failed_log'), 'error')
+				if (w.timedOut) lateDutPower(w, true, gen)
 				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), ref: msg('ctl.power_on_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(true, 'commanded')
@@ -499,6 +563,7 @@
 				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), ref: msg('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				markPowered(null, 'unknown')
 				log(msg('ctl.power_off_write_failed_log'), 'error')
+				if (w.timedOut) lateDutPower(w, false, gen)
 				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), ref: msg('ctl.power_off_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(false, 'commanded')
@@ -590,6 +655,11 @@
 		async function startSampling(guard) {
 			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 			if (sampling) return { ok: true, changed: false, sampling: true }
+			// 上一次 START 超时、结果还没收尾：设备可能正在采样，不能再开一轮
+			if (startUnknown) {
+				log(msg('ctl.start_blocked_unknown'), 'warn')
+				return { ok: false, code: 'start_unknown_pending', message: tr('ctl.start_blocked_unknown'), ref: msg('ctl.start_blocked_unknown'), executed: false }
+			}
 			const mv = readVoltageMv()
 			if (!isFinite(mv) || mv == null || mv < PROTO.VDD_LOW_MV) {
 				log(msg('ctl.voltage_required_start'), 'error')
@@ -661,6 +731,15 @@
 			onChange()
 
 			const startW = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START')
+			if (!startW.ok && startW.timedOut) {
+				// 插件侧超时只表示「结果未知」：宿主仍会把 START 写出去。不入库、不当成采样中，
+				// 也不当成确定的未采样——进入「结果未知」，补 STOP 并等宿主兑现后收尾
+				sampling = false
+				link.setDrop(true)
+				log(msg('ctl.start_unknown_log', { err: errText(startW) }), 'warn')
+				reconcileStart(startW, gen0)
+				return { ok: false, code: 'capture_start_unknown', message: tr('ctl.start_unknown', { err: errText(startW) }), ref: msg('ctl.start_unknown', { err: errText(startW) }), executed: 'unknown' }
+			}
 			if (!startW.ok) {
 				if (startW.stale) {
 					return { ok: false, code: 'disconnected', message: tr('ctl.start_conn_changed'), ref: msg('ctl.start_conn_changed'), executed: 'unknown' }
@@ -901,6 +980,9 @@
 			sampling = false
 			if (!stopPending) stopScheduled = false
 			stopCut = false
+			// 连接变了：上一条连接上 START 的收尾作废（设备状态随连接一起重置）
+			startUnknown = false
+			unknownToken++
 			if (wasSampling) {
 				// 已收到的样点先尽量入库；剩下的如实标缺口
 				let flushed = { remaining: 0, remainingBytes: 0 }
@@ -933,6 +1015,9 @@
 			sampling = false
 			if (!stopPending) stopScheduled = false
 			stopCut = false
+			// 连接变了：上一条连接上 START 的收尾作废（设备状态随连接一起重置）
+			startUnknown = false
+			unknownToken++
 			power = { on: null, source: 'unknown' }
 			lastTMs = 0
 			lastTMsValid = false
@@ -1108,6 +1193,8 @@
 			minimapData: function () { return folding.getData() },
 			foldingLength: function () { return folding.length },
 			isSampling: function () { return sampling },
+			// START 超时后结果未知、收尾未完成：期间不能再开始
+			isStartUnknown: function () { return startUnknown },
 			setRecordMode: setRecordMode,
 			setTargetRateHz: setTargetRateHz,
 			setSamplePeriodSec: setSamplePeriodSec,

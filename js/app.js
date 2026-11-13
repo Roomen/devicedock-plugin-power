@@ -374,7 +374,15 @@
 				voltageMv: settings.voltageMv,
 			},
 			log: log,
-			onChange: function () { renderSessionPanel() },
+			onChange: function () {
+				// START 超时的「结果未知」收尾完成：撤掉提示，放开 Start
+				if (sampleAlert && sampleAlert.key === 'ui.alert_start_unknown' && control && !control.isStartUnknown()) {
+					sampleAlert = null
+					updateSampleButton()
+				}
+				renderConnState()
+				renderSessionPanel()
+			},
 			// 任何途径结束采样（含停止沿自动停）都在这里收尾：停看门狗、释放更新屏障、清告警
 			onSamplingEnd: function (info) {
 				if (stall) stall.stop()
@@ -517,7 +525,8 @@
 		setText('session-meta', tr(open ? 'ui.session_connected' : 'ui.session_disconnected'))
 		$('btn-power').disabled = !open
 		// 初始化（读参数 + 探测）完成前不放开 Start：探测的 STOP 不能落在用户 START 之后
-		$('btn-sample').disabled = !open || !!connectInit
+		// START 结果未知（超时后宿主仍可能写出）收尾完成前同样不放开 Start
+		$('btn-sample').disabled = !open || !!connectInit || !!(control && control.isStartUnknown && control.isStartUnknown() && !control.isSampling())
 		$('btn-apply-voltage').disabled = !open
 	}
 
@@ -645,6 +654,11 @@
 			try { await connectInit } catch (e) { /* 初始化失败已记日志 */ }
 			if (!link.isOpen()) return
 		}
+		// 上一次 START 超时、结果未知的收尾还没完成（按钮已禁用，快捷键等入口在这里兜底）：不开始，也不改提示
+		if (control.isStartUnknown()) {
+			log(M('ctl.start_blocked_unknown'), 'warn')
+			return
+		}
 		let failed = ''
 		sampleAlert = null
 		setStatus(M('app.starting'), '')
@@ -669,7 +683,12 @@
 					log(M('app.voltage_not_applied', { typed: typed, mv: st.voltageMv }), 'warn')
 				}
 			}
-			if (!r || !r.ok) {
+			if (r && r.code === 'capture_start_unknown') {
+				// 结果未知不是「启动失败」：控制层已把未知原因与收尾说明写上状态条，这里不再盖成错误
+				failed = r.ref || r.message
+				hostLog('capture start outcome unknown (START timed out); settling')
+				releaseBusy()
+			} else if (!r || !r.ok) {
 				failed = M('app.start_failed', { why: (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason') })
 				log(failed, 'error')
 				releaseBusy()
@@ -679,7 +698,7 @@
 			failed = M('app.start_error', { err: (e && e.message ? e.message : e) })
 			log(failed, 'error')
 		}
-		if (failed) sampleAlert = { state: 'error', key: 'ui.alert_start_failed' }
+		if (failed) sampleAlert = control.isStartUnknown() ? { state: 'warn', key: 'ui.alert_start_unknown' } : { state: 'error', key: 'ui.alert_start_failed' }
 		renderSessionPanel()
 		updateSampleButton()
 		renderDiagnostics()

@@ -583,11 +583,22 @@
 					new Promise(function (resolve) { timer = setTimer(function () { resolve(TIMED_OUT) }, WRITE_TIMEOUT_MS) }),
 				])
 				if (res === TIMED_OUT) {
+					// 插件侧超时不会取消宿主写入：宿主仍在等这条写完，之后照样可能执行。
+					// 超时只表示「结果未知」，settled 保留宿主写入的最终结果（兑现 / 失败），
+					// 改变设备状态的调用方必须等它收尾（例如 START 迟到兑现后补 STOP）。
 					stats.txFailures++
 					const m = msg('clm.write_timeout', { note: note || '—', ms: WRITE_TIMEOUT_MS })
 					noteError(m)
 					onLog(m, 'error')
-					return { ok: false, stale: false, timedOut: true, error: { message: msg('clm.timeout_short', { ms: WRITE_TIMEOUT_MS }), code: 'timeout' } }
+					const settled = hostWrite.then(function () {
+						stats.txBytes += data.length
+						stats.lastTxAt = now()
+						return { ok: true }
+					}, function (e) {
+						// SDK 自己的 RPC 超时同样不代表宿主没写：仍算未知
+						return { ok: false, error: e, unknown: !!(e && e.code === 'timeout') }
+					})
+					return { ok: false, stale: false, timedOut: true, settled: settled, error: { message: msg('clm.timeout_short', { ms: WRITE_TIMEOUT_MS }), code: 'timeout' } }
 				}
 			} catch (e) {
 				const detail = (e && e.message ? e.message : String(e)) + (e && e.code ? ' [' + e.code + ']' : '')
