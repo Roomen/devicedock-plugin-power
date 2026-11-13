@@ -227,7 +227,6 @@
 			setClaimErrorHandler: setClaimErrorHandler,
 			_claimQueueDone: claimQueueDone,
 			bytesView: bytesView,
-			bytesView: bytesView,
 			device: {
 				listPorts: function () { return call('device.listPorts', {}) },
 				listBle: function () { return call('device.listBle', {}) },
