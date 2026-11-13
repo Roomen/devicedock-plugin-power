@@ -104,6 +104,8 @@
 			offsetGaps: 0,
 			hostGaps: 0,
 			genSwitches: 0,
+			parserRebuilds: 0,
+			parserGaps: 0,
 			sampleLossGaps: 0,
 			decodeErrors: 0,
 			backlogDropped: 0,
@@ -152,12 +154,13 @@
 			if (parser.converter && typeof parser.converter.resetFilter === 'function') parser.converter.resetFilter()
 		}
 
-		function noteGap(info) {
-			breakStream()
-			reportGap(info)
-		}
-
-		// ---- 异步入库 ----
+		// ---- 有序入库队列：样点段与断点按到达顺序排列，消费时严格保序 ----
+		//
+		// 队列项只有两种：
+		//   { kind: 'samples', samples, at, meta, from }  一段**连续**样点
+		//   { kind: 'break', info }                       结构断点（缺口），必须落在它真实的队列位置
+		// 缺口绝不能立刻通知上层：那样标记会插到还在队列里的旧样点之前，
+		// 真实断点两侧就会被统计、积分和触发状态机当成连续数据。
 		function scheduleFlush() {
 			if (drainTimer) return
 			drainTimer = scheduleDrain(function () {
@@ -166,10 +169,35 @@
 			})
 		}
 
+		function enqueueBreak(info) {
+			pending.push({ kind: 'break', info: info || {} })
+			scheduleFlush()
+		}
+
+		function enqueueSamples(samples, at, meta) {
+			if (!samples || !samples.length) return
+			pending.push({ kind: 'samples', samples: samples, at: at, meta: meta, from: 0 })
+			pendingCount += samples.length
+			// 硬上限兜底：绝不让队列无限长，也绝不因为跟不上就静默丢
+			if (pendingCount > MAX_PENDING) trimPending()
+			scheduleFlush()
+		}
+
 		function drainStep() {
 			const started = now()
 			while (pending.length) {
 				const job = pending[0]
+				if (job.kind === 'break') {
+					pending.shift()
+					try {
+						onGap(job.info)
+					} catch (e) {
+						onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error')
+					}
+					// 断点不占样点预算，但也要让出线程
+					if (pending.length && now() - started >= DRAIN_BUDGET_MS) break
+					continue
+				}
 				const rest = job.samples.length - job.from
 				const take = Math.min(rest, DRAIN_CHUNK)
 				const from = job.from
@@ -193,28 +221,97 @@
 		}
 
 		/**
+		 * 同步排空队列（停止采样时用）：先把截止点之前已经收到的数据交给上层，再冻结。
+		 * @param {number} [maxMs] 最多占用多久；超时返回剩余样点数
+		 * @returns {{ drained: number, remaining: number, remainingBytes: number }}
+		 */
+		function flushQueue(maxMs) {
+			const budget = maxMs > 0 ? maxMs : 250
+			const started = now()
+			let drained = 0
+			while (pending.length) {
+				const before = pendingCount
+				const job = pending[0]
+				if (job.kind === 'break') {
+					pending.shift()
+					try { onGap(job.info) } catch (e) { onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error') }
+				} else {
+					const rest = job.samples.length - job.from
+					const take = Math.min(rest, DRAIN_CHUNK)
+					const from = job.from
+					const chunk = from === 0 && take === job.samples.length ? job.samples : job.samples.slice(from, from + take)
+					job.from += take
+					pendingCount -= take
+					if (job.from >= job.samples.length) pending.shift()
+					try {
+						onSamples(chunk, job.at, Object.assign({}, job.meta, { from: from, total: job.samples.length }))
+					} catch (e) {
+						onLog('样点处理出错：' + (e && e.message ? e.message : e), 'error')
+					}
+				}
+				drained += Math.max(0, before - pendingCount)
+				if (now() - started >= budget) break
+			}
+			if (!pending.length && drainTimer) {
+				// 定时器还挂着但队列空了：不用取消，drainStep 里会自然返回
+			}
+			return { drained: drained, remaining: pendingCount, remainingBytes: signatureBytes() }
+		}
+
+		function signatureBytes() {
+			let n = 0
+			for (let i = 0; i < pending.length; i++) {
+				const j = pending[i]
+				if (j.kind === 'samples') n += (j.meta && j.meta.bytes) || 0
+			}
+			return n
+		}
+
+		/**
 		 * 队列硬上限：真跟不上时丢最老的整批并标缺口。
-		 * 丢的是还没进波形的样点，所以缺口位置就是当前波形末端。
+		 * 丢掉的样点必须在队列**原来的位置**留一个断点，否则后面的数据会被当成连续的。
 		 */
 		function trimPending() {
 			if (pendingCount <= MAX_PENDING) return
 			let droppedSamples = 0
 			let droppedBytes = 0
+			let firstSampleIdx = -1
 			while (pending.length && pendingCount > MAX_PENDING) {
-				const job = pending.shift()
+				if (firstSampleIdx < 0) {
+					for (let i = 0; i < pending.length; i++) {
+						if (pending[i].kind === 'samples') { firstSampleIdx = i; break }
+					}
+					if (firstSampleIdx < 0) break
+				}
+				const job = pending[firstSampleIdx]
 				const rest = job.samples.length - job.from
 				droppedSamples += rest
 				pendingCount -= rest
 				droppedBytes += (job.meta && job.meta.bytes) || 0
+				pending.splice(firstSampleIdx, 1)
+				if (firstSampleIdx === 0 || pending[0].kind !== 'samples') firstSampleIdx = 0
 			}
+			if (!droppedSamples) return
 			stats.backlogDropped += droppedSamples
-			noteGap({ reason: 'plugin_backlog', at: now(), gen: streamGen, missedSamples: droppedSamples, bytes: droppedBytes })
+			// 断点插到「被丢数据原本所在」的位置（上面已把最老的样点段从队头拿掉）
+			const head = { kind: 'break', info: { reason: 'plugin_backlog', at: now(), gen: streamGen, missedSamples: droppedSamples, bytes: droppedBytes } }
+			if (pending.length && pending[0].kind === 'break') {
+				pending[0].info = Object.assign({}, pending[0].info, {
+					missedSamples: (pending[0].info.missedSamples || 0) + droppedSamples,
+					bytes: (pending[0].info.bytes || 0) + droppedBytes,
+				})
+			} else {
+				pending.unshift(head)
+			}
+			stats.gaps++
+			stats.lastGap = head.info
 		}
 
 		// ---- claim.rx ----
 		/**
 		 * claim.rx 回调：只做「校验 offset/gen + 解码 + 入队」，不 await 长任务、不抛错。
 		 * 返回值固定 undefined —— 宿主串行发送并按回调结束自动 ack。
+		 * 解析器返回的是**带断点的连续段**：段与段之间要各自入队，缺口按真实位置插进去。
 		 */
 		function handleRx(event) {
 			if (!event || typeof event !== 'object') return undefined
@@ -229,14 +326,23 @@
 			const bytes = toBytes(event.bytes)
 
 			if (evGen && evGen !== streamGen) {
-				// 换 gen：这是新一次 open 的字节流，从它自己的 offset 重新算，不算缺口
-				if (streamGen) stats.genSwitches++
+				// 换 gen：这是新一次 open 的字节流，从它自己的 offset 重新算
+				const hadStream = !!streamGen
+				if (hadStream) stats.genSwitches++
 				resetStream(evGen, offset == null ? 0 : offset)
+				if (hadStream) {
+					// 旧流的残帧与计数器判据都不能带进新流
+					parser = createParser()
+					stats.parserRebuilds++
+				}
 				// 新流的第一批可能不是从 0 开始（宿主已丢过前段），按缺口记
 				if (offset != null && offset > 0) {
 					stats.offsetGaps++
 					stats.gapBytes += offset
-					noteGap({ reason: 'stream_start_offset', at: at, gen: evGen, offset: offset, bytes: offset })
+					enqueueBreak({ reason: 'stream_start_offset', at: at, gen: evGen, offset: offset, bytes: offset })
+				} else if (hadStream) {
+					// 即使 offset 是 0，新旧两次 open 之间也是一段空白（第一次 open 之前没有数据）
+					enqueueBreak({ reason: 'gen_switch', at: at, gen: evGen, offset: 0, bytes: 0 })
 				}
 			} else if (offset != null) {
 				if (offset !== expectedOffset) {
@@ -244,12 +350,14 @@
 					if (missing > 0) {
 						stats.offsetGaps++
 						stats.gapBytes += missing
-						noteGap({ reason: 'offset_gap', at: at, gen: streamGen, expectedOffset: expectedOffset, offset: offset, bytes: missing })
+						enqueueBreak({ reason: 'offset_gap', at: at, gen: streamGen, expectedOffset: expectedOffset, offset: offset, bytes: missing })
+						breakStream()
 					}
 					// offset 反向（理论上不该发生）：同样按不连续处理
 					else if (offset < expectedOffset) {
 						stats.offsetGaps++
-						noteGap({ reason: 'offset_rewind', at: at, gen: streamGen, expectedOffset: expectedOffset, offset: offset, bytes: 0 })
+						enqueueBreak({ reason: 'offset_rewind', at: at, gen: streamGen, expectedOffset: expectedOffset, offset: offset, bytes: 0 })
+						breakStream()
 					}
 				}
 			}
@@ -268,31 +376,37 @@
 			}
 
 			if (onBytes && onBytes(bytes, { gen: streamGen, seq: seq, offset: offset, at: at }) === true) return undefined
-			const before = parser.lostSamples || 0
-			let out
+			let result
 			try {
-				out = parser.push(bytes)
+				result = parser.push(bytes)
 			} catch (e) {
 				// 回调抛错会被宿主当成「已消费」而吞掉，所以这里必须自己接住并标缺口
 				stats.decodeErrors++
 				onLog('样点解码失败：' + (e && e.message ? e.message : e), 'error')
-				noteGap({ reason: 'decode_error', at: at, gen: streamGen })
+				enqueueBreak({ reason: 'decode_error', at: at, gen: streamGen })
+				breakStream()
 				return undefined
 			}
-			const after = parser.lostSamples || 0
-			if (after > before) {
-				// 设备侧计数器跳变：相位没错，但确实丢了样点
-				stats.sampleLossGaps++
-				noteGap({ reason: 'sample_loss', at: at, gen: streamGen, missedSamples: after - before, bytes: 0 })
+			const segments = (result && result.segments) || []
+			let total = 0
+			for (let i = 0; i < segments.length; i++) total += segments[i].samples.length
+			stats.samples += total
+			for (let i = 0; i < segments.length; i++) {
+				const seg = segments[i]
+				if (seg.breakBefore) {
+					// 解析器自己发现的断点（丢样点 / 重同步 / 坏字）也是缺口，按位置入队
+					stats.parserGaps++
+					enqueueBreak({
+						reason: seg.breakBefore.reason,
+						at: at,
+						gen: streamGen,
+						missedSamples: seg.breakBefore.missedSamples || 0,
+						bytes: seg.breakBefore.bytes || 0,
+						badSamples: seg.breakBefore.badSamples || 0,
+					})
+				}
+				enqueueSamples(seg.samples, at, { gen: streamGen, seq: seq, offset: offset, bytes: bytes.length, segment: i })
 			}
-			stats.samples += out.length
-			if (!out.length) return undefined
-			pending.push({ samples: out, at: at, meta: { gen: streamGen, seq: seq, offset: offset, bytes: bytes.length }, from: 0 })
-			pendingCount += out.length
-			// 硬上限兜底：绝不让队列无限长，也绝不因为跟不上就静默丢
-			if (pendingCount > MAX_PENDING) trimPending()
-			// 入库排到回调外面：回调要尽快返回（宿主串行发下一批 + 自动 ack）
-			scheduleFlush()
 			return undefined
 		}
 
@@ -307,10 +421,10 @@
 			const bytes = Number(e.bytes) || 0
 			stats.hostGaps++
 			stats.gapBytes += bytes
-			const at = now()
 			// reason 原样透出（宿主目前是 'overflow' / 'closing'），未知值不要谎报成 overflow
 			const reason = typeof e.reason === 'string' && e.reason ? e.reason : 'overflow'
-			noteGap({ reason: reason, at: at, gen: evGen || streamGen, offset: Number(e.offset) || 0, bytes: bytes })
+			enqueueBreak({ reason: reason, at: now(), gen: evGen || streamGen, offset: Number(e.offset) || 0, bytes: bytes })
+			breakStream()
 			return { gap: true, bytes: bytes }
 		}
 
@@ -428,9 +542,10 @@
 			return { ok: true, stale: false }
 		}
 
+		/** 上层（界面 / 看门狗）自己发现的缺口：同样排进有序队列，保证不插到旧样点前面 */
 		function noteExternalGap(reason, info) {
 			stats.hostGaps++
-			noteGap(Object.assign({ reason: reason, at: Date.now(), gen: streamGen }, info || {}))
+			enqueueBreak(Object.assign({ reason: reason, at: now(), gen: streamGen }, info || {}))
 		}
 
 		return {
@@ -444,6 +559,7 @@
 			handleGap: handleGap,
 			handleDropped: handleGap, // 兼容旧名
 			handleClaimState: handleClaimState,
+			flushQueue: flushQueue,
 			noteExternalGap: noteExternalGap,
 			isOpen: function () { return open },
 			isOpening: function () { return opening },

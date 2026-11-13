@@ -77,19 +77,24 @@ function wordsToBytes(list) {
 	const parser = new P.SampleParser(new P.Converter(P.defaultModifiers()))
 	const bytes = wordsToBytes([word(10, 2), word(20, 2), word(30, 2)])
 	const a = parser.push(bytes.subarray(0, 6))
-	assert.equal(a.length, 1, '6 字节能解 1 个整帧')
+	assert.equal(a.segments.length, 1)
+	assert.equal(a.segments[0].samples.length, 1, '6 字节能解 1 个整帧')
+	assert.equal(a.segments[0].breakBefore, null, '流开头没有断点')
 	assert.equal(parser.remainder.length, 2)
 	const b = parser.push(bytes.subarray(6))
-	assert.equal(b.length, 2, '残 2 字节 + 新 6 字节 = 2 个整帧')
+	assert.equal(b.segments.length, 1)
+	assert.equal(b.segments[0].samples.length, 2, '残 2 字节 + 新 6 字节 = 2 个整帧')
+	assert.equal(b.segments[0].breakBefore, null, '纯残帧拼接仍是连续的一段')
 	assert.equal(parser.remainder.length, 0)
 }
 
-// ---- 相位重同步：中间丢 1 个字节，学习完之后能找回相位 ----
+// ---- 相位重同步：中间丢 1 个字节 → 断点出现在正确位置 ----
 {
 	const parser = new P.SampleParser(new P.Converter(P.defaultModifiers()))
 	// 先喂够 LEARN_WORDS 量的样点建立恒定位判据
 	const warm = wordsToBytes(Array.from({ length: 600 }, () => word(500, 3, 0xff)))
-	parser.push(warm)
+	const r0 = parser.push(warm)
+	assert.equal(r0.segments.length, 1, '学习期是一整段')
 	assert.ok(parser.lockMask !== 0, '学习后应得到恒定位掩码：' + parser.lockMask)
 	const resyncBefore = parser.resyncCount
 	// 丢一个字节后再给一批合法样点
@@ -97,28 +102,57 @@ function wordsToBytes(list) {
 	const broken = new Uint8Array(tail.length + 1)
 	broken[0] = 0x5a // 相位被打断
 	broken.set(tail, 1)
-	parser.push(broken)
+	const r = parser.push(broken)
 	assert.ok(parser.resyncCount > resyncBefore, '必须重同步（否则整段波形会是锯齿）')
 	assert.ok(parser.droppedBytes > 0)
-	assert.ok(parser.lostSamples >= 0)
+	// 重同步丢掉的字节是一个断点，且它把数据切成两段（前段可能为空）
+	const withBreak = r.segments.filter((s) => s.breakBefore)
+	assert.equal(withBreak.length, 1, '断点只出现一次：' + JSON.stringify(r.segments.map((s) => s.breakBefore)))
+	assert.equal(withBreak[0].breakBefore.reason, 'resync')
+	assert.ok(withBreak[0].breakBefore.bytes >= 1, '断点记下丢掉的字节数')
+	// 断点两侧的样点不能进同一段
+	assert.ok(r.segments.length >= 1)
 }
 
-// ---- 非法字不当电流画出去 ----
+// ---- 设备侧计数器跳变：批内断点，且位置精确 ----
 {
 	const parser = new P.SampleParser(new P.Converter(P.defaultModifiers()))
-	const warm = wordsToBytes(Array.from({ length: 600 }, () => word(500, 3, 0xff)))
-	parser.push(warm)
-	const bad = new Uint8Array(4 * 4)
-	// range = 7 在 14 位域之外（>5），整批都非法
-	for (let i = 0; i < 4; i++) {
-		const w = (0x7 << 14) | 0x1234
-		bad[i * 4] = w & 0xff
-		bad[i * 4 + 1] = (w >>> 8) & 0xff
-		bad[i * 4 + 2] = (w >>> 16) & 0xff
-		bad[i * 4 + 3] = (w >>> 24) & 0xff
+	parser.push(wordsToBytes(Array.from({ length: 600 }, () => word(500, 3, 0xff))))
+	assert.equal(parser.counterOk, true, '计数器判据可用')
+	// 造 40 个样点：前 21 个与上一个样点连续，之后计数器跳 7（= 丢 6 个样点）
+	// 直接从解析器的 lastCounter 续，避免测试自己把计数器推乱
+	const last = parser.lastCounter
+	const list = []
+	for (let i = 0; i < 40; i++) {
+		const c = i <= 20 ? (last + 1 + i) & 0x3f : (last + 1 + i + 6) & 0x3f
+		list.push((((0xff) << 24) | (c << 18) | (3 << 14) | ((700 + i) & 0x3fff)) >>> 0)
 	}
-	parser.push(bad)
-	assert.ok(parser.badSamples > 0, '非法字要计入 badSamples')
+	const r = parser.push(wordsToBytes(list))
+	assert.equal(r.segments.length, 2, '计数器跳变把这一批切成两段：' + JSON.stringify(r.segments.map((s) => s.samples.length)))
+	assert.equal(r.segments[0].samples.length, 21, '断点前 21 个样点：' + r.segments[0].samples.length)
+	assert.equal(r.segments[0].breakBefore, null)
+	assert.equal(r.segments[1].samples.length, 19, '断点后 19 个样点')
+	assert.equal(r.segments[1].breakBefore.reason, 'sample_loss')
+	assert.equal(r.segments[1].breakBefore.missedSamples, 6, '丢点数量按计数器差算：' + r.segments[1].breakBefore.missedSamples)
+	assert.ok(parser.lostSamples >= 6)
+}
+
+// ---- 断点跨 push 保留：一批以断点结尾，下一批的第一段必须带着它 ----
+{
+	const parser = new P.SampleParser(new P.Converter(P.defaultModifiers()))
+	parser.push(wordsToBytes(Array.from({ length: 600 }, () => word(500, 3, 0xff))))
+	const last = parser.lastCounter
+	// 第一批的最后一个样点计数器跳变，然后这一批就结束了
+	const first = []
+	for (let i = 0; i < 8; i++) first.push((((0xff) << 24) | (((last + 1 + i) & 0x3f) << 18) | (3 << 14) | (800 & 0x3fff)) >>> 0)
+	first.push((((0xff) << 24) | (((last + 40) & 0x3f) << 18) | (3 << 14) | (801 & 0x3fff)) >>> 0)
+	const r1 = parser.push(wordsToBytes(first))
+	assert.equal(r1.segments.length, 2)
+	assert.equal(r1.segments[1].samples.length, 1, '跳变之后还有 1 个点')
+	// 下一批的第一段不带断点（断点已经随上一个段交付了）
+	const r2 = parser.push(wordsToBytes([(((0xff) << 24) | (((last + 41) & 0x3f) << 18) | (3 << 14) | (802 & 0x3fff)) >>> 0]))
+	assert.equal(r2.segments.length, 1)
+	assert.equal(r2.segments[0].breakBefore, null, '断点只报一次')
 }
 
 // ---- 主机重采样 ----

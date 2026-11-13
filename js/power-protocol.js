@@ -264,6 +264,8 @@
 		this.resyncCount = 0
 		this.droppedBytes = 0
 		this.badSamples = 0
+		// 上一次 push 尾部留下的断点（下一个 segment 要带着它进队列）
+		this.pendingBreak = null
 		this._learnReset()
 	}
 
@@ -283,6 +285,7 @@
 	SampleParser.prototype.reset = function () {
 		this.remainder = new Uint8Array(0)
 		this.converter.resetFilter()
+		this.pendingBreak = null
 		this._learnReset()
 	}
 
@@ -352,22 +355,68 @@
 		return true
 	}
 
-	/** 计数器跳变 = 真丢样点（区别于相位错位）。跨度 >64 会少算，只作量级参考 */
+	/**
+	 * 计数器跳变 = 真丢样点（区别于相位错位）。跨度 >64 会少算，只作量级参考。
+	 * @returns {number} 本点之前丢掉的样点数（0 表示连续）
+	 */
 	SampleParser.prototype._countLoss = function (raw) {
 		const c = (raw >>> POS_COUNTER) & MASK_COUNTER
+		let lost = 0
 		if (this.lastCounter >= 0) {
 			const step = (c - this.lastCounter + COUNTER_MOD) % COUNTER_MOD
-			if (step !== 1) this.lostSamples += (step - 1 + COUNTER_MOD) % COUNTER_MOD
+			if (step !== 1) {
+				lost = (step - 1 + COUNTER_MOD) % COUNTER_MOD
+				this.lostSamples += lost
+			}
 		}
 		this.lastCounter = c
+		return lost
 	}
 
 	/**
+	 * 流式解码：把一个字节块解析成若干**连续样点段**，段与段之间是断点。
+	 *
+	 * 断点来源：设备侧计数器跳变（真丢样点）、相位重同步时丢掉的字节、以及判据不可信时
+	 * 丢弃的坏字。调用方必须按段入队、在段之间插入缺口；绝不能把相邻两段接起来算，
+	 * 也不能把一次 push 的结果当成一整段（一次 read 里本来就可能既有坏字节也有好数据）。
+	 *
+	 * 缺的字节数记在 droppedBytes，丢的样点估数记在 lostSamples（都是累计统计）。
+	 *
 	 * @param {Uint8Array} buf
-	 * @returns {{ iUA: number, range: number, logic: number }[]}
+	 * @returns {{ segments: { samples: object[], breakBefore: object|null }[] }}
+	 *   breakBefore: null 表示这一段与上一段连续（流开头也算连续）；
+	 *   否则 { reason: 'sample_loss'|'resync'|'bad_sample', missedSamples, bytes, badSamples }。
 	 */
 	SampleParser.prototype.push = function (buf) {
-		if (!buf || !buf.length) return []
+		const segments = []
+		let cur = []
+		// 上一次调用尾部留下的断点：下一个 segment 必须带着它
+		let curBreak = this.pendingBreak || null
+		this.pendingBreak = null
+
+		function addMissed(target, k) {
+			if (!(k > 0)) return target
+			if (!target) return { reason: 'sample_loss', missedSamples: k, bytes: 0, badSamples: 0 }
+			target.missedSamples += k
+			return target
+		}
+		function addBytes(target, k) {
+			if (!(k > 0)) return target
+			if (!target) return { reason: 'resync', missedSamples: 0, bytes: k, badSamples: 0 }
+			target.bytes += k
+			return target
+		}
+		function addBad(target, k) {
+			if (!(k > 0)) return target
+			if (!target) return { reason: 'bad_sample', missedSamples: 0, bytes: 0, badSamples: k }
+			target.badSamples += k
+			return target
+		}
+
+		if (!buf || !buf.length) {
+			if (curBreak) this.pendingBreak = curBreak
+			return { segments: segments }
+		}
 		let data
 		if (this.remainder.length) {
 			data = new Uint8Array(this.remainder.length + buf.length)
@@ -376,7 +425,17 @@
 		} else {
 			data = buf instanceof Uint8Array ? buf : new Uint8Array(buf)
 		}
-		const out = []
+		const self = this
+		// 断点出现时先把当前段封口；如果这一段还没有样点，断点留到下一段（合并计数）
+		function cut(next) {
+			if (cur.length) {
+				segments.push({ samples: cur, breakBefore: curBreak })
+				cur = []
+				curBreak = next || null
+			} else {
+				curBreak = curBreak ? mergeBreak(curBreak, next) : (next || null)
+			}
+		}
 		let off = 0
 		const n = data.length
 		// 重同步至少要能校验 RESYNC_CONFIRM 个字加上 3 字节相位偏移
@@ -385,26 +444,28 @@
 		let probeFails = 0
 		while (off + SAMPLE_BYTES <= n) {
 			let raw = rawAt(data, off)
-			if (this.learnLeft > 0) {
-				this._learn(raw)
-				out.push(this.converter.handleRaw(raw))
+			if (self.learnLeft > 0) {
+				self._learn(raw)
+				cur.push(self.converter.handleRaw(raw))
 				off += SAMPLE_BYTES
 				continue
 			}
-			if (this.lockMask && !this._looksValid(raw)) {
+			if (self.lockMask && !self._looksValid(raw)) {
 				// 设备/驱动丢字节会让 4 字节相位永久错位，且 range 被 clamp 成 5 后
 				// 看着像几十安的锯齿。这里试 1/2/3 字节偏移找回相位。
 				let fixed = false
+				let shiftUsed = 0
 				if (n - off >= probeNeed && probeFails < DROP_LIMIT) {
 					for (let shift = 1; shift < SAMPLE_BYTES; shift++) {
-						if (this._phaseLocks(data, off + shift, n, RESYNC_CONFIRM)) {
+						if (self._phaseLocks(data, off + shift, n, RESYNC_CONFIRM)) {
 							off += shift
-							this.droppedBytes += shift
-							this.resyncCount++
+							self.droppedBytes += shift
+							self.resyncCount++
+							shiftUsed = shift
 							// 错位期间的样点已经污染了档位切换滤波的滑动均值，不清会继续外溢
-							this.converter.resetFilter()
+							self.converter.resetFilter()
 							// 错位期读到的计数器来自坏相位，据此算丢点是噪声，跳过一个间隔
-							this.lastCounter = -1
+							self.lastCounter = -1
 							raw = rawAt(data, off)
 							fixed = true
 							break
@@ -413,24 +474,47 @@
 				}
 				if (fixed) {
 					probeFails = 0
+					// 丢掉的字节 = 数据结构上的断点：前后样点不属于同一连续区间
+					cut(addBytes(null, shiftUsed))
 				} else {
 					probeFails++
-					this.badSamples++
+					self.badSamples++
 					// 锁不上就整点丢掉，不要把坏字当电流画出去——用户看到的几十安
 					// 尖峰就是这么来的。丢一个点远好过在波形上凭空造一个 49 A。
 					// 但连续丢太多说明判据本身可能就是错的，那就退回原样放行。
 					if (probeFails < DROP_LIMIT) {
+						cut(addBad(null, 1))
 						off += SAMPLE_BYTES
 						continue
 					}
 				}
 			}
-			if (this.counterOk) this._countLoss(raw)
-			out.push(this.converter.handleRaw(raw))
+			if (self.counterOk) {
+				// 计数器跳变 = 真丢样点（区别于相位错位）：这里必须断开
+				const lost = self._countLoss(raw)
+				if (lost > 0) cut(addMissed(null, lost))
+			}
+			cur.push(self.converter.handleRaw(raw))
 			off += SAMPLE_BYTES
 		}
-		this.remainder = off < n ? data.subarray(off) : new Uint8Array(0)
-		return out
+		self.remainder = off < n ? data.subarray(off) : new Uint8Array(0)
+		if (cur.length) {
+			segments.push({ samples: cur, breakBefore: curBreak })
+			curBreak = null
+		}
+		if (curBreak) self.pendingBreak = curBreak
+		return { segments: segments }
+	}
+
+	function mergeBreak(a, b) {
+		if (!a) return b || null
+		if (!b) return a
+		return {
+			reason: a.reason,
+			missedSamples: (a.missedSamples || 0) + (b.missedSamples || 0),
+			bytes: (a.bytes || 0) + (b.bytes || 0),
+			badSamples: (a.badSamples || 0) + (b.badSamples || 0),
+		}
 	}
 
 	// ---- 主机重采样（对照 Python RateAdjuster；基速可换实测）----

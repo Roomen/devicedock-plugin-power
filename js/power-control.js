@@ -73,6 +73,8 @@
 		let acq = VIEW ? VIEW.createAcqTrigger() : null
 		let trigLevelUA = null
 		let stopScheduled = false
+		// 缺口计数（长跑模式没有波形环，摘要里也得有数）
+		let gapCount = 0
 		// 长期模式的折叠总览（minimap）：长跑时不进波形环，只留 min/max 总览
 		const folding = new PROTO.FoldingBuffer(10000)
 		let warmupLeft = 0
@@ -172,10 +174,27 @@
 		}
 
 		// ---- 缺口：时间轴断开，能量不许跨缺口积分 ----
+		//
+		// 缺口是**有序**到达的（power-claim 把断点排进同一个队列），所以这里看到它时，
+		// 断点之前的样点已经全部入库。必须同时把「跨样点累积」的状态全部清掉：
+		//  - 主机重采样累加器：否则缺口两侧的电流会被平均进同一个输出点；
+		//  - 采样沿触发的滞回状态与等待期 pre-range；
+		//  - 上一个样点的时间戳：下一段第一个点重新起算，dt 不跨缺口。
 		function noteGap(info) {
 			const idx = wave && typeof wave.total === 'function' ? wave.total() : 0
 			if (wave && typeof wave.noteGap === 'function') wave.noteGap(idx)
 			gapPending = true
+			gapCount++
+			rateAdj.reset()
+			if (acq) {
+				acq.startState = 0
+				acq.stopState = 0
+				if (!acq.storeEnabled) {
+					acq.preMin = Infinity
+					acq.preMax = -Infinity
+				}
+			}
+			lastTMs = 0
 			onChange()
 			return { at: idx, info: info || null }
 		}
@@ -446,6 +465,7 @@
 			sessionT0Ms = 0
 			lastTMs = 0
 			gapPending = false
+			gapCount = 0
 			resetLongStats()
 			folding.reset()
 			voltageChanges = 0
@@ -723,6 +743,8 @@
 				storeEnabled: acq.storeEnabled,
 				startLatched: acq.startLatched,
 				waiting: acq.start !== 'off' && !acq.storeEnabled,
+				startState: acq.startState,
+				stopState: acq.stopState,
 				preMin: acq.preMin,
 				preMax: acq.preMax,
 			}

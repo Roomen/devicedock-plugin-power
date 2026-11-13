@@ -74,7 +74,9 @@ function makeHarness(opts) {
 	const wave = {
 		pushed: 0,
 		scriptedStats: null,
-		push() { wave.pushed++; return true },
+		// lastPushed 让用例能断言「实际入库的电流值」，而不只是条数
+		push(v) { wave.pushed++; wave.lastPushed = v; return true },
+		lastPushed: null,
 		reset() { wave.pushed = 0 },
 
 		// total / retained 可以分别设定：模拟「旧样点被淘汰」
@@ -399,6 +401,47 @@ test('长期模式：仍然维护折叠总览（minimap），但不进波形环'
 	// 清空会话时总览也清掉
 	h.control.clearSessionState()
 	assert.equal(h.control.foldingLength(), 0)
+})
+
+test('缺口（有序到达）：清空重采样累加器，缺口两侧不平均成同一个输出点', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	await h.control.startSampling()
+	// 100 kHz 原始流：每个输出点需要 100 个原始样点。先喂 50 个（不足一个输出点）
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	assert.equal(feed(1000, 50), 0, '半个窗口先攒着，不出点')
+	// 缺口：累加器必须被清空
+	h.control.noteGap({ reason: 'offset_gap' })
+	// 再喂 50 个 0 µA 的点：如果累加器没清，会凑出一个 (1000*50+0*50)/100 = 500 µA 的假点
+	const stored = feed(0, 50)
+	assert.equal(stored, 0, '缺口之后不能把两段拼成一个输出点：' + stored)
+	// 再补满一个完整窗口：出来的是纯 0 µA
+	const more = feed(0, 50)
+	assert.equal(more, 1)
+	assert.ok(h.wave.lastPushed != null && Math.abs(h.wave.lastPushed) < 1e-9,
+		'输出点必须是 0 µA，而不是 (1000+0)/2 = 500：' + h.wave.lastPushed)
+})
+
+test('缺口（有序到达）：采样沿触发的滞回状态与 pre-range 一起重置', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('rise', 'off')
+	await h.control.startSampling()
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(10, 300) // 低：等沿中，累计 pre-range
+	assert.ok(isFinite(h.control.acqState().preMin), '等沿时累计 pre-range')
+	h.control.noteGap({ reason: 'offset_gap' })
+	assert.equal(h.control.acqState().preMin, Infinity, '缺口后 pre-range 清零')
+	assert.equal(h.control.acqState().startState, 0, '缺口后沿状态复位')
 })
 
 test('电压在采样中改变：摘要标出这一点', async () => {
