@@ -1,0 +1,372 @@
+/* 功耗分析插件：仪器台式界面。冷调墨色中性色 + 单一钴蓝 accent；
+   所有 -- 变量都带本地兜底值，宿主没推送 tokens 时也能看清。
+   字号只用 7 档（micro…page），不加装饰动效，不设 cursor，悬停不做位移/缩放。 */
+
+:root {
+	--bg-body: #f5f7fa;
+	--bg-surface: #ffffff;
+	--bg-sunken: #eef1f5;
+	--bg-code: #f2f5f9;
+	--text-primary: #111827;
+	--text-secondary: #4b5565;
+	--text-muted: #6b7487;
+	--border-color: rgba(17, 24, 39, 0.12);
+	--border-light: rgba(17, 24, 39, 0.07);
+	--accent: #1f5fbf;
+	--accent-light: rgba(31, 95, 191, 0.08);
+	--success: #16a34a;
+	--warning: #b45309;
+	--danger: #dc2626;
+	--fs-micro: 11px;
+	--fs-small: 12px;
+	--fs-body: 13px;
+	--fs-body-lg: 14px;
+	--fs-title: 16px;
+	--fs-figure: 20px;
+	--fs-page: 28px;
+	--font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	--radius-xs: 4px;
+	--radius-sm: 6px;
+	--radius-lg: 8px;
+	--sp-1: 4px;
+	--sp-2: 8px;
+	--sp-3: 12px;
+	--sp-4: 16px;
+	--sp-5: 20px;
+	--sp-6: 24px;
+	--ctl-h: 30px;
+}
+
+[data-theme='dark'] {
+	--bg-body: #0b0d14;
+	--bg-surface: #11141c;
+	--bg-sunken: #07080d;
+	--bg-code: #161a24;
+	--text-primary: #eef0f5;
+	--text-secondary: #a3a9b8;
+	--text-muted: #7a8296;
+	--border-color: rgba(238, 240, 245, 0.14);
+	--border-light: rgba(238, 240, 245, 0.08);
+	--accent: #7fb1ff;
+	--accent-light: rgba(127, 177, 255, 0.12);
+	--success: #4ade80;
+	--warning: #f0a35e;
+	--danger: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+	margin: 0;
+	display: flex;
+	flex-direction: column;
+	gap: var(--sp-3);
+	padding: var(--sp-4);
+	background: var(--bg-body);
+	color: var(--text-primary);
+	font-family: var(--font-sans);
+	font-size: var(--fs-body);
+	line-height: 1.45;
+	overflow: hidden;
+}
+
+/* ---- 标题行 ---- */
+.head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: var(--sp-3);
+	padding-bottom: var(--sp-2);
+	border-bottom: 1px solid var(--border-color);
+}
+
+.head h1 {
+	margin: 0;
+	font-size: var(--fs-title);
+	font-weight: 500;
+	letter-spacing: 0;
+}
+
+.head .sub {
+	margin-left: var(--sp-2);
+	color: var(--text-muted);
+	font-size: var(--fs-small);
+}
+
+.chips {
+	display: flex;
+	align-items: center;
+	gap: var(--sp-2);
+}
+
+.chip {
+	padding: 2px var(--sp-2);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-xs);
+	color: var(--text-secondary);
+	font-family: var(--font-mono);
+	font-size: var(--fs-micro);
+	white-space: nowrap;
+}
+
+.chip[data-state='on'] { color: var(--success); border-color: currentColor; }
+.chip[data-state='busy'] { color: var(--accent); border-color: currentColor; }
+.chip[data-state='warn'] { color: var(--warning); border-color: currentColor; }
+
+/* ---- 工具条 ---- */
+.bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--sp-2);
+	padding: var(--sp-2) var(--sp-3);
+	background: var(--bg-surface);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-lg);
+}
+
+.bar .group {
+	display: flex;
+	align-items: center;
+	gap: var(--sp-2);
+}
+
+.bar .sep {
+	width: 1px;
+	height: 20px;
+	background: var(--border-color);
+}
+
+.bar label {
+	color: var(--text-muted);
+	font-size: var(--fs-micro);
+}
+
+select, input[type='number'], input[type='text'] {
+	height: var(--ctl-h);
+	padding: 0 var(--sp-2);
+	background: var(--bg-surface);
+	color: var(--text-primary);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-sm);
+	font-family: inherit;
+	font-size: var(--fs-small);
+}
+
+input[type='number'] { width: 92px; font-family: var(--font-mono); }
+select:disabled, input:disabled, button:disabled { opacity: 0.45; }
+
+button {
+	height: var(--ctl-h);
+	padding: 0 var(--sp-3);
+	background: var(--bg-surface);
+	color: var(--text-primary);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-sm);
+	font-family: inherit;
+	font-size: var(--fs-small);
+	transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+
+button:hover:not(:disabled) { background: var(--accent-light); border-color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+button[data-primary='1'] {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #ffffff;
+}
+
+button[aria-pressed='true'] {
+	border-color: var(--accent);
+	color: var(--accent);
+}
+
+button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
+
+.seg {
+	display: inline-flex;
+	align-items: center;
+	gap: 0;
+}
+
+.seg button {
+	border-radius: 0;
+	margin-left: -1px;
+}
+
+.seg button:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); margin-left: 0; }
+.seg button:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.seg button[aria-pressed='true'] { background: var(--accent-light); }
+
+/* ---- 主体 ---- */
+.body {
+	flex: 1;
+	min-height: 0;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 340px;
+	gap: var(--sp-3);
+}
+
+.panel {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	background: var(--bg-surface);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-lg);
+}
+
+.panel-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--sp-2);
+	padding: var(--sp-2) var(--sp-3);
+	border-bottom: 1px solid var(--border-light);
+}
+
+.panel-head h2 {
+	margin: 0;
+	font-size: var(--fs-body-lg);
+	font-weight: 500;
+}
+
+.panel-head .meta {
+	color: var(--text-muted);
+	font-family: var(--font-mono);
+	font-size: var(--fs-micro);
+}
+
+.scope-wrap {
+	position: relative;
+	flex: 1;
+	min-height: 0;
+	background: var(--bg-sunken);
+}
+
+#wave {
+	display: block;
+	width: 100%;
+	height: 100%;
+}
+
+.scope-empty {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	color: var(--text-muted);
+	font-size: var(--fs-small);
+}
+
+.readouts {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 1px;
+	background: var(--border-light);
+	border-top: 1px solid var(--border-color);
+}
+
+.readout {
+	padding: var(--sp-2) var(--sp-3);
+	background: var(--bg-surface);
+}
+
+.readout .k {
+	color: var(--text-muted);
+	font-size: var(--fs-micro);
+}
+
+.readout .v {
+	margin-top: 2px;
+	font-family: var(--font-mono);
+	font-size: var(--fs-figure);
+	font-variant-numeric: tabular-nums;
+	letter-spacing: -0.01em;
+}
+
+.readout .u {
+	margin-left: 3px;
+	color: var(--text-secondary);
+	font-size: var(--fs-small);
+}
+
+.readout[data-accent='1'] .v { color: var(--accent); }
+
+.side {
+	display: flex;
+	flex-direction: column;
+	gap: var(--sp-3);
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.side .panel-section {
+	padding: var(--sp-3);
+	border-top: 1px solid var(--border-light);
+}
+
+.side .panel-section:first-of-type { border-top: 0; }
+
+.rows {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 2px var(--sp-3);
+	margin: 0;
+	font-size: var(--fs-small);
+}
+
+.rows dt { color: var(--text-muted); }
+.rows dd {
+	margin: 0;
+	text-align: right;
+	font-family: var(--font-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+.rows dd[data-warn='1'] { color: var(--warning); }
+
+.hint {
+	margin: var(--sp-2) 0 0;
+	color: var(--text-muted);
+	font-size: var(--fs-micro);
+}
+
+.actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--sp-2);
+	margin-top: var(--sp-2);
+}
+
+.log {
+	flex: 1;
+	min-height: 120px;
+	max-height: 220px;
+	margin: 0;
+	padding: var(--sp-2) var(--sp-3);
+	overflow-y: auto;
+	background: var(--bg-code);
+	border-top: 1px solid var(--border-light);
+	border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+	font-family: var(--font-mono);
+	font-size: var(--fs-micro);
+	line-height: 1.5;
+	list-style: none;
+}
+
+.log li { white-space: pre-wrap; word-break: break-word; }
+.log li[data-level='warn'] { color: var(--warning); }
+.log li[data-level='error'] { color: var(--danger); }
+.log li[data-level='success'] { color: var(--success); }
+.log .t { color: var(--text-muted); }
+
+@media (max-width: 1080px) {
+	.body { grid-template-columns: minmax(0, 1fr) 300px; }
+	.readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

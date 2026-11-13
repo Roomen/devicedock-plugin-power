@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Power Analyzer</title>
+	<link rel="icon" href="icon.svg" type="image/svg+xml">
+	<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+	<header class="head">
+		<div>
+			<h1>Power Analyzer<span class="sub">current and power capture over an exclusively claimed serial port</span></h1>
+		</div>
+		<div class="chips">
+			<span class="chip" id="chip-port" data-state="off">port: none</span>
+			<span class="chip" id="chip-sampling" data-state="off">idle</span>
+			<span class="chip" id="chip-gaps">gaps: 0</span>
+			<span class="chip" id="chip-theme">theme: light</span>
+		</div>
+	</header>
+
+	<section class="bar">
+		<div class="group">
+			<label for="port">Port</label>
+			<select id="port" aria-label="Serial port"><option value="">no ports</option></select>
+			<button type="button" id="btn-refresh">Refresh</button>
+			<button type="button" id="btn-connect">Connect</button>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<label>Mode</label>
+			<span class="seg">
+				<button type="button" id="btn-mode-wave" aria-pressed="true">Waveform</button>
+				<button type="button" id="btn-mode-long" aria-pressed="false">Long stats</button>
+			</span>
+			<label for="rate">Rate</label>
+			<select id="rate" aria-label="Sample rate">
+				<option value="1000">1 kHz</option>
+				<option value="10000">10 kHz</option>
+				<option value="100000">100 kHz</option>
+			</select>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<label for="voltage">Source voltage (mV)</label>
+			<input type="number" id="voltage" min="500" max="5000" step="100" value="3300">
+			<button type="button" id="btn-apply-voltage">Apply</button>
+			<button type="button" id="btn-power" aria-pressed="false">DUT on</button>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<button type="button" id="btn-sample" data-primary="1">Start capture</button>
+			<button type="button" id="btn-clear">Clear</button>
+		</div>
+	</section>
+
+	<main class="body">
+		<section class="panel">
+			<div class="panel-head">
+				<h2>Current</h2>
+				<div class="meta" id="scope-meta">no data</div>
+			</div>
+			<div class="scope-wrap">
+				<canvas id="wave"></canvas>
+				<div class="scope-empty" id="scope-empty">Connect the analyzer and start a capture</div>
+			</div>
+			<div class="readouts">
+				<div class="readout" data-accent="1">
+					<div class="k">Current</div>
+					<div class="v" id="ro-current">0<span class="u">µA</span></div>
+				</div>
+				<div class="readout">
+					<div class="k">Power</div>
+					<div class="v" id="ro-power">0<span class="u">µW</span></div>
+				</div>
+				<div class="readout">
+					<div class="k">Voltage</div>
+					<div class="v" id="ro-voltage">—<span class="u">mV</span></div>
+				</div>
+				<div class="readout">
+					<div class="k">Samples kept</div>
+					<div class="v" id="ro-samples">0</div>
+				</div>
+			</div>
+		</section>
+
+		<aside class="side">
+			<section class="panel">
+				<div class="panel-head">
+					<h2>Session</h2>
+					<div class="meta" id="session-meta">—</div>
+				</div>
+				<div class="panel-section">
+					<dl class="rows">
+						<dt>Duration</dt><dd id="st-duration">0 s</dd>
+						<dt>Rate</dt><dd id="st-rate">—</dd>
+						<dt>Samples</dt><dd id="st-samples">0</dd>
+						<dt>Data gaps</dt><dd id="st-gaps" data-warn="0">0</dd>
+						<dt>Energy</dt><dd id="st-energy">—</dd>
+						<dt>Charge</dt><dd id="st-charge">—</dd>
+						<dt>Power state</dt><dd id="st-power">unknown</dd>
+					</dl>
+					<p class="hint" id="gaps-hint">Gaps come from the host dropping batches or from the device losing samples; time and energy never span a gap.</p>
+					<dl class="rows">
+						<dt>Window start</dt><dd id="win-start">0</dd>
+						<dt>Window mean</dt><dd id="win-mean">—</dd>
+						<dt>Window min / max</dt><dd id="win-range">—</dd>
+					</dl>
+				</div>
+			</section>
+
+			<section class="panel">
+				<div class="panel-head">
+					<h2>Storage</h2>
+					<div class="meta" id="store-meta">—</div>
+				</div>
+				<div class="panel-section">
+					<dl class="rows">
+						<dt>Cold (raw equivalent)</dt><dd id="store-raw">0 B</dd>
+						<dt>Cold (compressed)</dt><dd id="store-comp">0 B</dd>
+						<dt>Cold blocks</dt><dd id="store-blocks">0</dd>
+						<dt>Limits</dt><dd id="store-caps">—</dd>
+					</dl>
+					<div class="actions">
+						<label for="cap">Cold cap (MiB)</label>
+						<input type="number" id="cap" min="16" max="2048" step="16" value="512">
+						<button type="button" id="btn-apply-cap">Apply</button>
+					</div>
+					<p class="hint">Cold data lives in memory only (the sandbox has no disk). When the cap is hit, the oldest blocks are dropped and marked as gaps.</p>
+					<div class="actions">
+						<label for="view">Window</label>
+						<select id="view" aria-label="Waveform window">
+							<option value="2">2 s</option>
+							<option value="10" selected>10 s</option>
+							<option value="60">60 s</option>
+							<option value="600">10 min</option>
+						</select>
+					</div>
+				</div>
+			</section>
+
+			<section class="panel">
+				<div class="panel-head">
+					<h2>Export</h2>
+					<div class="meta" id="export-meta">limit 8 MiB</div>
+				</div>
+				<div class="panel-section">
+					<div class="actions">
+						<button type="button" id="btn-export-view">Export window</button>
+						<button type="button" id="btn-export-all">Export all</button>
+						<button type="button" id="btn-export-summary">Export summary</button>
+					</div>
+					<p class="hint" id="export-hint">Exports go through the host file saver. Anything past 8 MiB is refused with the exact size, never truncated.</p>
+				</div>
+			</section>
+
+			<section class="panel" style="flex:1;min-height:0">
+				<div class="panel-head">
+					<h2>Log</h2>
+					<div class="meta" id="log-meta">0 lines</div>
+				</div>
+				<ul class="log" id="log"></ul>
+			</section>
+		</aside>
+	</main>
+
+	<script src="sdk/devicedock-plugin.js"></script>
+	<script src="js/power-protocol.js"></script>
+	<script src="js/power-lane.js"></script>
+	<script src="js/power-analysis.js"></script>
+	<script src="js/power-store.js"></script>
+	<script src="js/power-wave.js"></script>
+	<script src="js/power-claim.js"></script>
+	<script src="js/power-control.js"></script>
+	<script src="js/power-export.js"></script>
+	<script src="js/app.js"></script>
+</body>
+</html>

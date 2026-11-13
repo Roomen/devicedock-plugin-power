@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "power",
+	"name": "Power Analyzer",
+	"version": "1.0.0",
+	"apiVersion": 1,
+	"kind": "web",
+	"entry": "index.html",
+	"icon": "icon.svg",
+	"capabilities": [
+		"device.read",
+		"serial.claim",
+		"app",
+		"log"
+	],
+	"integrity": {
+		"index.html": "sha256-e751c926a52a4f1ce6ce34109841303e8a5e9260ad2d8bd1568956eae436a8f9",
+		"css/app.css": "sha256-35cdbb4879aa8df391cea2d919736d25d4749b7dcd3c6bbb7d222e7670508386",
+		"icon.svg": "sha256-0e7895208f7c430de80e831eb62c74f2bfadadac59454c4a65159aa699da79b1",
+		"js/app.js": "sha256-e50fb7fcfb26454f6c0fea10a144912d7a8e634e01ec4bb05c11a7bcd9d85230",
+		"js/power-protocol.js": "sha256-f911029ab3aa3812e6eb822233bcc5bbce0e3e204ab2460c0bf8ad276081c510",
+		"js/power-lane.js": "sha256-2f51dbafbdf592b2fae03066f439e91ba9d1df3f8c0700fced6b0d6d9f72db4a",
+		"js/power-analysis.js": "sha256-7316ff239b6dd6dea2319f56dc0235d2aa75a1247716449c4be91ee448587622",
+		"js/power-store.js": "sha256-5e54f221f59fb0cbd06a9c5eda10a6744ba2f900cb5731637afdc5f78d4ded65",
+		"js/power-wave.js": "sha256-eaabaa3ba68d613660b070ae2e4e447cb2f3ab45e073f389c615c5ed7dc58d2a",
+		"js/power-claim.js": "sha256-237eed611f3e1370b6a523a6549b9826ee92c1c39ce15bbdfd85c03012bd547a",
+		"js/power-control.js": "sha256-a6bdc15721bb7a97ebc689997c9ab91b9378df63f03d2031fa9f9193d6bc4b4d",
+		"js/power-export.js": "sha256-6251cf4e8a711e87623fb61ef4410a2c36639bac8ca1c77918d39d803cccf7e2",
+		"sdk/devicedock-plugin.js": "sha256-c1ff17c257a7ea8f4c2d95358696b24effb98306eaf742e101b5873846b0fbfd"
+	},
+	"homepage": "https://github.com/Roomen/devicedock-plugin-power",
+	"license": "MIT"
+}

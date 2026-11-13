@@ -1,0 +1,15 @@
+{
+	"name": "devicedock-plugin-power",
+	"version": "1.0.0",
+	"private": true,
+	"description": "DeviceDock plugin: current/power waveform capture and analysis over an exclusively claimed serial port",
+	"license": "MIT",
+	"type": "commonjs",
+	"scripts": {
+		"build": "node tools/build.mjs --out-dir dist",
+		"test": "node tests/power-protocol.cjs && node tests/power-lane.cjs && node tests/power-wave-store.cjs && node tests/power-store.cjs && node tests/power-claim.cjs && node tests/power-control.cjs && node tests/power-export.cjs && node tests/app-smoke.cjs"
+	},
+	"engines": {
+		"node": ">=22"
+	}
+}
