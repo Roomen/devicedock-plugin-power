@@ -23,6 +23,9 @@
 
 	// 浏览器里由 <script> 顺序保证已加载；node 单测里按相对路径取同一份实现
 	const PROTO = global.PowerProtocol || (typeof require === 'function' ? require('./power-protocol.js') : null)
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
+	const msg = I18N.msg
 
 	function toBytes(value) {
 		if (!value) return new Uint8Array(0)
@@ -76,6 +79,10 @@
 		const scheduleDrain = typeof cfg.scheduleDrain === 'function'
 			? cfg.scheduleDrain
 			: function (fn) { return setTimeout(fn, 0) }
+		// 单次写入的上限：宿主迟迟不确认时按失败结束，排在后面的操作（尤其是 STOP）不会被无限期挡住
+		const WRITE_TIMEOUT_MS = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 3000
+		const setTimer = typeof cfg.setTimeout === 'function' ? cfg.setTimeout : function (fn, ms) { return setTimeout(fn, ms) }
+		const clearTimer = typeof cfg.clearTimeout === 'function' ? cfg.clearTimeout : function (t) { clearTimeout(t) }
 
 		let claimId = null
 		// 未 open 时以收到的第一条 claim.rx 的 claimId 为准（真机上 open 之后才有数据）
@@ -111,7 +118,19 @@
 			decodeErrors: 0,
 			backlogDropped: 0,
 			drainedBytes: 0,
+			// 诊断：收发字节与最近一次错误（实机回报用）
+			txWrites: 0,
+			txBytes: 0,
+			txFailures: 0,
+			lastTxAt: 0,
+			lastRxAt: 0,
+			lastError: null,
 			lastGap: null,
+		}
+
+		function noteError(message) {
+			// message 是当时语言的文本（测试 / 宿主日志用）；ref 保留惰性消息，诊断面板切语言时按新语言重绘
+			stats.lastError = { at: now(), message: String(message), ref: message }
 		}
 
 		function emitState() {
@@ -193,7 +212,7 @@
 					try {
 						onGap(job.info)
 					} catch (e) {
-						onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error')
+						onLog(msg('clm.gap_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 					}
 					// 断点不占样点预算，但也要让出线程
 					if (pending.length && now() - started >= DRAIN_BUDGET_MS) break
@@ -213,7 +232,7 @@
 				try {
 					onSamples(chunk, job.at, meta)
 				} catch (e) {
-					onLog('样点处理出错：' + (e && e.message ? e.message : e), 'error')
+					onLog(msg('clm.samples_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				}
 				// 按时间预算让出线程：重活（画布/统计刷新）由上层自己排，这里只负责把队列喂进去
 				if (pending.length && now() - started >= DRAIN_BUDGET_MS) break
@@ -235,7 +254,7 @@
 				const job = pending[0]
 				if (job.kind === 'break') {
 					pending.shift()
-					try { onGap(job.info) } catch (e) { onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error') }
+					try { onGap(job.info) } catch (e) { onLog(msg('clm.gap_handler_failed', { err: (e && e.message ? e.message : e) }), 'error') }
 				} else {
 					const rest = job.samples.length - job.from
 					const take = Math.min(rest, DRAIN_CHUNK)
@@ -247,7 +266,7 @@
 					try {
 						onSamples(chunk, job.at, Object.assign({}, job.meta, { from: from, total: job.samples.length }))
 					} catch (e) {
-						onLog('样点处理出错：' + (e && e.message ? e.message : e), 'error')
+						onLog(msg('clm.samples_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 					}
 				}
 				drained += Math.max(0, before - pendingCount)
@@ -367,6 +386,7 @@
 			if (seq) lastSeq = seq
 			stats.events++
 			stats.bytes += bytes.length
+			if (bytes.length) stats.lastRxAt = now()
 			if (offset != null) expectedOffset = offset + bytes.length
 			else if (bytes.length) expectedOffset += bytes.length
 
@@ -385,7 +405,8 @@
 			} catch (e) {
 				// 回调抛错会被宿主当成「已消费」而吞掉，所以这里必须自己接住并标缺口
 				stats.decodeErrors++
-				onLog('样点解码失败：' + (e && e.message ? e.message : e), 'error')
+				noteError(msg('clm.decode_failed', { err: (e && e.message ? e.message : e) }))
+				onLog(msg('clm.decode_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				enqueueBreak({ reason: 'decode_error', at: at, gen: streamGen })
 				breakStream()
 				return undefined
@@ -442,7 +463,7 @@
 					opening = false
 					gen++
 					emitState()
-					onLog('占用声明已被释放，串口按已关闭处理', 'warn')
+					onLog(msg('clm.claim_released'), 'warn')
 				}
 				return
 			}
@@ -467,9 +488,9 @@
 		 * 半成品声明自己释放掉，失败原因原样抛出。
 		 */
 		async function openOn(key) {
-			if (!host || !host.claim) throw new Error('宿主没有提供串口占用能力')
+			if (!host || !host.claim) throw new Error(tr('clm.no_claim_api'))
 			if (open || opening) {
-				try { await close() } catch (e) { /* 旧连接关闭失败不阻止新连接，但要记下来 */ onLog('关闭旧连接失败：' + (e && e.message ? e.message : e), 'warn') }
+				try { await close() } catch (e) { /* 旧连接关闭失败不阻止新连接，但要记下来 */ onLog(msg('clm.close_old_failed', { err: (e && e.message ? e.message : e) }), 'warn') }
 			}
 			opening = true
 			emitState()
@@ -478,7 +499,7 @@
 			try {
 				const res = await host.claim.acquire(String(key), 'exclusive')
 				acquiredId = res && res.claimId ? res.claimId : null
-				if (!acquiredId) throw new Error('宿主未返回占用声明')
+				if (!acquiredId) throw new Error(tr('clm.no_claim_id'))
 				claimId = acquiredId
 				portKey = String(key)
 				await host.claim.open(acquiredId, { baudRate: baudRate })
@@ -500,7 +521,8 @@
 				lastSeq = 0
 				resetStream(0, 0)
 				stats.openFailures++
-				onLog('打开串口失败：' + (e && e.message ? e.message : e), 'error')
+				noteError(msg('clm.open_failed', { err: (e && e.message ? e.message : e) }))
+				onLog(msg('clm.open_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				throw e
 			} finally {
 				// 无论成功失败都要退出 Opening，界面才不会卡死
@@ -542,18 +564,55 @@
 			const myGen = gen
 			const myId = claimId
 			if (!open || !myId) {
-				if (note) onLog('写入失败（未打开）：' + note, 'error')
+				noteError(msg('clm.write_not_open', { note: note || '—' }))
+				if (note) onLog(msg('clm.write_not_open', { note: note }), 'error')
 				return { ok: false, stale: false }
 			}
-			const data = toBytes(bytes)
+			// 宿主 claim.write 只收 0..255 的普通数组或十六进制串（plugin-rpc.toBytes）；
+			// Uint8Array 经 postMessage 结构化克隆后仍是 Uint8Array，会被整条拒成 bad_request。
+			const data = Array.from(toBytes(bytes))
+			stats.txWrites++
+			const TIMED_OUT = {}
+			let timer = null
 			try {
-				await host.claim.write(myId, data)
+				// 宿主的写入结果在超时之后才到也不能成未处理的拒绝
+				const hostWrite = Promise.resolve().then(function () { return host.claim.write(myId, data) })
+				hostWrite.catch(function () {})
+				const res = await Promise.race([
+					hostWrite,
+					new Promise(function (resolve) { timer = setTimer(function () { resolve(TIMED_OUT) }, WRITE_TIMEOUT_MS) }),
+				])
+				if (res === TIMED_OUT) {
+					// 插件侧超时不会取消宿主写入：宿主仍在等这条写完，之后照样可能执行。
+					// 超时只表示「结果未知」，settled 保留宿主写入的最终结果（兑现 / 失败），
+					// 改变设备状态的调用方必须等它收尾（例如 START 迟到兑现后补 STOP）。
+					stats.txFailures++
+					const m = msg('clm.write_timeout', { note: note || '—', ms: WRITE_TIMEOUT_MS })
+					noteError(m)
+					onLog(m, 'error')
+					const settled = hostWrite.then(function () {
+						stats.txBytes += data.length
+						stats.lastTxAt = now()
+						return { ok: true }
+					}, function (e) {
+						// SDK 自己的 RPC 超时同样不代表宿主没写：仍算未知
+						return { ok: false, error: e, unknown: !!(e && e.code === 'timeout') }
+					})
+					return { ok: false, stale: false, timedOut: true, settled: settled, error: { message: msg('clm.timeout_short', { ms: WRITE_TIMEOUT_MS }), code: 'timeout' } }
+				}
 			} catch (e) {
-				onLog('写入错误' + (note ? '（' + note + '）' : '') + '：' + (e && e.message ? e.message : e), 'error')
+				const detail = (e && e.message ? e.message : String(e)) + (e && e.code ? ' [' + e.code + ']' : '')
+				stats.txFailures++
+				noteError(msg('clm.write_failed', { note: note || '—', err: detail }))
+				onLog(msg('clm.write_failed', { note: note || '—', err: detail }), 'error')
 				return { ok: false, stale: false, error: e }
+			} finally {
+				if (timer != null) clearTimer(timer)
 			}
+			stats.txBytes += data.length
+			stats.lastTxAt = now()
 			if (!open || gen !== myGen || claimId !== myId) {
-				if (note) onLog('写入完成时连接已变化：' + note, 'warn')
+				if (note) onLog(msg('clm.write_stale', { note: note }), 'warn')
 				return { ok: false, stale: true }
 			}
 			return { ok: true, stale: false }
@@ -620,7 +679,28 @@
 		}
 	}
 
-	const api = { createClaimLink: createClaimLink, toBytes: toBytes }
+	// 唯一支持的设备：宿主给出的设备名（别名 / 产品名）里含 BLU（不区分大小写）。
+	// 只看名字字段，不看 portName（cu.usbmodem… / COMx 与设备类型无关）。
+	const ANALYZER_NAME = /blu/i
+	const ANALYZER_NAME_FIELDS = ['alias', 'productName', 'name']
+
+	function isAnalyzerPort(p) {
+		if (!p || typeof p !== 'object') return false
+		for (let i = 0; i < ANALYZER_NAME_FIELDS.length; i++) {
+			const v = p[ANALYZER_NAME_FIELDS[i]]
+			if (typeof v === 'string' && ANALYZER_NAME.test(v)) return true
+		}
+		return false
+	}
+
+	/** @returns {{ ports: Array, hidden: number }} 只留 BLU 口；hidden 是被筛掉的口数（空态提示用） */
+	function filterAnalyzerPorts(list) {
+		const all = Array.isArray(list) ? list : []
+		const ports = all.filter(isAnalyzerPort)
+		return { ports: ports, hidden: all.length - ports.length }
+	}
+
+	const api = { createClaimLink: createClaimLink, toBytes: toBytes, isAnalyzerPort: isAnalyzerPort, filterAnalyzerPorts: filterAnalyzerPorts }
 	global.PowerClaim = api
 	if (typeof module !== 'undefined' && module.exports) module.exports = api
 })(typeof window !== 'undefined' ? window : globalThis)

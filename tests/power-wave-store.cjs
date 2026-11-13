@@ -71,7 +71,8 @@ function load(store, opts) {
 		ramCapSamples: opts.cap || CHUNK * 4,
 		voltage: () => env.voltageV,
 		samplePeriod: () => env.samplePeriodSec,
-		log: (m) => logs.push(m),
+		// log 收到的可能是惰性消息（切语言可重绘），按当前语言转成文本再断言
+		log: (m) => logs.push(String(m)),
 		scheduleUI: () => {},
 		onStorageStop: () => { stops++ },
 		rawBudgetBytes: opts.rawBudgetBytes != null ? opts.rawBudgetBytes : Infinity,

@@ -24,6 +24,8 @@ function makeHarness(opts) {
 		samples: 0,
 		gaps: [],
 		onStoreInit: null,
+		defer: null,
+		deferred: [],
 	}
 	// 冷存储的 init 由测试决定做什么（例如「初始化期间连接断了」）
 	state.store = {
@@ -52,6 +54,14 @@ function makeHarness(opts) {
 				write: async (id, bytes) => {
 					state.writes.push({ id: id, bytes: Array.from(bytes) })
 					const n = state.writes.length
+					// 宿主永不确认这一条（卡死的写入）：靠链路的写入超时结束
+					if (state.hangOnByte != null && bytes[0] === state.hangOnByte) return new Promise(() => {})
+					// 宿主迟迟不确认、由用例决定何时兑现 / 失败（超时之后迟到完成）
+					if (typeof state.defer === 'function' && state.defer(bytes)) {
+						return new Promise((resolve, reject) => {
+							state.deferred.push({ bytes: Array.from(bytes), resolve: () => resolve({ bytes: bytes.length }), reject: reject })
+						})
+					}
 					if (state.writeDelay > 0) await wait(state.writeDelay)
 					if (state.writeFailAt && n >= state.writeFailAt) throw new Error('synthetic write failure')
 					if (state.writeMode === 'throw') throw new Error('synthetic write failure')
@@ -66,6 +76,7 @@ function makeHarness(opts) {
 		host: makeHost(),
 		baudRate: 115200,
 		scheduleDrain: (fn) => fn(),
+		writeTimeoutMs: opts.writeTimeoutMs,
 		onSamples: (list) => { state.samples += list.length },
 		onGap: (g) => state.gaps.push(g),
 		onLog: (msg, level) => state.logs.push({ msg: msg, level: level || '' }),
@@ -100,9 +111,10 @@ function makeHarness(opts) {
 		wave: wave,
 		store: state.store,
 		settings: { recordMode: opts.recordMode || 'wave', targetRateHz: 1000, voltageMv: 3300 },
-		options: { rxDrainMs: 0 },
+		options: Object.assign({ rxDrainMs: 0 }, opts.controlOptions || {}),
 		log: (msg, level) => state.logs.push({ msg: msg, level: level || '' }),
 		onChange: () => { state.changes++ },
+		onSamplingEnd: (info) => { state.ends = (state.ends || []).concat([info]) },
 	})
 
 	return { link, control, wave, state }
@@ -139,6 +151,47 @@ test('上电：电压成功后写 DUT 上电，状态记为 commanded', async ()
 	assert.equal(h.control.powerPayload().source, 'commanded')
 })
 
+test('上电命令等待回执时供电未知，确认后才显示上电', async () => {
+	const h = await connected({ writeTimeoutMs: 1000 })
+	h.control.markPowered(false, 'commanded')
+	const dut = Array.from(P.cmdDutPower(true))[0]
+	h.state.defer = (b) => b[0] === dut
+	const pending = h.control.setPower(true)
+	assert.ok(await until(() => h.state.deferred.length === 1))
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	h.state.deferred[0].resolve()
+	assert.equal((await pending).ok, true)
+	assert.equal(h.control.powerPayload().state, 'on')
+})
+
+test('下电命令等待回执时供电未知，确认后才显示下电', async () => {
+	const h = await connected({ writeTimeoutMs: 1000 })
+	h.control.markPowered(true, 'commanded')
+	const dut = Array.from(P.cmdDutPower(false))[0]
+	h.state.defer = (b) => b[0] === dut
+	const pending = h.control.setPower(false)
+	assert.ok(await until(() => h.state.deferred.length === 1))
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	h.state.deferred[0].resolve()
+	assert.equal((await pending).ok, true)
+	assert.equal(h.control.powerPayload().state, 'off')
+})
+
+test('较旧的供电写入在较新确认后返回，不得覆盖最新状态', async () => {
+	const h = await connected({ writeTimeoutMs: 1000 })
+	h.control.markPowered(true, 'commanded')
+	const dutOff = Array.from(P.cmdDutPower(false))
+	h.state.defer = (b) => Array.from(b).every((v, i) => v === dutOff[i]) && b.length === dutOff.length
+	const older = h.control.doPowerOff()
+	assert.ok(await until(() => h.state.deferred.length === 1))
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	assert.equal((await h.control.doPowerOn()).ok, true)
+	assert.equal(h.control.powerPayload().state, 'on')
+	h.state.deferred[0].resolve()
+	assert.equal((await older).ok, false)
+	assert.equal(h.control.powerPayload().state, 'on')
+})
+
 test('上电写失败：不谎称已上电，状态标成 unknown', async () => {
 	const h = await connected()
 	h.state.writeFailAt = 2 // 第一次(电压)成功，第二次(上电)失败
@@ -166,7 +219,7 @@ test('电压写失败：不把请求值当成已生效', async () => {
 	const r = await h.control.applyVoltageMv(1800)
 	assert.equal(r.ok, false)
 	assert.equal(r.stale, false)
-	assert.equal(h.control.readVoltageMv(), 3300, '仍保持上一次有效电压')
+	assert.equal(h.control.readVoltageMv(), null, '写入未确认时电压未知')
 })
 
 test('写入完成后连接已变化：不把结果算到新连接，也不改它的供电状态', async () => {
@@ -393,6 +446,464 @@ test('采样沿停止：命中停沿后自动停采（异步发 STOP，不在入
 	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), '发了 AVERAGE_STOP')
 })
 
+test('自动停采：停止沿命中后走与手动停相同的会话结束回调（reason=acq_stop），手动停为 manual', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300)
+	for (let i = 0; i < 40 && h.control.isSampling(); i++) await wait(5)
+	await wait(20)
+	assert.equal(h.control.isSampling(), false)
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }], '自动停采通知了会话结束（界面据此停看门狗、释放 busy）')
+	// 再开一次手动停：回调原因复位为 manual，不沿用上次的 acq_stop
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	await h.control.stopCapture()
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }, { reason: 'manual' }])
+})
+
+test('连接初始化与采集同队列：探测进行中点开始，探测的 STOP 不会落在采集的 START 之后', async () => {
+	const h = await connected()
+	const probe = h.control.probeDutPower()
+	const start = h.control.startCapture()
+	await probe
+	const r = await start
+	assert.equal(r.ok, true, JSON.stringify(r && r.code))
+	const ops = h.state.writes.map((w) => w.bytes[0]).filter((b) => b === 0x06 || b === 0x07)
+	// 探测 START/STOP → 采集前置 STOP → 采集 START，最后一个命令必须是 START
+	assert.deepEqual(ops, [0x06, 0x07, 0x07, 0x06], '写入顺序：' + ops.map((b) => b.toString(16)).join(','))
+	assert.equal(h.control.isSampling(), true)
+})
+
+test('启动前 STOP 写失败：中止启动、不写 START，返回原因并记错误日志', async () => {
+	const h = await connected()
+	h.state.writeFailAt = 1
+	const r = await h.control.startCapture()
+	assert.equal(r.ok, false)
+	assert.equal(r.code, 'capture_prestop_failed')
+	assert.equal(r.executed, false)
+	assert.match(String(r.ref), /STOP/)
+	assert.equal(h.state.writes.length, 1, '只尝试了前置 STOP，没有继续 START')
+	assert.equal(h.state.writes[0].bytes[0], 0x07)
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && /STOP/.test(String(l.msg))), '错误日志说明了 STOP 写失败')
+	assert.ok(!h.state.logs.some((l) => l.level === 'success'), '没有后续「采样已开始」盖掉失败')
+})
+
+test('队列满：停止沿自动停采不被丢弃，非停止操作才被拒', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0) // 让 startCapture 的出队记账先结算，下面 8 个才是真正占满队列的操作
+	// 8 个慢操作（每个都真的写电压）把队列塞满（上限 8），第 9 个非停止操作被拒；
+	// 单次写入够慢，停止沿命中时队列仍是满的
+	h.state.writeDelay = 100
+	const pending = []
+	for (let i = 0; i < 8; i++) pending.push(h.control.setVoltage(2000 + i * 100))
+	const rejected = await h.control.setVoltage(3300)
+	assert.equal(rejected.code, 'power_busy', '队列满时非停止操作被拒')
+	h.state.writes.length = 0
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300) // 命中停止沿，此时队列仍是满的
+	await Promise.all(pending)
+	for (let i = 0; i < 60 && h.control.isSampling(); i++) await wait(10)
+	await wait(30)
+	assert.equal(h.control.isSampling(), false, '停止沿在队列满时也必须停下采集')
+	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), 'STOP 真的写出去了')
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }])
+	assert.ok(!h.state.logs.some((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed'), '没有停采失败')
+})
+
+test('队列满：手动停止同样不被拒', async () => {
+	const h = await connected()
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writeDelay = 100
+	const pending = []
+	for (let i = 0; i < 8; i++) pending.push(h.control.setVoltage(2000 + i * 100))
+	assert.equal((await h.control.setVoltage(3300)).code, 'power_busy')
+	const r = await h.control.stopCapture()
+	await Promise.all(pending)
+	assert.equal(r.ok, true, '手动停止排进满队列后照常执行：' + (r && r.code))
+	assert.equal(h.control.isSampling(), false)
+})
+
+test('自动停采的结果被检查：STOP 写失败时记错误（上状态条），不只留「命中停止沿」', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	h.state.writeMode = 'throw'
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300)
+	for (let i = 0; i < 40 && !h.state.logs.some((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed'); i++) await wait(5)
+	const fail = h.state.logs.find((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed')
+	assert.ok(fail, '停采失败要记日志')
+	assert.equal(fail.level, 'error', '错误级（会上状态条）')
+})
+
+// 给可能卡死的等待加个上限：没修好时用例失败而不是整个进程挂住
+const HUNG = { hung: true }
+const within = (p, ms) => Promise.race([p, wait(ms).then(() => HUNG)])
+
+function feedOf(h) {
+	return (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+}
+
+test('停止合并：前面的操作卡住时反复请求停止只占一个队列位，自动 + 手动是同一个停止', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writes.length = 0
+	// 一个慢操作挡在队列前面
+	h.state.writeDelay = 150
+	const slow = h.control.setVoltage(2000)
+	const feed = feedOf(h)
+	feed(100, 300)
+	feed(0, 300) // 命中停止沿
+	await wait(10) // 自动停止已排队（仍被慢操作挡着）
+	const manual = []
+	for (let i = 0; i < 50; i++) manual.push(h.control.stopCapture())
+	assert.ok(manual.every((p) => p === manual[0]), '手动停止都合并成同一个待执行的停止')
+	// 停止只占一个队列位：慢操作 1 + 停止 1，还能再排 6 个非停止操作，第 7 个才被拒
+	const extra = []
+	for (let i = 0; i < 6; i++) extra.push(h.control.setVoltage(2100 + i * 10))
+	assert.equal((await h.control.setVoltage(2500)).code, 'power_busy', '队列上限仍然生效')
+	const r = await manual[0]
+	await slow
+	await Promise.all(extra)
+	assert.equal(r.ok, true)
+	assert.equal(h.control.isSampling(), false)
+	assert.equal(h.state.writes.filter((w) => w.bytes[0] === 0x07).length, 1, '只发了一条 STOP')
+	assert.equal(h.state.logs.filter((l) => l.msg && l.msg.key === 'ctl.acq_stop_hit').length, 1)
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }], '手动停止并入了自动停止，只结束一次')
+	// 停止执行完才清：之后可以重新开始、再次停止
+	h.state.writeDelay = 0
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	const again = await h.control.stopCapture()
+	assert.equal(again.ok, true)
+	assert.equal(h.state.writes.filter((w) => w.bytes[0] === 0x07).length, 3, '新一轮的前置 STOP + 停止 STOP')
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }, { reason: 'manual' }])
+})
+
+test('停止沿命中即数据截止：STOP 还在排队时，之后到达的样点不再入库', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writeDelay = 150
+	const slow = h.control.setVoltage(2000)
+	const feed = feedOf(h)
+	feed(100, 300)
+	const beforeMixed = h.wave.pushed
+	// 同一批里命中点之后的样点也不入库：低段命中下降沿，后面的高段整段被截掉
+	const mixed = []
+	for (let i = 0; i < 300; i++) mixed.push({ iUA: 0, range: 3, logic: 0xff })
+	for (let i = 0; i < 300; i++) mixed.push({ iUA: 100, range: 3, logic: 0xff })
+	h.control.pushSamples(mixed, 10, { from: 0, total: mixed.length })
+	const atHit = h.wave.pushed
+	assert.ok(atHit - beforeMixed <= 3, '命中点之后同批的样点被截掉：本批入库 ' + (atHit - beforeMixed))
+	await wait(20)
+	assert.equal(h.control.isSampling(), true, 'STOP 还被挡在队列里')
+	for (let k = 0; k < 5; k++) { feed(100, 300); feed(0, 300) }
+	assert.equal(h.wave.pushed, atHit, '截止后到达的样点一个都不入库')
+	await slow
+	for (let i = 0; i < 40 && h.control.isSampling(); i++) await wait(10)
+	assert.equal(h.control.isSampling(), false)
+	assert.equal(h.wave.pushed, atHit)
+	// 下一轮开始时截止标志复位
+	h.state.writeDelay = 0
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	const before = h.wave.pushed
+	feed(100, 300)
+	feed(100, 300)
+	assert.ok(h.wave.pushed > before, '新一轮照常入库')
+})
+
+test('写入超时：宿主不确认的写入按失败结束，原因带超时并记错误；排在后面的 STOP 照常执行', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	await h.control.startCapture()
+	await wait(0)
+	h.state.hangOnByte = 0x0d
+	const t0 = Date.now()
+	const v = h.control.setVoltage(2000)
+	const stop = h.control.stopCapture()
+	const vr = await within(v, 2000)
+	assert.notEqual(vr, HUNG, '卡死的写入必须在超时内结束')
+	assert.equal(vr.ok, false)
+	assert.equal(vr.code, 'voltage_write_failed')
+	assert.match(String(vr.cause), /60 ms/, '失败原因带超时：' + String(vr.cause))
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && l.msg && l.msg.key === 'clm.write_timeout'), '超时记错误日志（上状态条）')
+	const sr = await within(stop, 2000)
+	assert.notEqual(sr, HUNG, 'STOP 被卡死的写入挡住了')
+	assert.equal(sr.ok, true, 'STOP 没被卡死的写入挡住')
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(Date.now() - t0 < 1000, '在超时量级内完成：' + (Date.now() - t0) + ' ms')
+})
+
+test('存储初始化超时：中止启动、不发 START，返回原因并记错误', async () => {
+	const h = await connected({ controlOptions: { storeInitTimeoutMs: 50 } })
+	h.state.onStoreInit = () => new Promise(() => {})
+	const r = await within(h.control.startCapture(), 2000)
+	assert.notEqual(r, HUNG, '存储初始化卡住时启动必须在超时内结束')
+	assert.equal(r.ok, false)
+	assert.equal(r.code, 'store_init_timeout')
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(!h.state.writes.some((w) => w.bytes[0] === 0x06), '没有 START')
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && l.msg && l.msg.key === 'ctl.store_init_timeout'))
+	// 队列没被卡住：之后的操作照常执行
+	h.state.onStoreInit = null
+	assert.equal((await h.control.startCapture()).ok, true)
+})
+
+test('前置检查（guard.start）超时：操作不执行，返回 guard_timeout', async () => {
+	const h = await connected({ controlOptions: { guardTimeoutMs: 50 } })
+	const r = await within(h.control.setPower(true, { start: () => new Promise(() => {}) }), 2000)
+	assert.notEqual(r, HUNG, '前置检查卡住时必须在超时内结束')
+	assert.equal(r.code, 'guard_timeout')
+	assert.equal(h.state.writes.length, 0, '没有写任何命令')
+	assert.equal((await h.control.setPower(true)).ok, true, '队列没被卡住')
+})
+
+const cmdOps = (h) => h.state.writes.map((w) => w.bytes[0]).filter((b) => b === 0x06 || b === 0x07)
+const hasLog = (h, key, level) => h.state.logs.some((l) => l.msg && l.msg.key === key && (level == null || l.level === level))
+async function until(cond, ms) {
+	for (let i = 0; i < (ms || 1000) / 5 && !cond(); i++) await wait(5)
+	return cond()
+}
+const timeoutErr = () => Object.assign(new Error('rpc timeout'), { code: 'timeout' })
+
+test('START 超时后最新 STOP 确认即解除未知，旧回执不得覆盖', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	h.state.defer = (b) => b[0] === 0x06
+	const r = await within(h.control.startCapture(), 2000)
+	assert.equal(r.code, 'capture_start_unknown')
+	assert.ok(await until(() => !h.control.isStartUnknown()), '最新 STOP 确认后无需等旧 START')
+	assert.deepEqual(cmdOps(h), [0x07, 0x06, 0x07])
+	assert.ok(hasLog(h, 'ctl.start_settled_stop_confirmed', 'warn'))
+	h.state.deferred[0].resolve()
+	await wait(30)
+	assert.equal(h.control.isStartUnknown(), false, '旧 START 回执不改变状态')
+})
+
+test('START 超时且补的 STOP 也没确认：START 兑现后再补一条 STOP', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	let deferredStops = 0
+	h.state.defer = (b) => {
+		if (b[0] === 0x06) return true
+		// 只拖住 START 之后的第一条 STOP（超时当下补的那条）
+		if (b[0] === 0x07 && cmdOps(h).includes(0x06) && deferredStops === 0) { deferredStops++; return true }
+		return false
+	}
+	const r = await within(h.control.startCapture(), 2000)
+	assert.equal(r.code, 'capture_start_unknown')
+	assert.ok(await until(() => h.state.deferred.length === 2), 'START 与补的 STOP 都在等宿主')
+	await wait(100) // 补的 STOP 也超时了
+	h.state.deferred[0].resolve() // START 兑现：设备开始采样
+	h.state.deferred[1].reject(new Error('USB stall')) // 那条 STOP 最终失败
+	assert.ok(await until(() => !h.control.isStartUnknown()), '收尾')
+	assert.deepEqual(cmdOps(h), [0x07, 0x06, 0x07, 0x07], 'START 兑现而 STOP 失败 → 再补一条 STOP')
+	assert.ok(hasLog(h, 'ctl.start_settled_stopped', 'warn'))
+})
+
+test('START 与补的 STOP 都没有确定结果：保持未知并阻止启动', async () => {
+	const h = await connected({ writeTimeoutMs: 40 })
+	h.state.defer = (b) => b[0] === 0x06 || (b[0] === 0x07 && cmdOps(h).includes(0x06))
+	assert.equal((await h.control.startCapture()).code, 'capture_start_unknown')
+	// 宿主 SDK 自己的 RPC 超时也只算「未知」
+	for (let n = 0; n < 3; n++) {
+		assert.ok(await until(() => h.state.deferred.length > n), '第 ' + (n + 1) + ' 条等待中的写入')
+		await wait(60)
+		h.state.deferred[n].reject(timeoutErr())
+	}
+	assert.ok(await until(() => hasLog(h, 'ctl.start_settled_unknown', 'error')))
+	assert.equal(h.control.isStartUnknown(), true)
+	assert.equal((await h.control.startCapture()).code, 'start_unknown_pending')
+	assert.deepEqual(cmdOps(h), [0x07, 0x06, 0x07, 0x07])
+	assert.ok(hasLog(h, 'ctl.start_settled_unknown', 'error'))
+})
+
+test('结果未知期间断开：收尾作废，迟到的结果不再改状态', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	h.state.defer = (b) => b[0] === 0x06 || (b[0] === 0x07 && cmdOps(h).includes(0x06))
+	assert.equal((await h.control.startCapture()).code, 'capture_start_unknown')
+	h.control.abortSession('disconnected')
+	assert.equal(h.control.isStartUnknown(), false, '连接变了：设备状态随连接重置')
+	h.state.deferred[0].resolve()
+	await wait(30)
+	assert.ok(!hasLog(h, 'ctl.start_settled_stopped') && !hasLog(h, 'ctl.start_settled_unknown'), '旧连接的收尾不再记结果')
+})
+
+test('电压 / 上电写入超时后迟到完成：以设备为准更新状态', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	h.state.defer = (b) => b[0] === 0x0d
+	const v = await h.control.setVoltage(2000)
+	assert.equal(v.ok, false)
+	assert.equal(h.control.readVoltageMv(), null, '超时后电压未知')
+	h.state.deferred[0].resolve()
+	assert.ok(await until(() => h.control.readVoltageMv() === 2000), '迟到兑现后电压按实际更新')
+	assert.ok(hasLog(h, 'ctl.voltage_applied_late', 'warn'))
+	const dut = Array.from(P.cmdDutPower(true))[0]
+	h.state.defer = (b) => b[0] === dut
+	h.state.deferred.length = 0
+	const p = await h.control.setPower(true)
+	assert.equal(p.ok, false)
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	h.state.deferred[0].resolve()
+	assert.ok(await until(() => h.control.powerPayload().state === 'on'), '迟到兑现后记为已上电')
+	assert.equal(h.control.powerPayload().source, 'commanded')
+	assert.ok(hasLog(h, 'ctl.power_on_late', 'warn'))
+})
+
+test('手动 STOP 明确失败后采集状态未知，阻止重启直到重连', async () => {
+	const h = await connected()
+	assert.equal((await h.control.startCapture()).ok, true)
+	h.state.writeMode = 'throw'
+	assert.equal((await h.control.stopCapture()).code, 'stop_write_failed')
+	assert.ok(!hasLog(h, 'ctl.stopped'), '失败不能记录设备已停')
+	assert.equal(h.control.isStartUnknown(), true)
+	h.state.writeMode = 'ok'
+	assert.equal((await h.control.startCapture()).code, 'start_unknown_pending')
+	h.control.abortSession('disconnected')
+	assert.equal(h.control.isStartUnknown(), false)
+})
+
+test('停止沿 STOP 明确失败后保持未知', async () => {
+	const h = await connected()
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	assert.equal((await h.control.startCapture()).ok, true)
+	h.state.writeMode = 'throw'
+	const feed = (ua) => h.control.pushSamples(Array.from({ length: 300 }, () => ({ iUA: ua, range: 3, logic: 0xff })), 10, { from: 0, total: 300 })
+	feed(100); feed(0)
+	assert.ok(await until(() => h.control.isStartUnknown()))
+	assert.equal((await h.control.startCapture()).code, 'start_unknown_pending')
+})
+
+test('探测 STOP 明确失败后保持未知', async () => {
+	const h = await connected({ controlOptions: { probeMs: 1 } })
+	h.state.writeFailAt = 2
+	await h.control.probeDutPower()
+	assert.equal(h.control.isStartUnknown(), true)
+	assert.equal((await h.control.startCapture()).code, 'start_unknown_pending')
+})
+
+test('探测 START 超时会补 STOP，最新 STOP 确认后旧回执不能改状态', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	h.state.defer = (b) => b[0] === 0x06 || b[0] === 0x07
+	assert.equal(await h.control.probeDutPower(), null)
+	assert.ok(await until(() => h.state.deferred.length === 2))
+	assert.equal(h.control.isStartUnknown(), true)
+	h.state.deferred[0].resolve()
+	await wait(20)
+	assert.equal(h.control.isStartUnknown(), true)
+	h.state.deferred[1].resolve()
+	assert.ok(await until(() => !h.control.isStartUnknown()))
+})
+
+test('探测 STOP 超时保持未知，迟到确认后解除', async () => {
+	const h = await connected({ writeTimeoutMs: 30, controlOptions: { probeMs: 1 } })
+	h.state.defer = (b) => b[0] === 0x07
+	assert.equal(await h.control.probeDutPower(), null)
+	assert.equal(h.control.isStartUnknown(), true)
+	assert.equal(await h.control.probeDutPower(), null)
+	h.state.deferred[0].resolve()
+	assert.ok(await until(() => !h.control.isStartUnknown()))
+})
+
+test('STOP 超时期间状态未知，迟到确认后允许重新启动', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	assert.equal((await h.control.startCapture()).ok, true)
+	h.state.defer = (b) => b[0] === 0x07
+	assert.equal((await h.control.stopCapture()).ok, false)
+	assert.equal(h.control.isStartUnknown(), true)
+	assert.equal((await h.control.startCapture()).code, 'start_unknown_pending')
+	h.state.deferred[0].resolve()
+	assert.ok(await until(() => !h.control.isStartUnknown()))
+})
+
+test('连续供电命令超时：旧回执不覆盖最新命令', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	const dut = Array.from(P.cmdDutPower(true))[0]
+	h.state.defer = (b) => b[0] === dut
+	assert.equal((await h.control.setPower(true)).ok, false)
+	assert.equal((await h.control.setPower(false)).ok, false)
+	h.state.deferred[0].resolve()
+	await wait(20)
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	h.state.deferred[1].resolve()
+	assert.ok(await until(() => h.control.powerPayload().state === 'off'))
+})
+
+test('连续电压命令超时：只有最新回执确定电压', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	h.state.defer = (b) => b[0] === 0x0d
+	await h.control.setVoltage(2000)
+	await h.control.setVoltage(2500)
+	h.state.deferred[0].resolve()
+	await wait(20)
+	assert.equal(h.control.readVoltageMv(), null)
+	h.state.deferred[1].resolve()
+	assert.ok(await until(() => h.control.readVoltageMv() === 2500))
+})
+
+test('较新的供电回执先到时生效，旧回执不能反转', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	const dut = Array.from(P.cmdDutPower(true))[0]
+	h.state.defer = (b) => b[0] === dut
+	await h.control.setPower(true)
+	await h.control.setPower(false)
+	h.state.deferred[1].resolve()
+	assert.ok(await until(() => h.control.powerPayload().state === 'off'))
+	h.state.deferred[0].resolve()
+	await wait(20)
+	assert.equal(h.control.powerPayload().state, 'off')
+})
+
+test('较新的电压回执先到时生效，旧回执不能反转', async () => {
+	const h = await connected({ writeTimeoutMs: 30 })
+	h.state.defer = (b) => b[0] === 0x0d
+	await h.control.setVoltage(2000)
+	await h.control.setVoltage(2500)
+	h.state.deferred[1].resolve()
+	assert.ok(await until(() => h.control.readVoltageMv() === 2500))
+	h.state.deferred[0].resolve()
+	await wait(20)
+	assert.equal(h.control.readVoltageMv(), 2500)
+})
+
 test('长期模式：仍然维护折叠总览（minimap），但不进波形环', async () => {
 	const h = await connected()
 	h.control.setRecordMode('long')
@@ -598,6 +1109,38 @@ test('长期模式：时长只累计有效间隔、缺口有计数、能量按�
 	h.control.setVoltageSource(1800)
 	assert.ok(Math.abs(h.control.overallStats().energyUWh - 6600 / 3600) < 1e-9, '改电压不改历史能量')
 	assert.ok(Math.abs(h.control.overallStats().volts - 3.3) < 1e-9, '有效电压仍是 3.3 V：' + h.control.overallStats().volts)
+})
+
+test('长期模式电压写入待确认期间采样未知，确认后仅后续样点已知', async () => {
+	const h = await connected({ writeTimeoutMs: 1000 })
+	h.control.setRecordMode('long')
+	h.control.ingest(0, 1000)
+	h.state.defer = (b) => b[0] === 0x0d
+	const pending = h.control.setVoltage(2500)
+	assert.ok(await until(() => h.state.deferred.length === 1))
+	assert.equal(h.control.readVoltageMv(), null)
+	h.control.ingest(1000, 1000)
+	h.state.deferred[0].resolve()
+	assert.equal((await pending).ok, true)
+	assert.equal(h.control.readVoltageMv(), 2500)
+	h.control.ingest(2000, 1000)
+	assert.equal(h.control.overallStats().energyUWh, null)
+	assert.equal(h.control.overallStats().voltsUnknown, true)
+})
+
+test('长期模式电压未知时功率和能量不可用，恢复不改写历史', async () => {
+	const h = await connected()
+	h.control.setRecordMode('long')
+	h.control.ingest(0, 1000)
+	h.control.setVoltageSource(null)
+	h.control.ingest(1000, 1000)
+	h.control.setVoltageSource(2500)
+	h.control.ingest(2000, 1000)
+	assert.equal(h.control.overallStats().avgP, null)
+	assert.equal(h.control.overallStats().energyUWh, null)
+	assert.equal(h.control.overallStats().volts, null)
+	assert.equal(h.control.captureSummary().voltsUnknown, true)
+	assert.equal(h.control.captureSummary().volts, null)
 })
 
 test('停止采样联动：claim 队列里待入库的样点会被 control 排空后才冻结', async () => {

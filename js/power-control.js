@@ -11,6 +11,9 @@
 
 	const PROTO = global.PowerProtocol || (typeof require === 'function' ? require('./power-protocol.js') : null)
 	const VIEW = global.PowerView || (typeof require === 'function' ? require('./power-view.js') : null)
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
+	const msg = I18N.msg
 
 	const DEFAULTS = {
 		rxDrainMs: 50,
@@ -19,6 +22,10 @@
 		probeMs: 250,
 		dutOnThresholdUA: 0.5,
 		maxQueueDepth: 8,
+		// 队列里会 await 外部的步骤都要有上限，否则排在后面的 STOP 会被无限期挡住
+		// （串口写入的超时在 power-claim 的 writeTimeoutMs）
+		storeInitTimeoutMs: 5000,
+		guardTimeoutMs: 5000,
 	}
 
 	function emptyStats() {
@@ -44,6 +51,9 @@
 		const log = typeof cfg.log === 'function' ? cfg.log : function () {}
 		const onChange = typeof cfg.onChange === 'function' ? cfg.onChange : function () {}
 		const onSampleStored = typeof cfg.onSampleStored === 'function' ? cfg.onSampleStored : function () {}
+		// 采样会话结束（任何途径：手动停、停止沿自动停、存储上限停）。界面在这里统一收尾
+		// （停看门狗、释放更新屏障、清告警），自动停采不能绕过这一步。
+		const onSamplingEnd = typeof cfg.onSamplingEnd === 'function' ? cfg.onSamplingEnd : function () {}
 		const clock = cfg.clock || {
 			setTimeout: function (fn, ms) { return setTimeout(fn, ms) },
 			clearTimeout: function (t) { clearTimeout(t) },
@@ -72,7 +82,17 @@
 		// 采样沿触发（start / stop）与它需要的触发电平
 		let acq = VIEW ? VIEW.createAcqTrigger() : null
 		let trigLevelUA = null
+		// 停止请求：同一时刻最多一个待执行的停止（自动 + 手动合并），执行完（成功或失败）才清
 		let stopScheduled = false
+		let stopPending = null
+		// 停止沿命中后数据侧立即截止：之后到达的样点不再进本次采集（STOP 命令按队列再发）
+		let stopCut = false
+		// START 写入超时：设备可能已经开始采样（宿主仍会写出去），结果未知。
+		// 收尾（补 STOP、等宿主写入兑现）完成前禁止再次开始；token 让断开 / 新连接作废旧的收尾
+		let startUnknown = false
+		let unknownToken = 0
+		let commandSequence = 0
+		const latestCommand = Object.create(null)
 		// 缺口计数（长跑模式没有波形环，摘要里也得有数）
 		let gapCount = 0
 		// 长期模式的折叠总览（minimap）：长跑时不进波形环，只留 min/max 总览
@@ -88,19 +108,23 @@
 		let metaCollecting = false
 		let metaBuf = ''
 		let probe = null
+		// 本次 stopSampling 的原因（停止沿自动停 / 手动），传给 onSamplingEnd
+		let stopReason = null
 		let opChain = Promise.resolve()
 		let opDepth = 0
 		// energyUAs: Σ i·dt（µA·s = µC）；energyUWs: Σ i·V(t)·dt（µW·s），电压按摄入时刻记，属历史口径
-		const longStats = { n: 0, sumI: 0, minI: Infinity, maxI: -Infinity, energyUAs: 0, energyUWs: 0, durSec: 0, gaps: 0, t0: 0, tLast: 0 }
+		const longStats = { n: 0, sumI: 0, minI: Infinity, maxI: -Infinity, energyUAs: 0, energyUWs: 0, voltsUnknown: false, durSec: 0, gaps: 0, t0: 0, tLast: 0 }
 
 		// ---- 串行队列：界面操作排队，后台（failFast）不排在界面操作后面 ----
+		// 停止类操作（o.stop：手动停、停止沿自动停）永不因忙 / 队列满被拒：拒掉就是采集停不下来。
+		// 上限只挡非停止操作；调用方必须检查返回的 ok，失败要显示出来。
 		function runOp(fn, o) {
 			o = o || {}
-			if (o.failFast && opDepth > 0) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: '功耗仪正在执行另一项操作，请稍后重试' })
+			if (o.failFast && !o.stop && opDepth > 0) {
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_running'), ref: msg('ctl.busy_running') })
 			}
-			if (opDepth >= opts.maxQueueDepth) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: '功耗仪操作队列已满，请稍后重试' })
+			if (!o.stop && opDepth >= opts.maxQueueDepth) {
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_queue'), ref: msg('ctl.busy_queue') })
 			}
 			opDepth++
 			const run = opChain.then(fn, fn)
@@ -108,9 +132,23 @@
 			return run
 		}
 
+		/** p 在 ms 内没结束就按 timeoutValue 结束（p 之后的拒绝被吞掉，不成未处理异常） */
+		function withTimeout(p, ms, timeoutValue) {
+			let timer = null
+			const inner = Promise.resolve(p)
+			inner.catch(function () {})
+			const limit = new Promise(function (resolve) { timer = clock.setTimeout(function () { resolve(timeoutValue) }, ms) })
+			const done = function () { if (timer != null && typeof clock.clearTimeout === 'function') clock.clearTimeout(timer) }
+			return Promise.race([inner, limit]).then(function (v) { done(); return v }, function (e) { done(); throw e })
+		}
+
 		function guardStart(guard) {
 			if (!guard || typeof guard.start !== 'function') return Promise.resolve(null)
-			return Promise.resolve(guard.start()).then(function (e) { return e || null })
+			const timedOut = { ok: false, code: 'guard_timeout', message: tr('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), ref: msg('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), executed: false }
+			return withTimeout(Promise.resolve().then(function () { return guard.start() }), opts.guardTimeoutMs, timedOut).then(function (e) {
+				if (e === timedOut) log(msg('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), 'error')
+				return e || null
+			})
 		}
 		function guardStep(guard) {
 			if (!guard || typeof guard.step !== 'function') return null
@@ -173,6 +211,7 @@
 			longStats.maxI = -Infinity
 			longStats.energyUAs = 0
 			longStats.energyUWs = 0
+			longStats.voltsUnknown = false
 			longStats.durSec = 0
 			longStats.gaps = 0
 			longStats.t0 = 0
@@ -225,7 +264,8 @@
 				return 0
 			}
 			// 未采样时段（探测结束后到 START 之间、STOP 后的残包）：字节已消费但不入库
-			if (!sampling) {
+			// 停止沿命中后到 STOP 真正执行前：同样不入库（数据侧已截止）
+			if (!sampling || stopCut) {
 				ignoredSamples += list.length
 				return 0
 			}
@@ -258,16 +298,20 @@
 						if (feedAcq(ua, 'start')) {
 							acq.storeEnabled = true
 							acq.startLatched = true
-							log('已命中采样启动沿，开始入库', 'success')
+							log(msg('ctl.acq_start_hit'), 'success')
 						}
 						continue
 					}
 					if (ingest(outs[k].tMs, ua, s)) stored++
-					// 停沿：入库之后生效，STOP 排到回调外异步发
+					// 停沿：命中点入库后数据侧立即截止（本批剩余与之后的样点都不再入库），STOP 排到回调外异步发
 					if (acq && acq.stop !== 'off' && acq.storeEnabled && feedAcq(ua, 'stop')) {
-						requestStop('已命中采样停止沿，停止采样')
+						requestStop(msg('ctl.acq_stop_hit'))
 						break
 					}
+				}
+				if (stopCut) {
+					ignoredSamples += list.length - i - 1
+					break
 				}
 			}
 			return stored
@@ -289,17 +333,51 @@
 			return VIEW.feedAcqEdge(acq, { iUA: ua, kind: kind, thr: trigLevel() })
 		}
 
-		/** 停采排到回调之外：绝不能在这条入库路径里 await */
+		/**
+		 * 排一个停止：已经有待执行的停止就复用它（自动 + 手动合并成同一个），不再入队。
+		 * stopScheduled 保持到这次停止真正执行完（成功或失败）才清。
+		 */
+		function queueStop(reason, guard) {
+			if (stopPending) return stopPending
+			stopScheduled = true
+			if (!stopReason) stopReason = reason
+			const run = runOp(async function () {
+				const g = await guardStart(guard)
+				if (g) return g
+				return await stopSampling(guard)
+			}, { stop: true })
+			const settle = function () {
+				if (stopPending === pending) {
+					stopPending = null
+					stopScheduled = false
+					stopReason = null
+				}
+			}
+			const pending = run.then(function (r) { settle(); return r }, function (e) { settle(); throw e })
+			stopPending = pending
+			return pending
+		}
+
+		/** 停沿命中：数据侧立即截止；STOP 排到回调之外发（绝不能在这条入库路径里 await） */
 		function requestStop(reason) {
+			stopCut = true
 			if (stopScheduled) return
 			stopScheduled = true
 			log(reason, 'warn')
 			clock.setTimeout(function () {
-				stopScheduled = false
-				if (!sampling) return
-				// stopSampling 内部只发一条 STOP，失败会自己记日志
-				stopSampling().catch(function (e) {
-					log('停止采样失败：' + (e && e.message ? e.message : e), 'error')
+				if (!sampling) {
+					if (!stopPending) stopScheduled = false
+					return
+				}
+				// 自动停采也排进操作队列（与手动停同一条路径），会话结束回调统一收尾
+				queueStop('acq_stop').then(function (r) {
+					// 结果必须看：停不下来或 STOP 没写出去都要上状态条，不能只留一条「命中停止沿」
+					if (!r || r.ok === false) {
+						const why = (r && (r.ref || r.message || r.code)) || msg('ui.unknown_reason')
+						log(msg('ctl.acq_stop_failed', { why: r && r.cause ? I18N.join([why, r.cause]) : why }), 'error')
+					}
+				}, function (e) {
+					log(msg('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				})
 			}, 0)
 		}
@@ -327,7 +405,8 @@
 				if (iUA < longStats.minI) longStats.minI = iUA
 				if (iUA > longStats.maxI) longStats.maxI = iUA
 				longStats.energyUAs += iUA * dt
-				longStats.energyUWs += iUA * (voltageMv != null ? voltageMv / 1000 : 0) * dt
+				if (voltageMv == null) longStats.voltsUnknown = true
+				else longStats.energyUWs += iUA * (voltageMv / 1000) * dt
 				// 时长只累计**有效**的段内间隔：缺口处 dt = 0，不能算进时长
 				longStats.durSec += dt
 				// 长期模式不进波形环，但仍然维护一条折叠总览（min/max 分桶），供 minimap 用
@@ -340,90 +419,173 @@
 			try {
 				onSampleStored(wave.total() - 1, tMs)
 			} catch (e) {
-				log('样点时间锚点更新失败：' + (e && e.message ? e.message : e), 'warn')
+				log(msg('ctl.anchor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 			}
 			return true
 		}
 
 		// ---- 写 ----
+		function errText(w) {
+			const e = w && w.error
+			if (!e) return ''
+			// message 可能是惰性消息（例如写入超时）：拼接也保持惰性，切语言时整句重翻
+			const m = e.message ? e.message : String(e)
+			return msg('ctl.err_detail', { msg: e.code ? I18N.join([m, ' [' + e.code + ']']) : m })
+		}
+
 		function writeRaw(bytes, note) {
 			if (!link || typeof link.write !== 'function') return Promise.resolve({ ok: false, stale: false })
 			return link.write(bytes, note)
 		}
 
+		// 每个状态维度独立判断最新命令；不同维度的写入不会互相掩盖。
+		async function writeState(domain, bytes, note) {
+			const seq = ++commandSequence
+			latestCommand[domain] = seq
+			const gen = genOf()
+			const result = await writeRaw(bytes, note)
+			return Object.assign({}, result, { commandDomain: domain, commandSeq: seq, commandGen: gen })
+		}
+		function isLatest(w) {
+			return !!w && latestCommand[w.commandDomain] === w.commandSeq && stillSameConn(w.commandGen)
+		}
+		function settleLatest(w, apply) {
+			settleOf(w).then(function (f) { if (f.ok && isLatest(w)) apply() })
+		}
+
+		/** 写入的最终结果：超时的写入等宿主兑现 / 失败（{ ok, error, unknown }），其余直接取当下结果 */
+		function settleOf(w) {
+			if (w && w.timedOut && w.settled && typeof w.settled.then === 'function') return w.settled
+			return Promise.resolve({ ok: !!(w && w.ok), error: w && w.error, unknown: !!(w && w.timedOut) })
+		}
+
+		function trackStopFailure(w) {
+			if (!w || w.ok || w.stale || !isLatest(w)) return
+			startUnknown = true
+			onChange()
+			settleLatest(w, function () {
+				startUnknown = false
+				onChange()
+			})
+		}
+
+		/** START 结果未知时补发 STOP；只由最新的采集命令确认设备状态。 */
+		function reconcileStart(startW, gen0) {
+			const token = ++unknownToken
+			startUnknown = true
+			onChange()
+			const finish = function (key, level, known) {
+				if (token !== unknownToken) return
+				if (known) startUnknown = false
+				if (key) log(msg(key), level)
+				onChange()
+			}
+			;(async function () {
+				let stopW = await writeState('sampling', PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+				let stopFinal = await settleOf(stopW)
+				if (token !== unknownToken || !stillSameConn(gen0) || !isLatest(stopW)) return
+				if (stopFinal.ok) return finish('ctl.start_settled_stop_confirmed', 'warn', true)
+				// STOP 未确认时再补一次，不用旧 START 的回执推断最新状态。
+				stopW = await writeState('sampling', PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+				stopFinal = await settleOf(stopW)
+				if (token !== unknownToken || !stillSameConn(gen0) || !isLatest(stopW)) return
+				return finish(stopFinal.ok ? 'ctl.start_settled_stopped' : 'ctl.start_settled_unknown', stopFinal.ok ? 'warn' : 'error', stopFinal.ok)
+			})().catch(function () { finish('ctl.start_settled_unknown', 'error', false) })
+		}
+
 		/**
-		 * 写源电压。已连接时只有设备写入成功才算「已施加」：失败保持上一次有效值，
-		 * 不把请求值当成事实。
+		 * 写源电压。命令发出后电压未知，直到最新命令得到可靠确认。
 		 */
 		async function applyVoltageMv(mv, guard) {
 			if (mv == null || !isFinite(mv)) {
-				log('请先设定源电压 mV', 'error')
+				log(msg('ctl.voltage_required'), 'error')
 				return { ok: false, stale: false }
 			}
 			const clamped = Math.max(PROTO.VDD_LOW_MV, Math.min(PROTO.VDD_HIGH_MV, Math.round(mv)))
 			if (!isConnected()) {
 				toggleVoltageSource(clamped)
-				log('电压已设为 ' + clamped + ' mV（打开设备后写入）')
+				log(msg('ctl.voltage_pending', { mv: clamped }))
 				return { ok: false, stale: false }
 			}
 			if (guardStep(guard)) return { ok: false, stale: false }
-			const w = await writeRaw(PROTO.cmdRegulatorSet(clamped), 'REGULATOR ' + clamped + ' mV')
+			const previousMv = voltageMv
+			toggleVoltageSource(null)
+			const w = await writeState('voltage', PROTO.cmdRegulatorSet(clamped), 'REGULATOR ' + clamped + ' mV')
 			if (!w.ok) {
-				if (!w.stale) log('设定电压失败：设备未确认写入，保持上一次有效电压', 'error')
+				if (!w.stale) log(msg('ctl.voltage_write_failed_log'), 'error')
+				if (w.timedOut) {
+					// 超时 ≠ 没执行：宿主稍后写出去就以设备为准更新电压
+					settleLatest(w, function () {
+						if (previousMv !== clamped && sampling) voltageChanges++
+						toggleVoltageSource(clamped)
+						log(msg('ctl.voltage_applied_late', { mv: clamped }), 'warn')
+					})
+				}
 				onChange()
-				return { ok: false, stale: !!w.stale }
+				return { ok: false, stale: !!w.stale, error: w.error }
 			}
-			if (voltageMv !== clamped && sampling) voltageChanges++
+			if (!isLatest(w)) return { ok: false, stale: true }
+			if (previousMv !== clamped && sampling) voltageChanges++
 			toggleVoltageSource(clamped)
-			log('设定电压 ' + clamped + ' mV', 'success')
+			log(msg('ctl.voltage_set', { mv: clamped }), 'success')
 			return { ok: true, stale: false }
 		}
 
+		/** 上 / 下电写入超时：宿主稍后写出去了就按命令记状态（期间没有新的命令改过它） */
+		function lateDutPower(w, on) {
+			settleLatest(w, function () {
+				markPowered(on, 'commanded')
+				log(msg(on ? 'ctl.power_on_late' : 'ctl.power_off_late'), 'warn')
+			})
+		}
+
 		async function doPowerOn(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 			const mv = readVoltageMv()
 			if (mv == null || !isFinite(mv) || mv < PROTO.VDD_LOW_MV) {
-				log('请先设定源电压 mV（打开设备后会从设备读取）', 'error')
-				return { ok: false, code: 'voltage_unknown', message: '尚未设定源电压' }
+				log(msg('ctl.voltage_required_open'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown'), ref: msg('ctl.voltage_unknown') }
 			}
 			const gen = genOf()
 			const v = await applyVoltageMv(mv, guard)
 			if (!v.ok) {
-				if (v.stale) return { ok: false, code: 'disconnected', message: '写电压时连接已变化，未上电', executed: 'unknown', powered: powerPayload() }
-				log('DUT 上电已中止：源电压写入失败', 'error')
-				return { ok: false, code: 'voltage_write_failed', message: '源电压写入失败，未上电', voltageMv: voltageMv, powered: powerPayload() }
+				if (v.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed_voltage'), ref: msg('ctl.power_on_conn_changed_voltage'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_on_aborted'), 'error')
+				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), ref: msg('ctl.power_on_voltage_failed'), cause: errText(v), voltageMv: voltageMv, powered: powerPayload() }
 			}
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未上电', executed: false, powered: powerPayload() }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.power_on_cancelled'), ref: msg('ctl.power_on_cancelled'), executed: false, powered: powerPayload() }
 			if (!stillSameConn(gen)) {
-				return { ok: false, code: 'disconnected', message: '电压写入后设备已变化，未上电', executed: false, powered: powerPayload() }
+				return { ok: false, code: 'disconnected', message: tr('ctl.power_on_device_changed'), ref: msg('ctl.power_on_device_changed'), executed: false, powered: powerPayload() }
 			}
-			const w = await writeRaw(PROTO.cmdDutPower(true), 'DUT 上电')
+			markPowered(null, 'unknown')
+			const w = await writeState('power', PROTO.cmdDutPower(true), tr('ctl.note_power_on'))
 			if (!w.ok) {
 				// 连接已经变了：这次结果不属于新连接，不能改它的供电状态
-				if (w.stale) return { ok: false, code: 'disconnected', message: '上电过程中连接已变化，结果未知', executed: 'unknown', powered: powerPayload() }
-				// 同一连接写失败：不知道设备收没收到，标未知
-				markPowered(null, 'unknown')
-				log('DUT 上电写入失败：状态未知', 'error')
-				return { ok: false, code: 'power_write_failed', message: '上电命令写入失败，设备状态未知', executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed'), ref: msg('ctl.power_on_conn_changed'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_on_write_failed_log'), 'error')
+				if (w.timedOut) lateDutPower(w, true)
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), ref: msg('ctl.power_on_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
+			if (!isLatest(w)) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed'), ref: msg('ctl.power_on_conn_changed'), executed: 'unknown', powered: powerPayload() }
 			markPowered(true, 'commanded')
-			log('DUT 已上电（命令已写入，设备无回执）', 'success')
+			log(msg('ctl.power_on_done'), 'success')
 			return { ok: true, changed: true, powered: powerPayload(), voltageMv: voltageMv }
 		}
 
 		async function doPowerOff(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未执行', executed: false, powered: powerPayload() }
-			const gen = genOf()
-			const w = await writeRaw(PROTO.cmdDutPower(false), 'DUT 下电')
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.cancelled_nothing_done'), ref: msg('ctl.cancelled_nothing_done'), executed: false, powered: powerPayload() }
+			markPowered(null, 'unknown')
+			const w = await writeState('power', PROTO.cmdDutPower(false), tr('ctl.note_power_off'))
 			if (!w.ok) {
-				if (w.stale) return { ok: false, code: 'disconnected', message: '下电过程中连接已变化，结果未知', executed: 'unknown', powered: powerPayload() }
-				markPowered(null, 'unknown')
-				log('DUT 下电写入失败：状态未知', 'error')
-				return { ok: false, code: 'power_write_failed', message: '下电命令写入失败，设备状态未知', executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), ref: msg('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
+				log(msg('ctl.power_off_write_failed_log'), 'error')
+				if (w.timedOut) lateDutPower(w, false)
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), ref: msg('ctl.power_off_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
+			if (!isLatest(w)) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), ref: msg('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
 			markPowered(false, 'commanded')
-			log('DUT 已下电（命令已写入，设备无回执）')
+			log(msg('ctl.power_off_done'))
 			return { ok: true, changed: true, powered: powerPayload() }
 		}
 
@@ -436,7 +598,17 @@
 		async function fetchModifiers() {
 			metaCollecting = true
 			metaBuf = ''
-			await writeRaw(PROTO.cmdMeta(), 'GET_META_DATA')
+			const mw = await writeRaw(PROTO.cmdMeta(), 'GET_META_DATA')
+			if (!mw || !mw.ok) {
+				// 请求都没写出去就不用干等 3 s：直接按默认参数走，并把原因写清楚
+				metaCollecting = false
+				metaBuf = ''
+				modifiers = PROTO.defaultModifiers()
+				modifiersOk = false
+				log(msg('ctl.meta_write_failed', { err: errText(mw) }), 'error')
+				onChange()
+				return false
+			}
 			const deadline = clock.now() + 3000
 			let text = metaBuf
 			while (clock.now() < deadline) {
@@ -451,13 +623,13 @@
 				metaBuf = ''
 				if (link && typeof link.setConverterModifiers === 'function') link.setConverterModifiers(modifiers)
 				const saved = modifiers.savedVddMv || 0
-				log('设备参数读取完成' +
+				log(msg('ctl.meta_done', { details:
 					(modifiers.deviceSn ? ' · SN ' + modifiers.deviceSn : '') +
 					(saved ? ' · VDD ' + saved + ' mV' : '') +
-					(modifiers.Calibrated != null ? ' · Calibrated=' + modifiers.Calibrated : ''), 'success')
+					(modifiers.Calibrated != null ? ' · Calibrated=' + modifiers.Calibrated : '') }), 'success')
 				if (saved >= PROTO.VDD_LOW_MV && saved <= PROTO.VDD_HIGH_MV) toggleVoltageSource(Math.round(saved))
 				else {
-					log('设备未返回 VDD，请手动设定源电压', 'warn')
+					log(msg('ctl.meta_no_vdd'), 'warn')
 					toggleVoltageSource(null)
 				}
 				return true
@@ -466,7 +638,7 @@
 			modifiers = PROTO.defaultModifiers()
 			modifiersOk = false
 			metaBuf = ''
-			log('设备参数读取超时，使用默认 R/O 表', 'warn')
+			log(msg('ctl.meta_timeout'), 'warn')
 			onChange()
 			return false
 		}
@@ -499,21 +671,36 @@
 		}
 
 		async function startSampling(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 			if (sampling) return { ok: true, changed: false, sampling: true }
+			// 上一次 START 超时、结果还没收尾：设备可能正在采样，不能再开一轮
+			if (startUnknown) {
+				log(msg('ctl.start_blocked_unknown'), 'warn')
+				return { ok: false, code: 'start_unknown_pending', message: tr('ctl.start_blocked_unknown'), ref: msg('ctl.start_blocked_unknown'), executed: false }
+			}
 			const mv = readVoltageMv()
 			if (!isFinite(mv) || mv == null || mv < PROTO.VDD_LOW_MV) {
-				log('请先设定源电压 mV（设备要求先设电压再开采样）', 'error')
-				return { ok: false, code: 'voltage_unknown', message: '尚未设定源电压' }
+				log(msg('ctl.voltage_required_start'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown'), ref: msg('ctl.voltage_unknown') }
 			}
 			// 先 STOP → 排空残留 → 再 START
 			link.setDrop(true)
 			const gen0 = genOf()
-			await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+			const preStop = await writeState('sampling', PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+			if (!preStop || !preStop.ok) {
+				trackStopFailure(preStop)
+				// 写不进 STOP 就不能保证设备处于已停止态，也说明这条链路现在写不通：中止启动并说明原因，
+				// 不能继续 START 让后面的「采样已开始」把这条失败盖掉
+				if (preStop && preStop.stale) {
+					return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
+				}
+				log(msg('ctl.prestop_failed_log', { err: errText(preStop) }), 'error')
+				return { ok: false, code: 'capture_prestop_failed', message: tr('ctl.prestop_failed', { err: errText(preStop) }), ref: msg('ctl.prestop_failed', { err: errText(preStop) }), executed: false }
+			}
 			await drainSampleRx(opts.rxDrainMs)
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未开始采样', executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), ref: msg('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: '设备已变化，未开始采样', executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
 			}
 
 			const baseHz = deviceStreamHz > 1000 ? deviceStreamHz : PROTO.NOMINAL_BASE_HZ
@@ -521,16 +708,22 @@
 			// 先按标称速率起步，实测会在 pushSamples 里修正
 			deviceStreamHz = baseHz
 			if (recordMode === 'wave' && store) {
+				const initTimedOut = {}
 				try {
-					await store.init()
+					// 存储初始化有上限：卡住时中止启动并说明原因，不能把排在后面的 STOP 一起挡住
+					const ir = await withTimeout(store.init(), opts.storeInitTimeoutMs, initTimedOut)
+					if (ir === initTimedOut) {
+						log(msg('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), 'error')
+						return { ok: false, code: 'store_init_timeout', message: tr('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), ref: msg('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), executed: false }
+					}
 				} catch (e) {
-					log('初始化波形存储失败：' + (e && e.message ? e.message : e), 'warn')
+					log(msg('ctl.store_init_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				}
 			}
 			// 存储初始化等 await 之后重新确认：取消 / 断开 / 换设备都不能继续
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未开始采样', executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), ref: msg('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: '设备已变化，未开始采样', executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
 			}
 
 			link.resetParser(true)
@@ -549,28 +742,41 @@
 				acq.storeEnabled = acq.start === 'off'
 				acq.preMin = Infinity
 				acq.preMax = -Infinity
-				if (acq.start !== 'off') log('采样沿启动已 Arm：等待 ' + acq.start + ' 后开始入库（电平 ' + (trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : 'Auto') + '）')
+				if (acq.start !== 'off') log(msg('ctl.acq_armed', { edge: msg('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : msg('ctl.level_auto') }))
 			}
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
 			sampling = true
 			onChange()
 
-			const startW = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START')
+			const startW = await writeState('sampling', PROTO.cmdAverageStart(), 'AVERAGE_START')
+			if (!startW.ok && startW.timedOut) {
+				// 插件侧超时只表示「结果未知」：宿主仍会把 START 写出去。不入库、不当成采样中，
+				// 也不当成确定的未采样——进入「结果未知」，补 STOP 并等宿主兑现后收尾
+				sampling = false
+				link.setDrop(true)
+				log(msg('ctl.start_unknown_log', { err: errText(startW) }), 'warn')
+				reconcileStart(startW, gen0)
+				return { ok: false, code: 'capture_start_unknown', message: tr('ctl.start_unknown', { err: errText(startW) }), ref: msg('ctl.start_unknown', { err: errText(startW) }), executed: 'unknown' }
+			}
 			if (!startW.ok) {
 				if (startW.stale) {
-					return { ok: false, code: 'disconnected', message: '开始采样过程中连接已变化，结果未知', executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.start_conn_changed'), ref: msg('ctl.start_conn_changed'), executed: 'unknown' }
 				}
 				sampling = false
 				link.setDrop(true)
-				log('开始采样失败：START 写入失败', 'error')
+				log(msg('ctl.start_write_failed_log', { err: errText(startW) }), 'error')
 				onChange()
-				return { ok: false, code: 'capture_start_failed', message: 'START 写入失败，未开始采样' }
+				return { ok: false, code: 'capture_start_failed', message: tr('ctl.start_write_failed', { err: errText(startW) }), ref: msg('ctl.start_write_failed', { err: errText(startW) }) }
 			}
 			// START 已下发后再接收样点（此前 drop 挡住 STOP 尾包与竞态）
 			link.setDrop(false)
 			const warmMs = targetRateHz > 0 ? Math.round(warmupLeft / targetRateHz * 1000) : 0
-			log('采样已开始 · 目标 ' + targetRateHz + ' Hz · ' + (recordMode === 'long' ? '长期统计' : '波形') +
-				' · 预热约 ' + warmMs + ' ms（' + warmupLeft + ' 点）' + (modifiersOk ? '' : ' · 默认修正参数'), 'success')
+			log(msg('ctl.started', {
+				// 参数也存惰性消息：状态条切语言时整句一起换，不留半句旧语言
+				hz: targetRateHz, mode: msg(recordMode === 'long' ? 'ctl.mode_long' : 'ctl.mode_wave'),
+				ms: warmMs, n: warmupLeft, mods: modifiersOk ? '' : msg('ctl.default_mods'),
+			}), 'success')
 			return { ok: true, changed: true, sampling: true }
 		}
 
@@ -589,24 +795,31 @@
 			if (flushed.remaining > 0) {
 				// 确实排不完的（例如冷存储卡住）：计数 + 标缺口，绝不静默丢
 				noteGap({ reason: 'stop_drain', missedSamples: flushed.remaining, bytes: flushed.remainingBytes })
-				log('停止采样时仍有 ' + flushed.remaining + ' 个待入库样点未能处理，已标记缺口', 'warn')
+				log(msg('ctl.stop_undrained', { n: flushed.remaining }), 'warn')
 			}
 			sampling = false
 			onChange()
+			try {
+				onSamplingEnd({ reason: stopReason || 'manual' })
+			} catch (e) { /* 界面收尾出错不影响发 STOP */ }
+			stopReason = null
 			let stopW = { ok: true, stale: false }
 			try {
-				stopW = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+				stopW = await writeState('sampling', PROTO.cmdAverageStop(), 'AVERAGE_STOP')
 			} catch (e) {
-				stopW = { ok: false, stale: false }
+				stopW = { ok: false, stale: false, error: e }
 			}
 			link.resetParser(false)
 			const stopped = !!(wave && wave.storageStop && wave.storageStop())
-			log(stopped ? '已停止采样（存储限制）' : '已停止采样')
-			if (!stopW.ok) log('STOP 写入失败：本地已停止入库，设备可能仍在采样', 'warn')
+			if (stopW.ok) log(msg(stopped ? 'ctl.stopped_storage' : 'ctl.stopped'))
+			if (!stopW.ok) {
+				trackStopFailure(stopW)
+				log(msg('ctl.stop_write_failed_log'), 'warn')
+			}
 			onChange()
 			if (stopW.ok) return { ok: true, changed: true, sampling: false }
-			if (stopW.stale) return { ok: false, code: 'disconnected', message: '停止采样过程中连接已变化，结果未知', executed: 'unknown', sampling: false }
-			return { ok: false, code: 'stop_write_failed', message: 'STOP 写入失败，设备可能仍在采样', sampling: false }
+			if (stopW.stale) return { ok: false, code: 'disconnected', message: tr('ctl.stop_conn_changed'), ref: msg('ctl.stop_conn_changed'), executed: 'unknown', sampling: false }
+			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), ref: msg('ctl.stop_write_failed'), cause: errText(stopW), sampling: false }
 		}
 
 		// ---- 对外（界面 / 测试）----
@@ -615,7 +828,7 @@
 			return runOp(async function () {
 				const g = await guardStart(guard)
 				if (g) return g
-				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 				const gen = genOf()
 				// 只有「上次命令」的状态才能跳过；实测 / 未知都不足以代替一次显式命令
 				if (power.source === 'commanded' && power.on === want) {
@@ -623,7 +836,7 @@
 				}
 				const r = want ? await doPowerOn(guard) : await doPowerOff(guard)
 				if (!stillSameConn(gen) && r && r.ok) {
-					return { ok: false, code: 'disconnected', message: '操作期间设备断开，结果未知', executed: 'unknown', powered: powerPayload() }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), ref: msg('ctl.op_disconnected'), executed: 'unknown', powered: powerPayload() }
 				}
 				return r
 			}, { failFast: !!guard })
@@ -639,17 +852,17 @@
 						toggleVoltageSource(requested)
 						return { ok: true, pending: true, requestedMv: requested }
 					}
-					return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+					return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') }
 				}
 				if (!isFinite(requested) || requested < PROTO.VDD_LOW_MV || requested > PROTO.VDD_HIGH_MV) {
-					return { ok: false, code: 'out_of_range', message: '电压必须在 ' + PROTO.VDD_LOW_MV + '..' + PROTO.VDD_HIGH_MV + ' mV' }
+					return { ok: false, code: 'out_of_range', message: tr('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }), ref: msg('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }) }
 				}
 				const gen = genOf()
 				const applied = await applyVoltageMv(requested, guard)
 				if (!stillSameConn(gen) || applied.stale) {
-					return { ok: false, code: 'disconnected', message: '操作期间设备断开，结果未知', executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), ref: msg('ctl.op_disconnected'), executed: 'unknown' }
 				}
-				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: '电压写入失败，未生效', voltageMv: voltageMv, requestedMv: requested }
+				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), ref: msg('ctl.voltage_not_applied'), cause: errText(applied), voltageMv: voltageMv, requestedMv: requested }
 				return { ok: true, requestedMv: requested, appliedMv: voltageMv, clamped: voltageMv !== requested }
 			}, { failFast: !!guard })
 		}
@@ -664,35 +877,49 @@
 		}
 
 		function stopCapture(guard) {
-			return runOp(async function () {
-				const g = await guardStart(guard)
-				if (g) return g
-				return await stopSampling(guard)
-			}, { failFast: !!guard })
+			// 已有待执行的停止（例如停止沿刚命中）就合并成同一个，不再另排一个
+			return queueStop('manual', guard)
 		}
 
 		function togglePower() {
-			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: '功耗仪未连接' })
+			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: tr('ctl.not_connected'), ref: msg('ctl.not_connected') })
 			return setPower(power.on !== true)
 		}
 
 		/** DUT 是否带电：协议没有回读命令，只能短采一段看中位数 */
 		async function probeDutPower() {
-			if (!isConnected() || sampling || metaCollecting) return null
+			if (!isConnected() || sampling || metaCollecting || startUnknown) return null
 			probe = { vals: [] }
 			link.setDrop(false)
 			link.resetParser(false)
+			let pw = null
 			try {
-				await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START · DUT 供电探测')
+				pw = await writeState('sampling', PROTO.cmdAverageStart(), tr('ctl.note_probe_start'))
+				if (!pw || !pw.ok) {
+					probe = null
+					if (pw && pw.timedOut) {
+						link.setDrop(true)
+						reconcileStart(pw, pw.commandGen)
+					}
+					log(msg('ctl.probe_write_failed', { err: errText(pw) }), 'error')
+					return null
+				}
 				await new Promise(function (r) { clock.setTimeout(r, opts.probeMs) })
 			} catch (e) {
 				probe = null
+				log(msg('ctl.probe_error', { err: (e && e.message ? e.message : e) }), 'error')
 				return null
 			}
-			try { await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP · DUT 供电探测') } catch (e) { /* 忽略 */ }
+			try {
+				const stopW = await writeState('sampling', PROTO.cmdAverageStop(), tr('ctl.note_probe_stop'))
+				trackStopFailure(stopW)
+			} catch (e) { /* 忽略 */ }
 			const vals = probe ? probe.vals.slice() : []
 			probe = null
-			if (vals.length < 200) return null
+			if (vals.length < 200) {
+				log(msg('ctl.probe_empty', { ms: opts.probeMs, n: vals.length }), 'warn')
+				return null
+			}
 			vals.sort(function (a, b) { return a - b })
 			const med = vals[vals.length >> 1]
 			return { on: med >= opts.dutOnThresholdUA, medianUA: med, n: vals.length }
@@ -708,7 +935,7 @@
 				// 时长是累加的「有效间隔」，缺口那段不进来
 				const dur = longStats.durSec
 				const avgI = n ? longStats.sumI / n : 0
-				const avgP = dur > 0 ? longStats.energyUWs / dur : 0
+				const avgP = longStats.voltsUnknown ? null : (dur > 0 ? longStats.energyUWs / dur : 0)
 				return {
 					n: n,
 					avgI: avgI,
@@ -719,8 +946,9 @@
 					chargeUC: longStats.energyUAs,
 					chargeUAh: longStats.energyUAs / 3600,
 					// 能量按摄入时刻的电压积分（历史口径），等价于 Σ P·dt
-					energyUWh: longStats.energyUWs / 3600,
-					volts: longStats.energyUAs > 0 ? longStats.energyUWs / longStats.energyUAs : (voltageMv != null ? voltageMv / 1000 : 0),
+					energyUWh: longStats.voltsUnknown ? null : longStats.energyUWs / 3600,
+					voltsUnknown: longStats.voltsUnknown,
+					volts: longStats.voltsUnknown ? null : (longStats.energyUAs > 0 ? longStats.energyUWs / longStats.energyUAs : (voltageMv != null ? voltageMv / 1000 : 0)),
 					segments: longStats.gaps + 1,
 					gaps: longStats.gaps,
 					dropped: 0,
@@ -751,7 +979,8 @@
 				durationSec: st.dur,
 				gaps: recordMode === 'long' ? longStats.gaps : (st.gaps || 0),
 				droppedSamples: recordMode === 'long' ? 0 : (wave && typeof wave.droppedSamples === 'function' ? wave.droppedSamples() : 0),
-				volts: st.volts || 0,
+				volts: st.voltsUnknown ? null : (st.volts || 0),
+				voltsUnknown: !!st.voltsUnknown,
 				sampleRateHz: sampleHz,
 				samplePeriodSec: period,
 				voltageMvNow: voltageMv,
@@ -780,7 +1009,12 @@
 			const wasSampling = sampling
 			const pendingSamples = link && typeof link.pendingSamples === 'function' ? link.pendingSamples() : 0
 			sampling = false
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
+			// 连接变了：上一条连接上 START 的收尾作废（设备状态随连接一起重置）
+			startUnknown = false
+			unknownToken++
+			for (const domain in latestCommand) delete latestCommand[domain]
 			if (wasSampling) {
 				// 已收到的样点先尽量入库；剩下的如实标缺口
 				let flushed = { remaining: 0, remainingBytes: 0 }
@@ -803,7 +1037,7 @@
 			lastTMs = 0
 			lastTMsValid = false
 			gapPending = false
-			if (wasSampling) log('会话已终止（' + reason + '），供电状态置为未知', 'warn')
+			if (wasSampling) log(msg('ctl.session_ended', { reason: reason }), 'warn')
 			onChange()
 			return { wasSampling: wasSampling }
 		}
@@ -811,7 +1045,12 @@
 		/** 新建连接前调用：清掉上一次会话可能残留的采样 / 供电 / 触发状态 */
 		function prepareSession() {
 			sampling = false
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
+			// 连接变了：上一条连接上 START 的收尾作废（设备状态随连接一起重置）
+			startUnknown = false
+			unknownToken++
+			for (const domain in latestCommand) delete latestCommand[domain]
 			power = { on: null, source: 'unknown' }
 			lastTMs = 0
 			lastTMsValid = false
@@ -848,7 +1087,7 @@
 		async function importSeries(parsed, o) {
 			o = o || {}
 			if (!parsed || !parsed.ok || !parsed.rows || !parsed.rows.length) {
-				return { ok: false, code: 'empty', message: '没有可导入的样点' }
+				return { ok: false, code: 'empty', message: tr('ctl.import_empty'), ref: msg('ctl.import_empty') }
 			}
 			if (sampling) await stopSampling()
 			clearSessionState()
@@ -889,28 +1128,33 @@
 					if (wave && typeof wave.waitIdle === 'function') await wave.waitIdle(200)
 					// 每次 await 之后校验会话：变了就停止，绝不把旧导入写进新会话
 					if (epochOf() !== importEpoch) {
-						log('CSV 导入已取消：会话在导入期间发生变化（清空 / 重新采集 / 再次导入）', 'warn')
+						log(msg('ctl.import_cancelled_log'), 'warn')
 						return {
 							ok: false, code: 'session_changed', cancelled: true,
 							stored: stored, requested: requested, gaps: gapsApplied,
-							message: '导入期间会话已变化，已取消（已写入 ' + stored + ' / ' + requested + '）',
+							message: tr('ctl.import_cancelled', { stored: stored, requested: requested }), ref: msg('ctl.import_cancelled', { stored: stored, requested: requested }),
 						}
 					}
 				}
 			}
 			onChange()
 			if (storageStopped || stored < requested) {
-				log('CSV 导入不完整：只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）', 'warn')
+				log(msg('ctl.import_partial_log', { stored: stored, requested: requested }), 'warn')
 				return {
 					ok: false, code: 'incomplete',
 					stored: stored, requested: requested, gaps: gapsApplied,
-					message: '只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）',
+					message: tr('ctl.import_partial', { stored: stored, requested: requested }), ref: msg('ctl.import_partial', { stored: stored, requested: requested }),
 				}
 			}
-			log('已导入 ' + stored + ' 个样点（' + (samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : '周期未知') +
-				(estimated ? ' · 周期按默认值估计' : '') +
-				(gapsApplied ? ' · ' + gapsApplied + ' 处缺口' : '') +
-				(parsed.hasVoltage ? '' : ' · 文件无电压，能量不可用'), 'success')
+			log(msg('ctl.imported', {
+				n: stored,
+				rate: samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : msg('ctl.period_unknown'),
+				extra: I18N.join([
+					estimated ? msg('ctl.import_estimated') : '',
+					gapsApplied ? msg('ctl.import_gaps', { n: gapsApplied }) : '',
+					parsed.hasVoltage ? '' : msg('ctl.import_no_voltage'),
+				]),
+			}), 'success')
 			return {
 				ok: true, samples: stored, requested: requested, gaps: gapsApplied,
 				samplePeriodSec: samplePeriodSec, estimatedPeriod: estimated,
@@ -982,6 +1226,8 @@
 			minimapData: function () { return folding.getData() },
 			foldingLength: function () { return folding.length },
 			isSampling: function () { return sampling },
+			// START 超时后结果未知、收尾未完成：期间不能再开始
+			isStartUnknown: function () { return startUnknown },
 			setRecordMode: setRecordMode,
 			setTargetRateHz: setTargetRateHz,
 			setSamplePeriodSec: setSamplePeriodSec,
@@ -1000,10 +1246,12 @@
 			doPowerOn: doPowerOn,
 			doPowerOff: doPowerOff,
 			applyVoltageMv: applyVoltageMv,
-			fetchModifiers: fetchModifiers,
+			// 连接初始化（读参数、供电探测）与采集共用一条操作队列：
+			// 探测的 START/STOP 绝不会与用户的 START 交错（否则探测的 STOP 会掐断刚开始的采集）
+			fetchModifiers: function () { return runOp(fetchModifiers) },
 			appendMetadataText: appendMetadataText,
 			isMetaCollecting: function () { return metaCollecting },
-			probeDutPower: probeDutPower,
+			probeDutPower: function () { return runOp(probeDutPower) },
 			// 采样
 			startSampling: startSampling,
 			stopSampling: stopSampling,

@@ -2,6 +2,9 @@
 // 超限时只允许「选中的时间段」或「摘要」，并明确告诉用户能导出多少 —— 绝不静默截断。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
+	const msg = I18N.msg
 
 	// 与宿主 js/plugin-rpc.js 的 LIMITS.maxExportChars 对齐（按字符数计，UTF-8 下 CSV 全是 ASCII）
 	const MAX_EXPORT_BYTES = 8 * 1024 * 1024
@@ -54,7 +57,7 @@
 			return {
 				ok: false, kind: kind, limitBytes: limit, requestedSamples: 0, estimatedBytes: estimate,
 				maxSamples: maxSamples, reason: 'empty',
-				message: '所选时间段里没有样点',
+				message: tr('exp.empty'), ref: msg('exp.empty'),
 			}
 		}
 		if (estimate > limit) {
@@ -62,8 +65,7 @@
 			return {
 				ok: false, kind: kind, limitBytes: limit, requestedSamples: n, estimatedBytes: estimate,
 				maxSamples: maxSamples, reason: 'too_large',
-				message: '所选时间段约 ' + formatBytes(estimate) + '，超过单次导出上限 ' + formatBytes(limit) +
-					'（约 ' + allowedSec + ' 个样点）。请缩短时间段，或只导出摘要；不会自动截断。',
+				message: tr('exp.too_large_estimate', { size: formatBytes(estimate), limit: formatBytes(limit), n: allowedSec }), ref: msg('exp.too_large_estimate', { size: formatBytes(estimate), limit: formatBytes(limit), n: allowedSec }),
 				suggestions: ['shorten_range', 'export_summary'],
 			}
 		}
@@ -146,7 +148,7 @@
 			// 导出期间会话被清空 / 重新采集 / 导入：前后数据不属于同一次采集，整份作废
 			return {
 				ok: false, code: 'session_changed',
-				message: '导出期间会话已变化（清空 / 重新采集 / 导入），本次导出已取消，请重试。',
+				message: tr('exp.session_changed'), ref: msg('exp.session_changed'),
 				plan: plan,
 			}
 		}
@@ -154,7 +156,7 @@
 		if (size > limit) {
 			return {
 				ok: false, code: 'too_large',
-				message: '导出内容 ' + formatBytes(size) + ' 超过 ' + formatBytes(limit) + '，已取消本次导出（不截断）。请缩短时间段或只导出摘要。',
+				message: tr('exp.too_large', { size: formatBytes(size), limit: formatBytes(limit) }), ref: msg('exp.too_large', { size: formatBytes(size), limit: formatBytes(limit) }),
 				plan: plan,
 			}
 		}
@@ -171,7 +173,7 @@
 			format: 'devicedock-power-summary',
 			version: 1,
 			generatedAt: new Date().toISOString(),
-			gapNote: '缺口处的时间与能量不计入统计',
+			gapNote: tr('exp.gap_note'),
 		}, summary || {}, extra || {})
 		return { ok: true, text: JSON.stringify(payload, null, 2) }
 	}
@@ -206,22 +208,22 @@
 			try {
 				await saveFile({ name: name, mime: 'text/csv;charset=utf-8', text: csv.text })
 			} catch (err) {
-				return { ok: false, code: (err && err.code) || 'save_failed', message: '保存文件失败：' + (err && err.message ? err.message : err) }
+				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }), ref: msg('exp.save_failed', { err: err && err.message ? err.message : err }) }
 			}
-			log('已导出 ' + name + '（' + formatBytes(csv.bytes) + (csv.gaps ? ' · ' + csv.gaps + ' 处缺口已标记' : '') + '）', 'success')
+			log(msg('exp.exported', { name: name, size: formatBytes(csv.bytes), gaps: csv.gaps ? msg('exp.exported_gaps', { n: csv.gaps }) : '' }), 'success')
 			return { ok: true, name: name, bytes: csv.bytes, samples: e - s, gaps: csv.gaps, missing: csv.missing, dropped: csv.dropped }
 		}
 
 		async function exportSummary(opts) {
 			opts = opts || {}
-			if (!control) return { ok: false, code: 'no_control', message: '还没有可导出的采样摘要' }
+			if (!control) return { ok: false, code: 'no_control', message: tr('exp.no_summary'), ref: msg('exp.no_summary') }
 			const summary = control.captureSummary()
 			const built = buildSummary(summary, { gaps: summary.gaps, note: summary.reason })
 			const name = sanitizeFileName(opts.name || 'power-summary.json')
 			try {
 				await saveFile({ name: name, mime: 'application/json;charset=utf-8', text: built.text })
 			} catch (err) {
-				return { ok: false, code: (err && err.code) || 'save_failed', message: '保存文件失败：' + (err && err.message ? err.message : err) }
+				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }), ref: msg('exp.save_failed', { err: err && err.message ? err.message : err }) }
 			}
 			return { ok: true, name: name, bytes: built.text.length, summary: summary }
 		}

@@ -88,6 +88,7 @@ class El {
 	removeEventListener() {}
 	setAttribute(k, v) { this.attrs[k] = String(v) }
 	getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null }
+	removeAttribute(k) { delete this.attrs[k] }
 	getContext() { return makeCtx2d() }
 	getBoundingClientRect() {
 		return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight, right: this.clientWidth, bottom: this.clientHeight }
@@ -140,7 +141,30 @@ function makeDocument() {
 		listeners: {},
 		fullscreenElement: null,
 	}
+	// 带 data-i18n* 的元素：从真实 index.html 解析出来（有 id 的复用 getElementById 的同一个对象），
+	// 这样语言切换的静态文案刷新走的是真实标记，而不是测试里另编一份
+	const i18nEls = []
+	const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8')
+	const tagRe = /<(\w+)\s([^<>]*data-i18n[^<>]*)>/g
+	let m
+	while ((m = tagRe.exec(html))) {
+		const attrs = {}
+		const attrRe = /([\w-]+)="([^"]*)"/g
+		let a
+		while ((a = attrRe.exec(m[2]))) attrs[a[1]] = a[2]
+		const el = attrs.id ? doc.getElementById(attrs.id) : new El(m[1])
+		Object.keys(attrs).forEach(function (k) { if (k.indexOf('data-i18n') === 0 || k === 'title' || k === 'placeholder' || k === 'aria-label') el.attrs[k] = attrs[k] })
+		i18nEls.push(el)
+	}
+	doc.querySelectorAll = function (sel) {
+		void sel
+		return i18nEls.filter(function (el) {
+			return ['data-i18n', 'data-i18n-title', 'data-i18n-placeholder', 'data-i18n-aria'].some(function (k) { return el.getAttribute(k) })
+		})
+	}
+	doc.title = ''
 	doc._byId = byId
+	doc._i18nEls = i18nEls
 	return doc
 }
 
@@ -179,13 +203,40 @@ function makeFakeSdk(state) {
 				state.acquires.push([portKey, mode])
 				return { claimId: id, mode: mode }
 			},
-			open: async (id) => { const c = claims.get(id); if (c) c.open = true; return { claimId: id, open: true } },
+			open: async (id) => {
+				const c = claims.get(id)
+				if (c) c.open = true
+				// 与宿主一致：每个新声明的字节流从 offset 0、seq 1 开始（gen 从 1 起）
+				state.rxOffset = 0
+				state.rxSeq = 0
+				return { claimId: id, open: true }
+			},
 			close: async (id) => { const c = claims.get(id); if (c) c.open = false; return { closed: true } },
 			release: async (id) => { claims.delete(id); return { released: true } },
 			write: async (id, bytes) => {
+				// 与宿主 plugin-rpc.toBytes 同一契约：只收 0..255 的普通数组或十六进制串，Uint8Array 一律 bad_request
+				if (!Array.isArray(bytes) && typeof bytes !== 'string') {
+					const err = new Error('数据必须是字节数组或十六进制串')
+					err.code = 'bad_request'
+					throw err
+				}
+				// failOnByte：只让某一条命令写失败（例如只有启动前的 STOP 失败、START 本身能写出去）
+				if (state.failWrites || (state.failOnByte != null && bytes[0] === state.failOnByte)) {
+					const err = new Error(state.failWrites || state.failOnByteError || 'synthetic write failure')
+					err.code = 'internal'
+					throw err
+				}
 				state.writes.push(Array.from(bytes))
+				// 宿主永不确认这一条写入（卡死）：插件靠写入超时结束它
+				if (state.hangOnByte != null && bytes[0] === state.hangOnByte) return new Promise(function () {})
+				// 宿主迟迟不确认、由用例决定何时兑现（插件超时之后迟到完成）
+				if (typeof state.defer === 'function' && state.defer(bytes)) {
+					return new Promise(function (resolve, reject) {
+						state.deferred.push({ bytes: Array.from(bytes), resolve: function () { resolve({ bytes: bytes.length }) }, reject: reject })
+					})
+				}
 				if (bytes[0] === 0x19) state.pushRxText('R0=1031.64\r\nVDD=3300 mV\r\nEND\r\n')
-				if (bytes[0] === 0x06) state.pushRxSamples(300, 1000)
+				if (bytes[0] === 0x06 && !state.silent) state.pushRxSamples(300, 1000)
 				return { bytes: bytes.length }
 			},
 			onRx(fn) { state.rxHandler = fn; return function () {} },
@@ -193,18 +244,37 @@ function makeFakeSdk(state) {
 			ack: async () => ({ ack: true }),
 		},
 	}
+	// 宿主语言推送：state.localeSupport 打开时模拟新 SDK（getLocale / onLocale），否则只有 on('app.locale')
+	state.emit = function (name, payload) {
+		const set = handlers.get(name)
+		if (set) Array.from(set).forEach(function (fn) { fn(payload) })
+	}
+	if (state.localeSupport) {
+		const fns = []
+		sdk.getLocale = function () { return state.hostLocale || null }
+		sdk.onLocale = function (fn) {
+			fns.push(fn)
+			if (state.hostLocale) fn(state.hostLocale)
+			return function () {}
+		}
+		state.pushLocale = function (l) {
+			state.hostLocale = l
+			fns.forEach(function (fn) { fn(l) })
+		}
+	}
 	return sdk
 }
 
 // ---------- 运行 app.js ----------
 const root = path.join(__dirname, '..')
 const files = [
-	'js/power-protocol.js', 'js/power-view.js', 'js/power-lane.js', 'js/power-analysis.js',
+	'js/power-i18n.js', 'js/power-protocol.js', 'js/power-view.js', 'js/power-lane.js', 'js/power-analysis.js',
 	'js/power-store.js', 'js/power-wave.js', 'js/power-panels.js', 'js/power-claim.js',
 	'js/power-control.js', 'js/power-export.js', 'js/power-import.js',
 ]
 
-function makeEnv(state) {
+function makeEnv(state, opts) {
+	opts = opts || {}
 	const document = makeDocument()
 	const win = {
 		document: document,
@@ -228,11 +298,18 @@ function makeEnv(state) {
 		console, Date, Math, JSON, Number, String, Boolean, Array, Object, Promise, Map, Set,
 		Uint8Array, Float32Array, Float64Array, ArrayBuffer, isFinite, parseInt, parseFloat, Infinity, NaN,
 	}
+	// 没给 navigator 时沙箱里就没有（回退到 en）
+	if (opts.navigator) { sandbox.navigator = opts.navigator; win.navigator = opts.navigator }
 	sandbox.globalThis = sandbox
 	sandbox.window.window = win
 	vm.createContext(sandbox)
 	for (const rel of files) {
 		vm.runInContext(fs.readFileSync(path.join(root, rel), 'utf8'), sandbox, { filename: rel })
+	}
+	const makeWave = win.PowerWave.createWave
+	win.PowerWave.createWave = function (cfg) {
+		state.triggerStorageStop = cfg.onStorageStop
+		return makeWave(cfg)
 	}
 	const sdk = makeFakeSdk(state)
 	sandbox.window.DeviceDockPlugin = sdk
@@ -280,8 +357,11 @@ const fireKey = (win, key, props) => {
 		rxSeq: 0,
 		gen: 1,
 		ports: [
-			{ key: 'p1', portName: 'COM7', productName: 'Power Monitor', serialNumber: 'SN-42' },
-			{ key: 'p2', portName: 'COM8', productName: 'Other', busy: 'channel A' },
+			{ key: 'p1', portName: 'COM7', productName: 'BLU Power Monitor', serialNumber: 'SN-42' },
+			// 非 BLU 设备：必须被筛掉
+			{ key: 'p0', portName: 'COM3', productName: 'CP2102 USB to UART' },
+			// 别名里带小写 blu 也算
+			{ key: 'p2', portName: 'COM8', productName: 'Other', alias: 'my-blu', busy: 'channel A' },
 		],
 		rxHandler: null,
 		gapHandler: null,
@@ -293,7 +373,8 @@ const fireKey = (win, key, props) => {
 		const offset = state.rxOffset
 		state.rxOffset += bytes.length
 		if (!state.rxHandler) return
-		state.rxHandler({ claimId: state.claimIds[0] || 'claim1', gen: state.gen, seq: state.rxSeq, offset: offset, at: Date.now(), bytes: bytes })
+		// 用当前声明的 id（重连后是新声明，旧 id 的数据会被插件正确丢弃）
+		state.rxHandler({ claimId: state.claimIds[state.claimIds.length - 1] || 'claim1', gen: state.gen, seq: state.rxSeq, offset: offset, at: Date.now(), bytes: bytes })
 	}
 	state.pushRxText = function (s) {
 		const bytes = new Uint8Array(s.length)
@@ -306,8 +387,9 @@ const fireKey = (win, key, props) => {
 	await tick(60)
 
 	// ---- 启动 ----
-	assert.equal(document.getElementById('port').options.length, 2)
-	assert.match(document.getElementById('port').options[0].textContent, /Power Monitor/)
+	assert.equal(document.getElementById('port').options.length, 2, '只列 BLU 设备（非 BLU 的 CP2102 不出现）')
+	assert.match(document.getElementById('port').options[0].textContent, /BLU Power Monitor/)
+	assert.ok(!document.getElementById('port').options.some((o) => /CP2102/.test(o.textContent)), '非 BLU 口不能出现')
 	assert.match(document.getElementById('port').options[1].textContent, /busy: channel A/)
 	assert.equal(text(document, 'chip-sampling'), 'idle')
 	assert.equal(text(document, 'chip-theme'), 'theme: dark')
@@ -318,7 +400,7 @@ const fireKey = (win, key, props) => {
 	click(document, 'btn-connect')
 	await tick(500)
 	assert.deepEqual(state.acquires[0], ['p1', 'exclusive'], '必须走 claim.acquire(mode=exclusive)')
-	assert.equal(text(document, 'chip-port').indexOf('port: Power Monitor'), 0)
+	assert.equal(text(document, 'chip-port').indexOf('port: BLU Power Monitor'), 0)
 	assert.equal(text(document, 'btn-connect'), 'Disconnect')
 	assert.ok(state.writes.some((w) => w[0] === 0x19), '打开后读设备参数（0x19）')
 	assert.equal(document.getElementById('voltage').value, '3300', 'metadata 里的 VDD 回填到输入框')
@@ -347,6 +429,72 @@ const fireKey = (win, key, props) => {
 	await tick(520)
 	const kept = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
 	assert.ok(kept > 0, '样点进波形：' + ['st-samples', 'ro-samples', 'scope-meta'].map((id) => id + '=' + text(document, id)).join(' '))
+
+	// 电压超时的未知时段必须穿过 app → wave → 统计/CSV，迟到确认只影响后续样点。
+	state.deferred = []
+	state.defer = (b) => b[0] === 0x0d
+	document.getElementById('voltage').value = '2500'
+	click(document, 'btn-apply-voltage')
+	await tick(1500)
+	state.pushRxSamples(3000, 1000)
+	await tick(150)
+	click(document, 'btn-export-all')
+	await tick(150)
+	const pendingRows = state.files.pop().text.split('\n').filter((r) => /^\d+,/.test(r)).map((r) => r.split(','))
+	assert.ok(pendingRows.some((r) => r[4] === '1800'), '写入前保留已确认电压')
+	assert.ok(pendingRows.slice(-5).every((r) => r[3] === '' && r[4] === ''), '未超时时 pending 样点的功率和电压均未知')
+	await tick(1350)
+	state.pushRxSamples(3000, 1000)
+	await tick(200)
+	state.deferred[0].resolve()
+	await tick(100)
+	state.defer = null
+	state.pushRxSamples(3000, 1000)
+	await tick(250)
+	click(document, 'btn-export-all')
+	await tick(200)
+	const csvRows = state.files.pop().text.split('\n').filter((r) => /^\d+,/.test(r)).map((r) => r.split(','))
+	assert.ok(csvRows.some((r) => r[3] === '' && r[4] === ''), '未知时段功率和电压列为空')
+	assert.ok(csvRows.some((r) => r[4] === '1800'), '超时前电压保留')
+	assert.ok(csvRows.some((r) => r[4] === '2500'), '迟到确认后的电压恢复')
+	assert.equal(text(document, 'st-energy'), 'n/a', '未知电压时能量不可用')
+	click(document, 'btn-export-summary')
+	await tick(100)
+	const voltageSummary = JSON.parse(state.files.pop().text)
+	assert.ok(JSON.stringify(voltageSummary).includes('"voltsUnknown":true'))
+
+	// ---- 语言切换（旧 SDK 路径：on('app.locale')）：采集中就地刷新，采集状态不丢 ----
+	{
+		assert.equal(text(document, 'btn-sample'), 'Stop capture', '无 navigator / 无宿主推送时回退 en')
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(text(document, 'btn-sample'), '停止采集', '运行时按钮文案切到中文')
+		assert.equal(text(document, 'chip-sampling'), '采集中')
+		assert.equal(text(document, 'btn-connect'), '断开')
+		assert.equal(text(document, 'btn-refresh'), '刷新', '静态 data-i18n 文案刷新')
+		assert.equal(text(document, 'gaps-hint').indexOf('缺口来自'), 0)
+		assert.equal(document.getElementById('trig-level').getAttribute('placeholder'), '自动 µA', 'placeholder 刷新')
+		assert.equal(document.getElementById('port').getAttribute('aria-label'), '串口', 'aria-label 刷新')
+		assert.match(text(document, 'chip-port'), /^端口：BLU Power Monitor/)
+		assert.equal(text(document, 'session-meta'), '已连接')
+		assert.match(text(document, 'chip-theme'), /^主题：/)
+		assert.match(text(document, 'scope-meta'), /个样点/)
+		assert.equal(document.title, '功耗分析仪')
+		assert.equal(document.documentElement.getAttribute('lang'), 'zh-CN')
+		// 采集没有被打断：样点继续入库
+		const before = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		state.pushRxSamples(600, 1000)
+		await tick(450)
+		const after = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		assert.ok(after > before, '切换语言后采集继续：' + before + ' → ' + after)
+		assert.equal(text(document, 'btn-sample'), '停止采集')
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(text(document, 'btn-sample'), 'Stop capture')
+		assert.equal(text(document, 'btn-refresh'), 'Refresh')
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		assert.equal(document.getElementById('trig-level').getAttribute('placeholder'), 'auto µA')
+	}
 
 	// ---- 缺口 1：宿主静默少发一批（offset 跳号）----
 	const gapsBefore = text(document, 'chip-gaps')
@@ -626,6 +774,269 @@ const fireKey = (win, key, props) => {
 		await tick(150)
 	}
 
+	// ---- 阻塞 1：Connect 后立刻点 Start（落在读参数 / 供电探测窗口内）----
+	// 探测的 START/STOP 必须全部在用户 START 之前，否则探测的 STOP 会掐断刚开始的采集（之后只剩「无应答」）
+	{
+		const acqStart = document.getElementById('acq-start')
+		const acqStop = document.getElementById('acq-stop')
+		acqStart.value = 'off'
+		fire(acqStart, 'change', {})
+		acqStop.value = 'off'
+		fire(acqStop, 'change', {})
+		state.writes.length = 0
+		click(document, 'btn-connect')
+		await tick(30)
+		assert.equal(text(document, 'btn-connect'), 'Disconnect')
+		assert.equal(document.getElementById('btn-sample').disabled, true, '连接初始化（读参数 / 供电探测）完成前 Start 不可点')
+		// 即使点击绕过了禁用态（快捷键、竞态），开始采集也必须排在初始化之后
+		fire(document.getElementById('btn-sample'), 'click', { detail: 1 })
+		await tick(700)
+		assert.equal(document.getElementById('btn-sample').disabled, false, '初始化结束后放开 Start')
+		const ops = state.writes.map((w) => w[0]).filter((b) => b === 0x06 || b === 0x07)
+		assert.deepEqual(ops, [0x06, 0x07, 0x07, 0x06], '探测 START/STOP → 采集 STOP/START，START 之后不能再有 STOP：' + ops.join(','))
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		// 状态条「采样已开始」里的模式词也随语言切换（参数存惰性消息，不是预先翻译好的串）
+		{
+			const sl0 = document.getElementById('status-line')
+			assert.match(sl0.textContent, /^Capture started .*waveform/, '状态条：' + sl0.textContent)
+			state.emit('app.locale', { locale: 'zh-CN' })
+			await tick(20)
+			assert.match(sl0.textContent, /^采样已开始 .*波形/, '状态条切到中文：' + sl0.textContent)
+			assert.ok(!/waveform|Capture/.test(sl0.textContent), '不残留英文：' + sl0.textContent)
+			state.emit('app.locale', { locale: 'en' })
+			await tick(20)
+			assert.match(sl0.textContent, /^Capture started .*waveform/)
+		}
+		const before = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		state.pushRxSamples(3000, 1000)
+		await tick(450)
+		const after = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		assert.ok(after > before, '采集真的收到数据：' + before + ' → ' + after)
+		click(document, 'btn-sample')
+		await tick(150)
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// ---- 阻塞 2：停止沿自动停采 → 与手动停同样收尾（停看门狗、释放 busy、不记缺口、不误报）----
+	{
+		const acqStop = document.getElementById('acq-stop')
+		const acqStartSel = document.getElementById('acq-start')
+		acqStartSel.value = 'off'
+		fire(acqStartSel, 'change', {})
+		click(document, 'btn-connect')
+		await tick(500)
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		// 手动电平落在两段之间（adc 1000 ≈ 47 mA、adc 12000 ≈ 561 mA）
+		const lvl = document.getElementById('trig-level')
+		const lvlBefore = lvl.value
+		lvl.value = '300000'
+		fire(lvl, 'change', {})
+		const releasedBefore = state.released.length
+		const gapsBefore = text(document, 'chip-gaps')
+		acqStop.value = 'rise'
+		fire(acqStop, 'change', {})
+		state.pushRxSamples(3000, 1000)
+		await tick(60)
+		state.pushRxSamples(3000, 12000)
+		await tick(300)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '停止沿命中后停采：' + text(document, 'chip-sampling'))
+		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		assert.equal(state.released.length, releasedBefore + 1, '自动停采也释放更新屏障')
+		assert.ok(state.hostLogs.some((l) => /capture stop edge hit; local acquisition ended, device STOP requested/.test(l)), '自动停采写宿主日志')
+		// 看门狗已停：超过中断阈值后既不报中断，也不新增缺口
+		await tick(3200)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '自动停采后看门狗不能再报故障：' + text(document, 'chip-sampling'))
+		assert.equal(text(document, 'chip-gaps'), gapsBefore, '自动停采后不能记缺口')
+		const sl = document.getElementById('status-line')
+		assert.ok(!/stalled|No response/.test(sl.textContent), '状态条不能误报：' + sl.textContent)
+		// 停止沿命中但 STOP 写失败：失败原因上状态条（结果被检查，不只显示「命中停止沿」）
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		const releasedMid = state.released.length
+		const edgeHostStart = state.hostLogs.length
+		state.failOnByte = 0x07
+		state.failOnByteError = 'USB 写超时'
+		state.pushRxSamples(3000, 1000)
+		await tick(60)
+		state.pushRxSamples(3000, 12000)
+		await tick(300)
+		state.failOnByte = null
+		state.failOnByteError = null
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.equal(document.getElementById('btn-sample').disabled, true)
+		assert.equal(state.released.length, releasedMid + 1)
+		assert.ok(!state.hostLogs.slice(edgeHostStart).some((l) => /capture stopped by the capture stop edge/.test(l)), 'STOP 失败时不能声称设备已停')
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /^Capture stop edge hit, but stopping the capture failed/, '状态条：' + sl.textContent)
+		acqStop.value = 'off'
+		fire(acqStop, 'change', {})
+		lvl.value = lvlBefore
+		fire(lvl, 'change', {})
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// 存储上限触发本地收尾，STOP 失败时不能声称设备已停止。
+	{
+		click(document, 'btn-connect')
+		await tick(500)
+		click(document, 'btn-sample')
+		await tick(200)
+		const hostStart = state.hostLogs.length
+		state.failOnByte = 0x07
+		state.triggerStorageStop('synthetic storage limit')
+		await tick(200)
+		state.failOnByte = null
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.match(text(document, 'status-line'), /Local capture ended at the storage limit; device STOP was not confirmed/, '记录本地采集结束和设备状态未知')
+		assert.ok(!state.hostLogs.slice(hostStart).some((l) => /capture stopped:/.test(l)), '不声称 STOP 已确认')
+		assert.ok(state.hostLogs.slice(hostStart).some((l) => /capture stop unconfirmed/.test(l)))
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// ---- 失败必须可见：START 写失败 / 设备无应答都要写到状态条，不能静默回到 idle ----
+	{
+		click(document, 'btn-connect')
+		await tick(500)
+		assert.equal(text(document, 'btn-connect'), 'Disconnect')
+		// 1) 阻塞 3：只有启动前的 STOP 写失败（START 本身能写出去）→ 中止启动，原因留在状态条上
+		state.writes.length = 0
+		state.failOnByte = 0x07
+		state.failOnByteError = 'USB 写超时'
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.ok(!state.writes.some((w) => w[0] === 0x06), 'STOP 写失败后不能继续 START')
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.equal(document.getElementById('chip-sampling').dataset.state, 'warn')
+		const sl = document.getElementById('status-line')
+		assert.equal(sl.hidden, false, '状态条要显示出来')
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /STOP before START could not be written.*USB 写超时/, '状态条写明原因：' + sl.textContent)
+		await tick(400)
+		assert.match(sl.textContent, /STOP before START could not be written/, '失败不会被后续成功日志覆盖：' + sl.textContent)
+		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		state.failOnByte = null
+		click(document, 'btn-connect')
+		await tick(150)
+		click(document, 'btn-connect')
+		await tick(500)
+		// 1b) START 本身写失败：同样可见
+		state.failOnByte = 0x06
+		click(document, 'btn-sample')
+		await tick(200)
+		state.failOnByte = null
+		state.failOnByteError = null
+		assert.equal(text(document, 'chip-sampling'), 'start failed')
+		assert.match(sl.textContent, /Starting the capture failed: START could not be written.*USB 写超时/, '状态条：' + sl.textContent)
+		// 阻塞 4：语言切换时状态条按保存的键与参数重绘（不是保留旧语言的文本）
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(sl.textContent, /^开始采样失败：START 写入失败.*USB 写超时/, '状态条切到中文：' + sl.textContent)
+		assert.equal(sl.dataset.level, 'error', '级别不变')
+		assert.equal(text(document, 'chip-sampling'), '启动失败')
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(sl.textContent, /^Starting the capture failed: START could not be written/)
+		// 诊断面板：发送失败计数与最近错误
+		click(document, 'btn-diag')
+		await tick(10)
+		assert.equal(document.getElementById('diag').hidden, false, '诊断面板可展开')
+		assert.match(text(document, 'diag-tx'), /writes .* [1-9]\d* failed/, '诊断显示发送统计：' + text(document, 'diag-tx'))
+		assert.match(text(document, 'diag-rx'), /batches .* B/)
+		assert.match(text(document, 'diag-error'), /USB 写超时/, '诊断显示最近错误：' + text(document, 'diag-error'))
+		// 阻塞 4：诊断里的最近错误也跟着切语言
+		const diagEn = text(document, 'diag-error')
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(text(document, 'diag-error'), /写入失败.*USB 写超时/, '诊断最近错误切到中文：' + text(document, 'diag-error'))
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(text(document, 'diag-error'), diagEn)
+		// 2) 设备无应答：START 写成功但一个字节都不回 → 看门狗报「无应答」，不是缺口
+		state.silent = true
+		const gapsBefore = text(document, 'chip-gaps')
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		await tick(3200)
+		assert.equal(text(document, 'chip-sampling'), 'no response', '看门狗必须真的在跑：' + text(document, 'chip-sampling'))
+		assert.match(sl.textContent, /No response from the device/, '状态条：' + sl.textContent)
+		assert.equal(text(document, 'chip-gaps'), gapsBefore, '从未收到数据不算缺口')
+		state.silent = false
+		click(document, 'btn-sample')
+		await tick(200)
+		// 3) 宿主卡住不确认写入：按超时失败结束，超时原因留在状态条（中英都整句可重绘）
+		state.hangOnByte = 0x0d
+		document.getElementById('voltage').value = '2400'
+		click(document, 'btn-apply-voltage')
+		await tick(3300)
+		state.hangOnByte = null
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /^Setting the voltage failed: .*not confirmed within 3000 ms \[timeout\]/, '状态条写明超时：' + sl.textContent)
+		assert.match(text(document, 'diag-error'), /Write timed out .*3000 ms/, '诊断最近错误：' + text(document, 'diag-error'))
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(sl.textContent, /^设定电压失败：.*3000 ms 内未确认 \[timeout\]/, '状态条切到中文：' + sl.textContent)
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		// 电压超时后状态未知，重新确认电压再启动采集。
+		click(document, 'btn-apply-voltage')
+		await tick(200)
+		// 4) START 写入超时：结果未知（宿主仍可能写出），不能显示成确定的未采样 / 启动失败
+		state.deferred = []
+		state.defer = function (b) { return b[0] === 0x06 || (b[0] === 0x07 && state.writes.some((w) => w[0] === 0x06)) }
+		state.writes.length = 0
+		click(document, 'btn-sample')
+		await tick(3300)
+		assert.equal(text(document, 'chip-sampling'), 'start unknown', 'chip：' + text(document, 'chip-sampling'))
+		assert.equal(document.getElementById('chip-sampling').dataset.state, 'warn')
+		assert.equal(document.getElementById('btn-sample').disabled, true, '结果未知期间不能再开始')
+		assert.equal(sl.dataset.level, 'warn')
+		assert.match(sl.textContent, /^START timed out and its outcome is unknown/, '状态条说明结果未知：' + sl.textContent)
+		assert.deepEqual(state.writes.map((w) => w[0]).filter((b) => b === 0x06 || b === 0x07), [0x07, 0x06, 0x07], '超时当下就补了 STOP')
+		// 绕过禁用（快捷键等入口）也不会再发 START
+		fire(document.getElementById('btn-sample'), 'click', { detail: 1 })
+		await tick(100)
+		assert.equal(state.writes.filter((w) => w[0] === 0x06).length, 1, '没有再发 START')
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		// 最新 STOP 先确认：即使旧 START 未确认，也应恢复为已停止。
+		state.deferred[1].resolve()
+		await tick(60)
+		state.defer = null
+		assert.equal(text(document, 'chip-sampling'), 'idle')
+		assert.equal(document.getElementById('btn-sample').disabled, false, '收尾后放开 Start')
+		assert.match(sl.textContent, /^The timed-out START is still unconfirmed, but the following STOP was confirmed/, '状态条：' + sl.textContent)
+		state.deferred[0].resolve()
+		await tick(20)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '旧 START 回执不能覆盖 STOP')
+		click(document, 'btn-diag')
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// ---- BLU 筛选空态：没有 BLU 口时给明确提示，不退回列全部口 ----
+	{
+		const saved = state.ports
+		state.ports = [{ key: 'q1', portName: 'COM9', productName: 'CH340' }, { key: 'q2', portName: 'COM10', productName: 'FTDI' }]
+		click(document, 'btn-refresh')
+		await tick(40)
+		const sel = document.getElementById('port')
+		assert.equal(sel.options.length, 1, '空态只有一条提示')
+		assert.equal(sel.options[0].value, '')
+		assert.match(sel.options[0].textContent, /No BLU device found.*2/, '空态写明未发现 BLU 并说明隐藏了几个口：' + sel.options[0].textContent)
+		assert.equal(sel.disabled, true)
+		state.ports = saved
+		click(document, 'btn-refresh')
+		await tick(40)
+		assert.equal(sel.options.length, 2)
+		assert.equal(sel.disabled, false)
+	}
+
 	// ---- CSV 导入：本地文件解析后替换会话 ----
 	{
 		const csv = [
@@ -644,11 +1055,35 @@ const fireKey = (win, key, props) => {
 		assert.ok(Number(text(document, 'ro-samples').replace(/[^0-9]/g, '')) >= 3, '导入的样点进了会话')
 		assert.notEqual(text(document, 'chip-gaps'), 'gaps: 0', '导入文件里的缺口标记要生效：' + text(document, 'chip-gaps'))
 		assert.ok(state.hostLogs.some((l) => /imported 3 samples/.test(l)), '导入写宿主日志：' + JSON.stringify(state.hostLogs.slice(-3)))
+		// 无效 CSV：状态条上的失败原因也随语言切换
+		document.getElementById('import-file').files = [{ name: 'bad.csv', text: async () => 'foo,bar\n1,2\n' }]
+		click(document, 'btn-import')
+		await tick(100)
+		const isl = document.getElementById('status-line')
+		assert.equal(isl.dataset.level, 'error')
+		assert.match(isl.textContent, /^CSV import failed: no current column/, '状态条：' + isl.textContent)
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(isl.textContent, 'CSV 导入失败：找不到电流列', '原因随语言切换：' + isl.textContent)
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(isl.textContent, /^CSV import failed: no current column/)
 		// 没有选文件时给出提示，不抛错
 		document.getElementById('import-file').files = []
 		click(document, 'btn-import')
 		await tick(40)
 		assert.match(text(document, 'import-hint'), /Choose a CSV file/)
+		// 阻塞 4：已显示的导出 / 导入提示跟着切语言
+		const exportEn = text(document, 'export-hint')
+		assert.match(exportEn, /^Saved /, '导出提示：' + exportEn)
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(text(document, 'import-hint'), '请先选择 CSV 文件。')
+		assert.match(text(document, 'export-hint'), /^已保存 /, '导出提示切到中文：' + text(document, 'export-hint'))
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(text(document, 'import-hint'), /Choose a CSV file/)
+		assert.equal(text(document, 'export-hint'), exportEn)
 	}
 
 	// ---- 冷区上限 ----
@@ -656,6 +1091,38 @@ const fireKey = (win, key, props) => {
 	click(document, 'btn-apply-cap')
 	await tick(500)
 	assert.ok(state.saved.some(([k, v]) => k === 'settings' && v.capMiB === 256), '冷区上限写进设置：' + JSON.stringify(state.saved.slice(-1)))
+
+	// ---- 语言来源：navigator 回退 / 新 SDK onLocale 覆盖 navigator ----
+	{
+		// 1) 旧宿主：SDK 没有 onLocale，navigator 是中文 → 中文界面
+		const s1 = Object.assign({}, state, { settings: {}, saved: [], hostLogs: [], claimIds: [], busy: [], released: [], acquires: [] })
+		const e1 = makeEnv(s1, { navigator: { language: 'zh-CN' } })
+		await tick(80)
+		assert.equal(e1.document.getElementById('btn-sample').textContent, '开始采集', 'navigator 回退为中文')
+		assert.equal(e1.document.getElementById('btn-refresh').textContent, '刷新')
+		assert.equal(e1.document.getElementById('chip-sampling').textContent, '空闲')
+		assert.equal(e1.document.getElementById('btn-connect').textContent, '连接')
+		// 宿主后来推了 en（旧 SDK 也会把 app.locale 转给 on()）
+		s1.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(e1.document.getElementById('btn-sample').textContent, 'Start capture')
+
+		// 2) 新宿主：onLocale 已有值时立即回调，覆盖 navigator；之后的推送就地生效
+		const s2 = Object.assign({}, state, {
+			settings: {}, saved: [], hostLogs: [], claimIds: [], busy: [], released: [], acquires: [],
+			localeSupport: true, hostLocale: 'en',
+			ports: [{ key: 'z1', portName: 'COM4', productName: 'CH340' }],
+		})
+		const e2 = makeEnv(s2, { navigator: { language: 'zh-CN' } })
+		await tick(80)
+		assert.equal(e2.document.getElementById('btn-sample').textContent, 'Start capture', '宿主语言优先于 navigator')
+		assert.match(e2.document.getElementById('port').options[0].textContent, /^No BLU device found \(1 other port\(s\) hidden\)/)
+		s2.pushLocale('zh-CN')
+		await tick(20)
+		assert.equal(e2.document.getElementById('btn-sample').textContent, '开始采集')
+		assert.match(e2.document.getElementById('port').options[0].textContent, /^未发现 BLU 设备（已隐藏 1 个其他串口）/, '空态提示也跟着切语言：' + e2.document.getElementById('port').options[0].textContent)
+		assert.equal(e2.document.getElementById('port').disabled, true, '空态下拉保持禁用')
+	}
 
 	console.log('app-smoke: ok')
 	process.exit(0)

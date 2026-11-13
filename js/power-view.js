@@ -11,6 +11,8 @@
 //  - 沿触发的 waiting 阶段只累计 pre-range（供 Auto 电平），且 unknown 状态只 seed 不产生沿。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const C = {
 		DEFAULT_VIEW_POINTS: 2000,
@@ -715,6 +717,25 @@
 		return api
 	}
 
+	/**
+	 * 看门狗命中时判断是哪一种「没数据」：设备完全无应答 / 收到字节但解不出样点 / 有过数据后中断。
+	 * 三种原因处理方式不同，界面必须说清楚，不能都叫「中断」。
+	 * @param {{ idleMs: number, rxBytes: number, samples: number }} o 采样开始以来的增量
+	 */
+	function describeStall(o) {
+		o = o || {}
+		const sec = ((Number(o.idleMs) || 0) / 1000).toFixed(1)
+		const rx = Math.max(0, Number(o.rxBytes) || 0)
+		const n = Math.max(0, Number(o.samples) || 0)
+		if (rx === 0) {
+			return { kind: 'no_response', level: 'error', message: tr('view.no_response', { sec: sec }), ref: I18N.msg('view.no_response', { sec: sec }) }
+		}
+		if (n === 0) {
+			return { kind: 'undecodable', level: 'error', message: tr('view.undecodable', { bytes: rx }), ref: I18N.msg('view.undecodable', { bytes: rx }) }
+		}
+		return { kind: 'stall', level: 'warn', message: tr('view.stall', { sec: sec }), ref: I18N.msg('view.stall', { sec: sec }) }
+	}
+
 	// ---------- 总览条（minimap） ----------
 	/** 总览条里视口框的像素区间 */
 	function minimapViewRect(o) {
@@ -778,6 +799,7 @@
 		setAcqStartMode: setAcqStartMode,
 		setAcqStopMode: setAcqStopMode,
 		createStallWatch: createStallWatch,
+		describeStall: describeStall,
 		minimapViewRect: minimapViewRect,
 		minimapSeekIndex: minimapSeekIndex,
 	}

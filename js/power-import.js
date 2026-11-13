@@ -8,6 +8,8 @@
 // 不猜单位：电流按 µA、时间按 s、电压按 mV（导出时就是这些单位）。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const MAX_ROWS = 2000000
 
@@ -204,17 +206,21 @@
 
 	/** 解析结果的摘要（界面提示用） */
 	function summarize(parsed) {
-		if (!parsed || !parsed.ok) return { text: '导入失败：' + ((parsed && parsed.reason) || 'unknown'), warn: true }
+		if (!parsed || !parsed.ok) {
+			const code = (parsed && parsed.reason) || 'unknown'
+			const key = 'ui.reason_' + code
+			return { text: tr('imp.failed', { why: I18N.has(key) ? tr(key) : code }), warn: true }
+		}
 		const dur = parsed.rows.length * (parsed.samplePeriodSec || 0)
 		const parts = [
-			parsed.rows.length + ' rows',
-			parsed.samplePeriodSec > 0 ? (1 / parsed.samplePeriodSec).toFixed(0) + ' Hz' : 'no time column',
-			parsed.volts != null ? parsed.volts.toFixed(0) + ' mV' : 'no voltage',
+			tr('imp.rows', { n: parsed.rows.length }),
+			parsed.samplePeriodSec > 0 ? (1 / parsed.samplePeriodSec).toFixed(0) + ' Hz' : tr('imp.no_time_column'),
+			parsed.volts != null ? parsed.volts.toFixed(0) + ' mV' : tr('imp.no_voltage'),
 		]
-		if (parsed.gaps.length) parts.push(parsed.gaps.length + ' gap marker(s)')
-		if (parsed.skipped) parts.push(parsed.skipped + ' row(s) skipped')
-		if (parsed.voltsMixed) parts.push('mixed voltage (weighted)')
-		if (!parsed.powerUsable) parts.push('energy unavailable')
+		if (parsed.gaps.length) parts.push(tr('imp.gap_markers', { n: parsed.gaps.length }))
+		if (parsed.skipped) parts.push(tr('imp.rows_skipped', { n: parsed.skipped }))
+		if (parsed.voltsMixed) parts.push(tr('imp.mixed_voltage'))
+		if (!parsed.powerUsable) parts.push(tr('imp.energy_unavailable'))
 		void dur
 		return { text: parts.join(' · '), warn: !parsed.powerUsable }
 	}
