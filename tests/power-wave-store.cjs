@@ -532,5 +532,33 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		assert.equal(tail.energyUW_s, 0, '未知电压不产生能量')
 	}
 
+	{
+		// N12：平均功率必须累计（热块与完整冷块两条路径）
+		// 热块：两点 1000 µA / 3.3 V / 1 s
+		const { T } = load(makeStore(), { cap: CHUNK })
+		T.env.samplePeriodSec = 1
+		T.env.voltageV = 3.3
+		T.ringPush(1000)
+		T.ringPush(1000)
+		const hot = T.calcStats(0, 2)
+		assert.equal(hot.avgI, 1000)
+		assert.ok(Math.abs(hot.avgP - 3300) < 1e-9, '热块平均功率应为 3300 µW：' + hot.avgP)
+		assert.ok(Math.abs(hot.energyUWh - 3300 / 3600) < 1e-12, '热块能量：' + hot.energyUWh)
+
+		// 完整冷块：4 点一块，写满两块后整块落盘，avgP 仍要正确
+		const store2 = makeStore()
+		const w2 = Wave.createWave({
+			store: store2, chunkSize: 4, ramCapSamples: 4, voltage: () => 3.3, samplePeriod: () => 1,
+		})
+		for (let i = 0; i < 8; i++) w2.push(1000)
+		await settle()
+		assert.ok(w2.chunks.some((c) => c.state === 'cold'), '应有冷块：' + w2.chunks.map((c) => c.state).join(','))
+		w2.clearHydrateCache()
+		const cold = w2.calcStats(0, 8)
+		assert.equal(cold.avgI, 1000)
+		assert.ok(Math.abs(cold.avgP - 3300) < 1e-9, '完整冷块平均功率应为 3300 µW：' + cold.avgP)
+		assert.ok(Math.abs(cold.energyUWh - (1000 * 3.3 * 7) / 3600) < 1e-9, '冷块能量：' + cold.energyUWh)
+	}
+
 	console.log('power-wave-store: ok')
 })().catch(function (e) { console.error(e); process.exit(1) })

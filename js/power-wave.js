@@ -308,7 +308,16 @@
 		 *   { kind: 'missing', lo, hi }    冷块回读失败（不可用，不造数）
 		 * 分析与导出都走这里：拿不到就明说不可用，绝不拿块级 min/max 中点充数。
 		 */
-		async function walkExact(start, end, visit) {
+		/**
+		 * 流式精确遍历：逐块「回读一块 → 立刻交付并累加一块」，所以即使回读缓存装不下整段，
+		 * 也不会出现「早期的块被挤出缓存、后续积分退回近似」的问题。
+		 *
+		 * @param {number} start
+		 * @param {number} end
+		 * @param {function} [visit] 事件回调（samples / gap / dropped / missing）
+		 * @param {object} [accOut] createIntegralAcc() 的累加器：遍历时按块精确累加
+		 */
+		async function walkExact(start, end, visit, accOut) {
 			const a0 = Math.max(0, Math.min(totalCount, start | 0))
 			const b0 = Math.max(a0, Math.min(totalCount, end | 0))
 			const summary = { samples: 0, missing: 0, dropped: 0, gaps: 0, aborted: false }
@@ -367,9 +376,12 @@
 						}
 						if (!buf) {
 							summary.missing += hi - lo
+							if (accOut) accOut.voltsUnknown = accOut.voltsUnknown || false
 							if (visit) visit({ kind: 'missing', lo: lo, hi: hi })
 						} else {
 							summary.samples += hi - lo
+							// 精确累加：本块刚回读到手，立刻算完（不依赖缓存后续还留着）
+							if (accOut) accChunkExact(accOut, ch, lo - ch0, hi - ch0, segB - 1 - ch0, buf)
 							if (visit) {
 								// 按块内电压边界拆开：每个事件里的样点共享同一个**当时**的电压
 								const runs = chunkVoltRuns(ch, lo - ch0, hi - ch0)
@@ -418,6 +430,32 @@
 		/** 当前会话序号：调用方可据此判断一次异步分析是否还有效 */
 		function epoch() {
 			return waveEpoch
+		}
+
+		/**
+		 * 精确积分（分析 / 游标用）：流式逐块回读并累加，绝不依赖「整段都还留在缓存里」。
+		 * @returns {Promise<{ ok:boolean, aborted:boolean, missing:number, dropped:number, gaps:number,
+		 *   n, sumI, sumP, sumSq, minI, maxI, intervals, chargeUC, energyUW_s, volts, voltsUnknown, durSec }>}
+		 */
+		async function integrateExactAsync(start, end, o) {
+			o = o || {}
+			const per = o.samplePeriodSec > 0 ? o.samplePeriodSec : samplePeriod()
+			const acc = createIntegralAcc(per)
+			const walk = await walkExact(start, end, o.visit || null, acc)
+			const a0 = Math.max(0, Math.min(totalCount, start | 0))
+			const b0 = Math.max(a0, Math.min(totalCount, end | 0))
+			const res = Object.assign(finalizeAcc(acc), {
+				ok: true,
+				aborted: !!(walk && walk.aborted),
+				missing: walk ? walk.missing : 0,
+				dropped: walk ? walk.dropped : 0,
+				gaps: walk ? walk.gaps : 0,
+				segments: b0 > a0 ? segments(a0, b0).length : 0,
+			})
+			if (res.aborted) res.ok = false
+			// 有读不到的块 → 数据不完整（调用方必须标不完整 / 不可用）
+			if (res.missing > 0) res.ok = false
+			return res
 		}
 
 		/**
@@ -828,17 +866,71 @@
 			return n
 		}
 
+		// ---- 积分：唯一的累加实现（同步 / 流式都走这两个函数） ----
+		function createIntegralAcc(per) {
+			return {
+				per: per > 0 ? per : samplePeriod(),
+				n: 0, sumI: 0, sumP: 0, sumSq: 0, minI: Infinity, maxI: -Infinity,
+				intervals: 0, chargeUC: 0, energyUW_s: 0,
+				voltNum: 0, voltDen: 0, voltsUnknown: false, approximate: false,
+			}
+		}
+
 		/**
-		 * **唯一的积分实现**：按「每个有效相邻样点间隔」左端点累加。
-		 *
-		 * 约定：样点 i 管 [t_i, t_{i+1}) 这段间隔，所以区间 [a,b) 的积分只覆盖
-		 * i ∈ [a, b-1)，且 i 与 i+1 必须同属一个连续段（缺口 / 淘汰 / 读不到都不算间隔）。
-		 * 结果与块大小、块边界无关：整块走块级和（sumI / sumP），跨块的边界间隔
-		 * 由「左端点所在块」负责，部分块用逐点值。
-		 *
-		 * n / sumI / minI / maxI 覆盖区间内的**全部样点**（[a,b)），
-		 * intervals / chargeUC / energyUW_s 只覆盖左端点（[a,b-1)）。
-		 *
+		 * 把「一个块内属于 [localLo, localHi) 的样点」按左端点累加进 acc。
+		 * 需要逐点值（ch.buf）；没有 buf 时返回 false，由调用方决定近似或回读。
+		 * eHiLocal 是本块内「最后一个左端点」的块内上界（段尾样点不算间隔）。
+		 */
+		function accChunkExact(acc, ch, localLo, localHi, eHiLocal, bufIn) {
+			const buf = bufIn || ch.buf || getChunkBuf(ch) || null
+			if (!buf) return false
+			const per = acc.per
+			const eHi = Math.min(localHi, eHiLocal)
+			const runs = chunkVoltRuns(ch, localLo, localHi)
+			for (let r = 0; r < runs.length; r++) {
+				const run = runs[r]
+				const vset = run.mv == null ? null : run.mv / 1000
+				if (vset == null) acc.voltsUnknown = true
+				for (let k = run.lo; k < run.hi; k++) {
+					const v = buf[k]
+					if (!isFinite(v)) continue
+					acc.n++
+					acc.sumI += v
+					acc.sumSq += v * v
+					if (v < acc.minI) acc.minI = v
+					if (v > acc.maxI) acc.maxI = v
+					if (vset != null) {
+						acc.sumP += v * vset
+						acc.voltNum += v * vset
+						acc.voltDen += v
+					}
+					if (k < eHi) {
+						acc.intervals++
+						acc.chargeUC += v * per
+						if (vset != null) acc.energyUW_s += v * vset * per
+					}
+				}
+			}
+			return true
+		}
+
+		function finalizeAcc(acc) {
+			const per = acc.per
+			return {
+				n: acc.n, sumI: acc.sumI, sumP: acc.sumP, sumSq: acc.sumSq,
+				minI: isFinite(acc.minI) ? acc.minI : 0,
+				maxI: isFinite(acc.maxI) ? acc.maxI : 0,
+				intervals: acc.intervals, chargeUC: acc.chargeUC, energyUW_s: acc.energyUW_s,
+				volts: acc.voltDen > 0 ? acc.voltNum / acc.voltDen : 0,
+				voltsUnknown: acc.voltsUnknown,
+				approximate: acc.approximate,
+				durSec: acc.intervals * per,
+			}
+		}
+
+		/**
+		 * 同步积分：按「每个有效相邻样点间隔」左端点累加（缓存里有逐点值就精确，
+		 * 否则部分块退回比例近似并标 approximate）。
 		 * @param {number} start 含
 		 * @param {number} end 不含
 		 * @param {object} [o] { samplePeriodSec }
@@ -846,12 +938,8 @@
 		function integrateRange(start, end, o) {
 			o = o || {}
 			const per = o.samplePeriodSec > 0 ? o.samplePeriodSec : samplePeriod()
-			const out = {
-				n: 0, sumI: 0, sumP: 0, minI: Infinity, maxI: -Infinity,
-				intervals: 0, chargeUC: 0, energyUW_s: 0,
-				volts: 0, voltsUnknown: false, approximate: false,
-				segments: 0, gaps: 0, dropped: 0, durSec: 0,
-			}
+			const acc = createIntegralAcc(per)
+			const out = Object.assign(finalizeAcc(acc), { segments: 0, gaps: 0, dropped: 0 })
 			if (totalCount < 1 || end <= start) return out
 			start = Math.max(0, start)
 			end = Math.min(totalCount, end)
@@ -860,12 +948,9 @@
 			out.segments = segs.length
 			out.gaps = gapsIn(start, end)
 			out.dropped = droppedIn(start, end)
-			let voltNum = 0
-			let voltDen = 0
 			for (let s = 0; s < segs.length; s++) {
 				const a = segs[s][0]
 				const b = segs[s][1]
-				// 左端点范围 [a, b-1)
 				const eHiGlobal = b - 1
 				let i0 = chunkIndexAt(a)
 				let base = waveChunks[i0] ? waveChunks[i0].base : 0
@@ -879,83 +964,59 @@
 					if (hi > lo && ch.state !== 'dropped') {
 						const localLo = lo - ch0
 						const localHi = hi - ch0
-						// 本块内属于「左端点」的部分
-						const eHi = Math.min(localHi, eHiGlobal - ch0)
-						const buf = getChunkBuf(ch)
-						if (buf) {
-							const runs = chunkVoltRuns(ch, localLo, localHi)
-							for (let r = 0; r < runs.length; r++) {
-								const run = runs[r]
-								const vset = run.mv == null ? null : run.mv / 1000
-								if (vset == null) out.voltsUnknown = true
-								for (let k = run.lo; k < run.hi; k++) {
-									const v = buf[k]
-									if (!isFinite(v)) continue
-									out.n++
-									out.sumI += v
-									if (v < out.minI) out.minI = v
-									if (v > out.maxI) out.maxI = v
-									if (vset != null) { voltNum += v * vset; voltDen += v }
-									if (k < eHi) {
-										out.intervals++
-										out.chargeUC += v * per
-										if (vset != null) out.energyUW_s += v * vset * per
+						const eHiLocal = eHiGlobal - ch0
+						if (!accChunkExact(acc, ch, localLo, localHi, eHiLocal)) {
+							if (localLo === 0 && localHi === ch.n) {
+								// 整块：块级和精确
+								if (ch.voltsUnknown) acc.voltsUnknown = true
+								acc.n += ch.n
+								acc.sumI += ch.sumI
+								acc.sumP += ch.sumP
+								acc.sumSq += ch.sumSqI
+								if (ch.minI < acc.minI) acc.minI = ch.minI
+								if (ch.maxI > acc.maxI) acc.maxI = ch.maxI
+								if (!ch.voltsUnknown) { acc.voltNum += ch.sumP; acc.voltDen += ch.sumI }
+								if (eHiLocal >= ch.n) {
+									acc.intervals += ch.n
+									acc.chargeUC += ch.sumI * per
+									if (!ch.voltsUnknown) acc.energyUW_s += ch.sumP * per
+								} else {
+									// 段尾那块：最后一个样点不构成间隔
+									const lastI = ch.lastI
+									acc.intervals += ch.n - 1
+									acc.chargeUC += (ch.sumI - lastI) * per
+									if (!ch.voltsUnknown) {
+										const runs = chunkVoltRuns(ch, ch.n - 1, ch.n)
+										const mv = runs.length ? runs[0].mv : null
+										const lastP = mv == null ? 0 : lastI * (mv / 1000)
+										acc.energyUW_s += (ch.sumP - lastP) * per
 									}
 								}
-							}
-						} else if (localLo === 0 && localHi === ch.n) {
-							// 整块：块级和精确
-							if (ch.voltsUnknown) out.voltsUnknown = true
-							out.n += ch.n
-							out.sumI += ch.sumI
-							if (ch.minI < out.minI) out.minI = ch.minI
-							if (ch.maxI > out.maxI) out.maxI = ch.maxI
-							if (!ch.voltsUnknown) { voltNum += ch.sumP; voltDen += ch.sumI }
-							// 左端点数 = 本块内属于 [a,b-1) 的样点数
-							const cntE = Math.max(0, eHi)
-							if (cntE >= ch.n) {
-								out.intervals += ch.n
-								out.chargeUC += ch.sumI * per
-								if (!ch.voltsUnknown) out.energyUW_s += ch.sumP * per
 							} else {
-								// 段尾那块：最后一个样点不构成间隔，用块级值减去它
-								const lastI = ch.lastI
-								out.intervals += ch.n - 1
-								out.chargeUC += (ch.sumI - lastI) * per
-								if (!ch.voltsUnknown) {
-									const runs = chunkVoltRuns(ch, ch.n - 1, ch.n)
-									const mv = runs.length ? runs[0].mv : null
-									const lastP = mv == null ? 0 : lastI * (mv / 1000)
-									out.energyUW_s += (ch.sumP - lastP) * per
-								}
+								// 部分块且未回读：比例近似（显示用）
+								requestHydrate(ch)
+								acc.approximate = true
+								if (ch.voltsUnknown) acc.voltsUnknown = true
+								const cnt = localHi - localLo
+								const ratio = ch.n > 0 ? cnt / ch.n : 0
+								acc.n += cnt
+								acc.sumI += ch.sumI * ratio
+								acc.sumP += ch.sumP * ratio
+								acc.sumSq += ch.sumSqI * ratio
+								if (ch.minI < acc.minI) acc.minI = ch.minI
+								if (ch.maxI > acc.maxI) acc.maxI = ch.maxI
+								if (!ch.voltsUnknown) { acc.voltNum += ch.sumP * ratio; acc.voltDen += ch.sumI * ratio }
+								const cntE = Math.max(0, eHiLocal - localLo)
+								acc.intervals += cntE
+								acc.chargeUC += ch.sumI * ratio * per
+								if (!ch.voltsUnknown) acc.energyUW_s += ch.sumP * ratio * per
 							}
-						} else {
-							// 部分块且未回读：按比例近似（显示用）
-							requestHydrate(ch)
-							out.approximate = true
-							if (ch.voltsUnknown) out.voltsUnknown = true
-							const cnt = localHi - localLo
-							const ratio = ch.n > 0 ? cnt / ch.n : 0
-							out.n += cnt
-							out.sumI += ch.sumI * ratio
-							out.sumP += ch.sumP * ratio
-							if (ch.minI < out.minI) out.minI = ch.minI
-							if (ch.maxI > out.maxI) out.maxI = ch.maxI
-							if (!ch.voltsUnknown) { voltNum += ch.sumP * ratio; voltDen += ch.sumI * ratio }
-							const cntE = Math.max(0, eHi - localLo)
-							out.intervals += cntE
-							out.chargeUC += ch.sumI * ratio * per
-							if (!ch.voltsUnknown) out.energyUW_s += ch.sumP * ratio * per
 						}
 					}
 					if (base >= b) break
 				}
 			}
-			out.durSec = out.intervals * per
-			out.volts = voltDen > 0 ? voltNum / voltDen : 0
-			if (!isFinite(out.minI)) out.minI = 0
-			if (!isFinite(out.maxI)) out.maxI = 0
-			return out
+			return Object.assign(finalizeAcc(acc), { segments: segs.length, gaps: gapsIn(start, end), dropped: droppedIn(start, end) })
 		}
 
 		/**
@@ -1239,6 +1300,13 @@
 			stats: calcStats,
 			calcStats: calcStats,
 			integrateRange: integrateRange,
+			integrateExactAsync: integrateExactAsync,
+			walkExactWithAcc: function (a, b, visit, per) {
+				const acc = createIntegralAcc(per)
+				return walkExact(a, b, visit, acc).then(function (summary) {
+					return { summary: summary, integral: finalizeAcc(acc), acc: acc }
+				})
+			},
 			hydrateRange: hydrateRange,
 			minPositiveIn: minPositiveIn,
 			bucketEntry: getBucketEntry,
