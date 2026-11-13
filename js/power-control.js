@@ -590,7 +590,7 @@
 				acq.storeEnabled = acq.start === 'off'
 				acq.preMin = Infinity
 				acq.preMax = -Infinity
-				if (acq.start !== 'off') log(msg('ctl.acq_armed', { edge: tr('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : tr('ctl.level_auto') }))
+				if (acq.start !== 'off') log(msg('ctl.acq_armed', { edge: msg('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : msg('ctl.level_auto') }))
 			}
 			stopScheduled = false
 			sampling = true
@@ -611,8 +611,9 @@
 			link.setDrop(false)
 			const warmMs = targetRateHz > 0 ? Math.round(warmupLeft / targetRateHz * 1000) : 0
 			log(msg('ctl.started', {
-				hz: targetRateHz, mode: tr(recordMode === 'long' ? 'ctl.mode_long' : 'ctl.mode_wave'),
-				ms: warmMs, n: warmupLeft, mods: modifiersOk ? '' : tr('ctl.default_mods'),
+				// 参数也存惰性消息：状态条切语言时整句一起换，不留半句旧语言
+				hz: targetRateHz, mode: msg(recordMode === 'long' ? 'ctl.mode_long' : 'ctl.mode_wave'),
+				ms: warmMs, n: warmupLeft, mods: modifiersOk ? '' : msg('ctl.default_mods'),
 			}), 'success')
 			return { ok: true, changed: true, sampling: true }
 		}
@@ -966,10 +967,12 @@
 			}
 			log(msg('ctl.imported', {
 				n: stored,
-				rate: samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : tr('ctl.period_unknown'),
-				extra: (estimated ? tr('ctl.import_estimated') : '') +
-					(gapsApplied ? tr('ctl.import_gaps', { n: gapsApplied }) : '') +
-					(parsed.hasVoltage ? '' : tr('ctl.import_no_voltage')),
+				rate: samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : msg('ctl.period_unknown'),
+				extra: I18N.join([
+					estimated ? msg('ctl.import_estimated') : '',
+					gapsApplied ? msg('ctl.import_gaps', { n: gapsApplied }) : '',
+					parsed.hasVoltage ? '' : msg('ctl.import_no_voltage'),
+				]),
 			}), 'success')
 			return {
 				ok: true, samples: stored, requested: requested, gaps: gapsApplied,

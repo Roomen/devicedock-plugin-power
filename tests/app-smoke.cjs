@@ -749,6 +749,18 @@ const fireKey = (win, key, props) => {
 		const ops = state.writes.map((w) => w[0]).filter((b) => b === 0x06 || b === 0x07)
 		assert.deepEqual(ops, [0x06, 0x07, 0x07, 0x06], '探测 START/STOP → 采集 STOP/START，START 之后不能再有 STOP：' + ops.join(','))
 		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		// 状态条「采样已开始」里的模式词也随语言切换（参数存惰性消息，不是预先翻译好的串）
+		{
+			const sl0 = document.getElementById('status-line')
+			assert.match(sl0.textContent, /^Capture started .*waveform/, '状态条：' + sl0.textContent)
+			state.emit('app.locale', { locale: 'zh-CN' })
+			await tick(20)
+			assert.match(sl0.textContent, /^采样已开始 .*波形/, '状态条切到中文：' + sl0.textContent)
+			assert.ok(!/waveform|Capture/.test(sl0.textContent), '不残留英文：' + sl0.textContent)
+			state.emit('app.locale', { locale: 'en' })
+			await tick(20)
+			assert.match(sl0.textContent, /^Capture started .*waveform/)
+		}
 		const before = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
 		state.pushRxSamples(3000, 1000)
 		await tick(450)
@@ -927,6 +939,19 @@ const fireKey = (win, key, props) => {
 		assert.ok(Number(text(document, 'ro-samples').replace(/[^0-9]/g, '')) >= 3, '导入的样点进了会话')
 		assert.notEqual(text(document, 'chip-gaps'), 'gaps: 0', '导入文件里的缺口标记要生效：' + text(document, 'chip-gaps'))
 		assert.ok(state.hostLogs.some((l) => /imported 3 samples/.test(l)), '导入写宿主日志：' + JSON.stringify(state.hostLogs.slice(-3)))
+		// 无效 CSV：状态条上的失败原因也随语言切换
+		document.getElementById('import-file').files = [{ name: 'bad.csv', text: async () => 'foo,bar\n1,2\n' }]
+		click(document, 'btn-import')
+		await tick(100)
+		const isl = document.getElementById('status-line')
+		assert.equal(isl.dataset.level, 'error')
+		assert.match(isl.textContent, /^CSV import failed: no current column/, '状态条：' + isl.textContent)
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(isl.textContent, 'CSV 导入失败：找不到电流列', '原因随语言切换：' + isl.textContent)
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.match(isl.textContent, /^CSV import failed: no current column/)
 		// 没有选文件时给出提示，不抛错
 		document.getElementById('import-file').files = []
 		click(document, 'btn-import')

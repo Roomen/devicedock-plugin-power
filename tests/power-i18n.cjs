@@ -138,4 +138,19 @@ const en = I18N.DICTS.en
 	I18N.setLocale('zh-CN')
 }
 
+// ---- 惰性消息：参数里嵌套的消息 / 惰性拼接也按切换后的语言重新翻译（不留半句旧语言） ----
+{
+	I18N.setLocale('en')
+	const m = I18N.msg('ctl.started', { hz: 1000, mode: I18N.msg('ctl.mode_wave'), ms: 10, n: 5, mods: I18N.msg('ctl.default_mods') })
+	const j = I18N.msg('ctl.imported', { n: 3, rate: I18N.msg('ctl.period_unknown'), extra: I18N.join([I18N.msg('ctl.import_estimated'), '', I18N.msg('ctl.import_no_voltage')]) })
+	assert.match(String(m), /waveform.*default correction tables/)
+	assert.match(String(j), /period estimated/)
+	I18N.setLocale('zh-CN')
+	assert.match(String(m), /波形.*默认修正参数/)
+	assert.ok(!/[A-Za-z]{4,}/.test(String(m).replace(/Hz/g, '')), '切中文后不残留英文：' + String(m))
+	assert.equal(String(j), I18N.t('ctl.imported', { n: 3, rate: I18N.t('ctl.period_unknown'), extra: I18N.t('ctl.import_estimated') + I18N.t('ctl.import_no_voltage') }))
+	assert.ok(I18N.isMsg(I18N.join(['a'])))
+	assert.equal(String(I18N.join([])), '')
+}
+
 console.log('power-i18n: ok')

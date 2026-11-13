@@ -210,7 +210,7 @@
 			} catch (err) {
 				return { ok: false, code: (err && err.code) || 'save_failed', message: tr('exp.save_failed', { err: err && err.message ? err.message : err }), ref: msg('exp.save_failed', { err: err && err.message ? err.message : err }) }
 			}
-			log(msg('exp.exported', { name: name, size: formatBytes(csv.bytes), gaps: csv.gaps ? tr('exp.exported_gaps', { n: csv.gaps }) : '' }), 'success')
+			log(msg('exp.exported', { name: name, size: formatBytes(csv.bytes), gaps: csv.gaps ? msg('exp.exported_gaps', { n: csv.gaps }) : '' }), 'success')
 			return { ok: true, name: name, bytes: csv.bytes, samples: e - s, gaps: csv.gaps, missing: csv.missing, dropped: csv.dropped }
 		}
 

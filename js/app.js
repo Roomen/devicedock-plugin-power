@@ -148,6 +148,12 @@
 		return (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason')
 	}
 
+	/** 同 reasonText，但返回惰性消息：用作日志 / 状态条参数，切语言时跟着换 */
+	function reasonMsg(code) {
+		const key = 'ui.reason_' + code
+		return I18N.has(key) ? M(key) : String(code)
+	}
+
 	function reasonText(code) {
 		const key = 'ui.reason_' + code
 		return I18N.has(key) ? tr(key) : String(code)
@@ -1541,7 +1547,7 @@
 			if (!parsed.ok) {
 				setHintFn('import-hint', function () { return ImportMod.summarize(parsed).text })
 				hint.dataset.warn = '1'
-				log(M('app.import_failed', { why: reasonText(parsed.reason) }), 'error')
+				log(M('app.import_failed', { why: reasonMsg(parsed.reason) }), 'error')
 				return
 			}
 			if (control.isSampling()) {

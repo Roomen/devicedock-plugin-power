@@ -919,12 +919,22 @@
 		this.key = key
 		this.vars = vars || null
 	}
-	Msg.prototype.toString = function () { return t(this.key, this.vars) }
+	Msg.prototype.toString = function () {
+		if (this.parts) return this.parts.map(String).join('')
+		return t(this.key, this.vars)
+	}
 	Msg.prototype.valueOf = Msg.prototype.toString
 	Msg.prototype.toJSON = Msg.prototype.toString
 
 	function msg(key, vars) {
 		return new Msg(key, vars)
+	}
+
+	/** 惰性拼接：几段文案（惰性消息或普通串）按当前语言拼成一段，用作消息参数 */
+	function join(parts) {
+		const m = new Msg(null, null)
+		m.parts = (parts || []).filter(function (p) { return p != null && p !== '' })
+		return m
 	}
 
 	function isMsg(v) {
@@ -990,6 +1000,7 @@
 		DICTS: DICTS,
 		t: t,
 		msg: msg,
+		join: join,
 		isMsg: isMsg,
 		has: has,
 		normalize: normalize,
