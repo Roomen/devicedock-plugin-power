@@ -9,9 +9,11 @@
 //   claim.gap { claimId, gen, offset, bytes, reason: 'overflow' | 'closing' }
 //     宿主丢弃了字节（直发、保证送达），插件必须标缺口。
 //
-// 回调纪律（宿主的实际行为）：
+// 回调纪律（宿主 SDK 定稿后的实际行为）：
 //  - SDK 对同一 claim 串行调用 claim.onRx：上一批回调（及其返回的 Promise）结束后才给下一批，
-//    回调结束后自动 claim.ack；回调抛错视为「已消费」（这批数据就没救了）。
+//    每批结束后按序 claim.ack（即发即忘的 post，没有回包、没有超时）。
+//  - 回调抛错仍会 ack（视为已消费，避免把宿主卡在背压里），并交给 setClaimErrorHandler；
+//    所以本文件的回调自己接住一切异常并标缺口，别指望宿主替我们兜住。
 //  - 所以回调里只做「校验 offset/gen + 解码字节流 + 入队」这类线性廉价工作，样点入库（含画布/统计刷新）
 //    排到回调外的异步批次里，且绝不在回调里 await 长任务。
 //  - 队列有硬上限：真跟不上（例如冷存储归档卡住）时按「丢最老 + 标记缺口」处理，宁可报缺口也不撑爆内存，
@@ -306,7 +308,9 @@
 			stats.hostGaps++
 			stats.gapBytes += bytes
 			const at = now()
-			noteGap({ reason: e.reason === 'closing' ? 'closing' : 'overflow', at: at, gen: evGen || streamGen, offset: Number(e.offset) || 0, bytes: bytes })
+			// reason 原样透出（宿主目前是 'overflow' / 'closing'），未知值不要谎报成 overflow
+			const reason = typeof e.reason === 'string' && e.reason ? e.reason : 'overflow'
+			noteGap({ reason: reason, at: at, gen: evGen || streamGen, offset: Number(e.offset) || 0, bytes: bytes })
 			return { gap: true, bytes: bytes }
 		}
 

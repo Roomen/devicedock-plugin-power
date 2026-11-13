@@ -167,6 +167,8 @@ function makeFakeSdk(state) {
 			notify: async () => ({ ok: true }),
 		},
 		log: { write: async (text) => { state.hostLogs.push(text); return { ok: true } } },
+		// 宿主 SDK 的 claim 回调错误处理器（插件把它接到日志上）
+		setClaimErrorHandler(fn) { state.claimErrorHandler = typeof fn === 'function' ? fn : null },
 		device: { listPorts: async () => state.ports.slice() },
 		claim: {
 			acquire: async (portKey, mode) => {
@@ -282,6 +284,7 @@ const fireKey = (win, key, props) => {
 		],
 		rxHandler: null,
 		gapHandler: null,
+		claimErrorHandler: null,
 	}
 	state.pushRxBytes = function (bytes) {
 		state.rxSeq++
@@ -557,6 +560,16 @@ const fireKey = (win, key, props) => {
 	await tick(80)
 	assert.equal(state.files.length, 2)
 	assert.match(state.files[1].name, /\.json$/)
+
+	// ---- SDK 的 claim 回调错误处理器：插件必须接上，并写两份日志 ----
+	assert.equal(typeof state.claimErrorHandler, 'function', '插件要注册 setClaimErrorHandler')
+	const logsBefore = document.getElementById('log').children.length
+	const hostBefore = state.hostLogs.length
+	state.claimErrorHandler(new Error('synthetic claim failure'), { claimId: 'claim1', gen: 1, seq: 9 })
+	await tick(20)
+	assert.ok(state.hostLogs.length > hostBefore, '回调异常写进宿主日志')
+	assert.match(state.hostLogs[state.hostLogs.length - 1], /claim\.rx handler threw/, '宿主日志内容：' + state.hostLogs[state.hostLogs.length - 1])
+	assert.ok(document.getElementById('log').children.length > logsBefore, '回调异常也写进插件日志')
 
 	// ---- 宿主日志 ----
 	assert.ok(state.hostLogs.some((l) => /claimed .* exclusively/.test(l)), '连接时写宿主日志：' + JSON.stringify(state.hostLogs))

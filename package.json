@@ -7,7 +7,7 @@
 	"type": "commonjs",
 	"scripts": {
 		"build": "node tools/build.mjs --out-dir dist",
-		"test": "node tests/power-protocol.cjs && node tests/power-view.cjs && node tests/power-lane.cjs && node tests/power-wave-store.cjs && node tests/power-store.cjs && node tests/power-panels.cjs && node tests/power-claim.cjs && node tests/power-control.cjs && node tests/power-export.cjs && node tests/app-smoke.cjs"
+		"test": "node tests/power-protocol.cjs && node tests/power-view.cjs && node tests/power-lane.cjs && node tests/power-wave-store.cjs && node tests/power-store.cjs && node tests/power-panels.cjs && node tests/power-claim.cjs && node tests/sdk-claim.cjs && node tests/power-control.cjs && node tests/power-export.cjs && node tests/app-smoke.cjs"
 	},
 	"engines": {
 		"node": ">=22"

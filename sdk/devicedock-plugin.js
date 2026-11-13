@@ -91,6 +91,14 @@
 			target.postMessage(envelope, '*')
 		}
 
+		// 即发即忘：不登记 pending Promise、不起超时定时器。宿主快速路径不回包，
+		// 用 call 会留下一个永远等不到响应的 Promise 与定时器。
+		function post(method, params) {
+			try {
+				postToHost({ __devicedock: PROTOCOL, id: 'post-' + (++seq), method: String(method), params: params || {} })
+			} catch (e) {}
+		}
+
 		function call(method, params, opts) {
 			const timeoutMs = (opts && Number(opts.timeoutMs)) > 0 ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT_MS
 			return new Promise(function (resolve, reject) {
@@ -135,60 +143,68 @@
 			if (Array.isArray(v)) return Uint8Array.from(v)
 			return new Uint8Array(0)
 		}
-		// claim.rx 合批事件（定稿形状）：{ claimId, gen, seq, offset, at, bytes: Uint8Array }
-		//  - gen    该 claim 第几次 claim.open；换 gen 视为新字节流（不是缺口）
-		//  - seq    同一 gen 内从 1 单调递增
-		//  - offset 本批首字节在该 gen 字节流中的绝对偏移（含已丢弃的字节）
-		// 缺口判据：offset ≠ 上批 offset + 上批 bytes.length，或收到 claim.gap。
-		// 背压：宿主每个 claim 只允许 4 批「已发未确认」在途，所以插件必须在回调里快速返回；
-		// 回调返回（或它的 Promise 结束）后自动 claim.ack，重活放到回调之后异步做。
+		// 合批事件：bytes 为 Uint8Array，gen / seq / offset 用于判断缺口
+		// （offset !== 上一批 offset + 上一批长度 即有缺口，缺口通知见 claim.gap）。
+		//
+		// 同一 claim 的批次**串行**交给回调：上一批回调（含它返回的 Promise）结束后才调用下一批，
+		// 每批结束后按序 ack 该批 seq——保证累积确认只覆盖已完成的连续批次，宿主不会提前放行。
+		// 回调抛错（或 Promise 拒绝）：仍 ack 该批（视为已消费，避免把宿主卡死在背压里），
+		// 同时调用可选的 onError 处理器；没有就 console.error。
+		const claimQueues = new Map()
+		let claimErrorHandler = null
+		function reportClaimError(err, info) {
+			if (typeof claimErrorHandler === 'function') {
+				try { claimErrorHandler(err, info); return } catch (e) {}
+			}
+			if (typeof console !== 'undefined' && console.error) console.error('claim.rx handler failed', err)
+		}
+		function enqueueClaim(claimId, job) {
+			const prev = claimQueues.get(claimId) || Promise.resolve()
+			const next = prev.then(job).catch(function () {})
+			claimQueues.set(claimId, next)
+			next.then(function () { if (claimQueues.get(claimId) === next) claimQueues.delete(claimId) })
+			return next
+		}
 		function onClaimRx(fn) {
 			if (typeof fn !== 'function') return function () {}
 			return on('claim.rx', function (pkt) {
 				const p = pkt && typeof pkt === 'object' ? pkt : {}
-				const ev = {
-					claimId: p.claimId,
-					gen: p.gen || 0,
-					seq: p.seq || 0,
-					offset: p.offset || 0,
-					at: p.at || 0,
-					bytes: bytesView(p.bytes),
-				}
-				const ack = function () {
-					if (!ev.claimId || !ev.gen || !ev.seq) return
-					// 累计确认：ack(seq) 表示已处理到 seq。失败不重试，宿主会按在途上限自己停发。
-					call('claim.ack', { claimId: ev.claimId, gen: ev.gen, seq: ev.seq }).catch(function () {})
-				}
-				let ret
-				try {
-					ret = fn(ev)
-				} catch (e) {
+				const item = { claimId: p.claimId, gen: p.gen || 0, at: p.at || 0, seq: p.seq || 0, offset: p.offset || 0, bytes: bytesView(p.bytes) }
+				if (!item.claimId) return
+				enqueueClaim(String(item.claimId), function () {
+					const ack = function () {
+						if (!item.seq) return
+						post('claim.ack', { claimId: item.claimId, gen: item.gen, seq: item.seq })
+					}
+					let out
+					try {
+						out = fn(item)
+					} catch (e) {
+						reportClaimError(e, { claimId: item.claimId, gen: item.gen, seq: item.seq })
+						ack()
+						return
+					}
+					if (out && typeof out.then === 'function') {
+						return out.then(ack, function (e) {
+							reportClaimError(e, { claimId: item.claimId, gen: item.gen, seq: item.seq })
+							ack()
+						})
+					}
 					ack()
-					throw e
-				}
-				if (ret && typeof ret.then === 'function') {
-					ret.then(ack, ack)
-					// 让宿主等这个 Promise：返回值原样透出，SDK 内部不 await
-					return ret
-				}
-				ack()
-				return undefined
+				})
 			})
 		}
+		// 回调失败时的处理器（可选）；不设就 console.error
+		function setClaimErrorHandler(fn) { claimErrorHandler = typeof fn === 'function' ? fn : null }
+		// 测试用：等某个 claim 的队列排空
+		function claimQueueDone(claimId) { return claimQueues.get(String(claimId)) || Promise.resolve() }
 
-		// claim.gap { claimId, gen, offset, bytes, reason: 'overflow' | 'closing' }：宿主丢弃了字节，
-		// 走直发路径、保证送达。插件必须在这里标记缺口（波形与统计都不许把它当成连续数据）。
+		// 缺口通知（overflow / closing）：offset 是被丢字节的起点，插件据此知道样本缺了哪些
 		function onClaimGap(fn) {
 			if (typeof fn !== 'function') return function () {}
-			return on('claim.gap', function (pkt) {
-				const p = pkt && typeof pkt === 'object' ? pkt : {}
-				fn({
-					claimId: p.claimId,
-					gen: p.gen || 0,
-					offset: p.offset || 0,
-					bytes: Number(p.bytes) || 0,
-					reason: p.reason === 'closing' ? 'closing' : 'overflow',
-				})
+			return on('claim.gap', function (p) {
+				const g = p && typeof p === 'object' ? p : {}
+				fn({ claimId: g.claimId, gen: g.gen || 0, offset: g.offset || 0, bytes: g.bytes || 0, reason: g.reason || '' })
 			})
 		}
 
@@ -206,8 +222,12 @@
 			getTheme: function () { return Object.assign({}, currentTheme, { tokens: Object.assign({}, currentTheme.tokens) }) },
 			// 测试注入入口
 			_handleMessage: onMessage,
+			post: post,
+			_pendingCount: function () { return pending.size },
+			setClaimErrorHandler: setClaimErrorHandler,
+			_claimQueueDone: claimQueueDone,
 			bytesView: bytesView,
-			claimGap: onClaimGap,
+			bytesView: bytesView,
 			device: {
 				listPorts: function () { return call('device.listPorts', {}) },
 				listBle: function () { return call('device.listBle', {}) },
@@ -227,10 +247,10 @@
 				open: function (claimId, opts) { return call('claim.open', Object.assign({ claimId: claimId }, opts || {})) },
 				close: function (claimId) { return call('claim.close', { claimId: claimId }) },
 				write: function (claimId, bytes) { return call('claim.write', { claimId: claimId, bytes: bytes }) },
-				ack: function (claimId, gen, seq) { return call('claim.ack', { claimId: claimId, gen: gen, seq: seq }) },
-				// 合批事件：bytes 为 Uint8Array，seq 每个 claim 单调递增，at 是本批第一块时间
 				onRx: onClaimRx,
 				onGap: onClaimGap,
+				// 即发即忘（宿主不回包）：返回 undefined
+				ack: function (claimId, gen, seq) { post('claim.ack', { claimId: claimId, gen: gen, seq: seq }) },
 			},
 			protocol: {
 				info: function (lane) { return call('protocol.info', { lane: lane }) },

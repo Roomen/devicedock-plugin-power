@@ -208,6 +208,16 @@
 		})
 		link.attach()
 
+		// 宿主 SDK 在 claim.rx 回调抛错时仍会 ack（视为已消费），并把错误交给这个处理器。
+		// 我们的回调自己接住一切异常，所以走到这里说明是插件自身的 bug：两个日志都写一遍。
+		if (typeof sdk.setClaimErrorHandler === 'function') {
+			sdk.setClaimErrorHandler(function (err, info) {
+				const where = info && info.claimId ? ' (claim ' + info.claimId + ' gen ' + info.gen + ' seq ' + info.seq + ')' : ''
+				log('样点回调异常' + where + '：' + (err && err.message ? err.message : err) + '，该批已按已消费处理', 'error')
+				hostLog('claim.rx handler threw' + where + ': ' + (err && err.message ? err.message : err))
+			})
+		}
+
 		control = ControlMod.createControl({
 			link: link,
 			wave: wave,
