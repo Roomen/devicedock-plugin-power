@@ -351,11 +351,246 @@
 	}
 
 	/**
-	 * 组装一次分析。全部分析都基于**真实样点**并且**按连续段**进行：
-	 *  - 冷块先等回读；回读失败 / 已淘汰的区间记为 unusable，不参与任何计算；
+	 * 精确分析：只走真实样点（\`wave.walkExact\`），流式处理，**不截断**。
+	 *
+	 * 两遍扫描：第一遍算统计 / 电量 / 能量 / 每个电压子区间；第二遍（需要时）算边沿。
+	 * 每遍都是「取一块、算完、丢引用」，所以超过回读缓存容量也不会被截断或被挤掉。
+	 *
+	 * 不完整时（有 missing / dropped）整份结果标记 \`complete=false\`，调用方必须显示
+	 * 「不完整/不可用」，不能拿部分样点的读数冒充整个区间。
+	 *
+	 * @param {object} wave
+	 * @param {number} a 含
+	 * @param {number} b 含
+	 * @param {object} opts { samplePeriodSec, edges, maxSamples }
+	 */
+	async function analyseExact(wave, a, b, opts) {
+		opts = opts || {}
+		const per = opts.samplePeriodSec > 0 ? opts.samplePeriodSec : 0
+		const total = wave.total()
+		const a0 = clampIndex(a, total)
+		const b0 = clampIndex(b, total)
+		const out = {
+			ok: false, aborted: false, complete: false,
+			a: a0, b: b0, nRaw: a0 == null || b0 == null ? 0 : Math.abs(b0 - a0) + 1,
+			samples: 0, missing: 0, dropped: 0, gaps: 0,
+			basic: null, durSec: 0, chargeUC: 0, energyUWh: null,
+			volts: 0, voltsUnknown: false, voltRuns: 0,
+			segments: [], longest: null,
+			edges: null,
+		}
+		if (a0 == null || b0 == null) return out
+		const lo0 = Math.min(a0, b0)
+		const hi0 = Math.max(a0, b0)
+		if (hi0 - lo0 < 1) return out
+		let n = 0
+		let sumI = 0
+		let sumSq = 0
+		let minI = Infinity
+		let maxI = -Infinity
+		let intervals = 0
+		let charge = 0
+		let energy = 0
+		let voltNum = 0
+		let voltDen = 0
+		let voltsUnknown = false
+		let curSeg = null
+		const maxKeep = opts.maxSamples > 0 ? opts.maxSamples : MAX_SAMPLES_DEFAULT
+		let longest = null
+		let longestN = 0
+		// 「上一个样点」：只有与当前点**紧邻**时才构成一个时间间隔（左端点约定）
+		let prevLi = -2
+		let prevV = 0
+		let prevMv = null
+		const flushSeg = function () {
+			if (curSeg && curSeg.hi > curSeg.lo) out.segments.push(curSeg)
+			curSeg = null
+			prevLi = -2
+			prevV = 0
+			prevMv = null
+		}
+		const walk1 = await wave.walkExact(lo0, hi0 + 1, function (ev) {
+			if (ev.kind !== 'samples') {
+				if (ev.kind === 'gap') out.gaps++
+				else if (ev.kind === 'dropped') out.dropped += ev.hi - ev.lo
+				else if (ev.kind === 'missing') out.missing += ev.hi - ev.lo
+				flushSeg()
+				return
+			}
+			const cnt = ev.hi - ev.lo
+			const mv = ev.volts == null ? null : Math.round(ev.volts * 1000)
+			if (mv == null) voltsUnknown = true
+			out.voltRuns++
+			const vals = ev.values
+			let runSum = 0
+			for (let k = 0; k < vals.length; k++) {
+				const v = vals[k]
+				if (!isFinite(v)) continue
+				const li = ev.lo + k
+				runSum += v
+				sumSq += v * v
+				if (v < minI) minI = v
+				if (v > maxI) maxI = v
+				// 时间间隔归属**前一个**样点：只有相邻才计
+				if (prevLi === li - 1) {
+					intervals++
+					charge += prevV * per
+					if (prevMv != null) energy += prevV * (prevMv / 1000) * per
+				}
+				prevLi = li
+				prevV = v
+				prevMv = mv
+			}
+			n += cnt
+			sumI += runSum
+			if (mv != null) { voltNum += runSum * (mv / 1000); voltDen += runSum }
+			if (!curSeg) curSeg = { lo: ev.lo, hi: ev.hi, samples: 0 }
+			else curSeg.hi = ev.hi
+			curSeg.samples += cnt
+			// 保留最长的一段样点（只给 FFT / 叠画用，按 maxKeep 抽稀）
+			if (cnt > longestN) {
+				const step = cnt > maxKeep ? Math.ceil(cnt / maxKeep) : 1
+				const nOut = Math.max(1, Math.floor((cnt - 1) / step) + 1)
+				const arr = new Float32Array(nOut)
+				let j = 0
+				for (let k = 0; k < cnt; k += step) arr[j++] = vals[k]
+				longest = { lo: ev.lo, hi: ev.hi, values: arr.subarray(0, j), step: step, volts: ev.volts }
+				longestN = cnt
+			}
+		})
+		if (walk1 && walk1.aborted) { out.aborted = true; return out }
+		flushSeg()
+		out.samples = n
+		out.voltsUnknown = voltsUnknown
+		out.volts = voltDen > 0 ? voltNum / voltDen : 0
+		out.basic = n ? {
+			n: n, avg: sumI / n, min: isFinite(minI) ? minI : 0, max: isFinite(maxI) ? maxI : 0,
+			sum: sumI, sumSq: sumSq, pp: (isFinite(maxI) ? maxI : 0) - (isFinite(minI) ? minI : 0),
+			rms: Math.sqrt(sumSq / n),
+		} : null
+		out.longest = longest
+		out.durSec = intervals * per
+		out.chargeUC = charge
+		out.energyUWh = voltsUnknown ? null : energy
+		out.ok = n > 0
+		out.complete = out.missing === 0 && out.dropped === 0 && !out.aborted
+		// 第二遍：边沿 / 周期 / 占空比（段内配对，绝不跨段）
+		if (opts.edges && out.ok && out.complete) {
+			if (!isFinite(opts.thr) && out.basic) opts = Object.assign({}, opts, { thr: (out.basic.min + out.basic.max) * 0.5 })
+			if (!(opts.hyst > 0) && out.basic) opts = Object.assign({}, opts, { hyst: Math.max(out.basic.pp * 0.02, Math.abs(opts.thr) * 0.005, 1e-9) })
+			out.edges = await scanEdgesExact(wave, lo0, hi0 + 1, per, opts)
+			if (out.edges && out.edges.aborted) { out.aborted = true; out.edges = null }
+		}
+		return out
+	}
+
+	/**
+	 * 第二遍：逐连续段扫描边沿（真实的样点，不是显示缓存）。
+	 * 位置是全局样点下标，周期 = dp × per（不再乘抽稀）；段与段之间绝不配对。
+	 */
+	async function scanEdgesExact(wave, a, b, per, opts) {
+		opts = opts || {}
+		const res = {
+			thr: opts.thr, hyst: opts.hyst > 0 ? opts.hyst : 0, nRise: 0, nFall: 0,
+			periodSec: null, freqHz: null, duty: null, nPeriod: 0, segments: 0, aborted: false,
+		}
+		const thr = isFinite(opts.thr) ? opts.thr : 0
+		const hyst = opts.hyst > 0 ? opts.hyst : Math.max(Math.abs(opts.pp || 0) * 0.02, Math.abs(thr) * 0.005, 1e-9)
+		res.thr = thr
+		res.hyst = hyst
+		const thrHi = thr + hyst
+		const thrLo = thr - hyst
+		let state = 0
+		let lastRise = null
+		let pendingFall = null
+		let inSegment = false
+		let sumP = 0
+		let nP = 0
+		let sumDuty = 0
+		let nD = 0
+		const startSegment = function () {
+			state = 0
+			lastRise = null
+			pendingFall = null
+			inSegment = false
+			res.segments++
+		}
+		const walk = await wave.walkExact(a, b, function (ev) {
+			if (ev.kind !== 'samples') {
+				// 缺口 / 淘汰 / 读不到：时间轴在这里断开，边沿状态清零
+				startSegment()
+				return
+			}
+			if (!inSegment) {
+				inSegment = true
+				// 段的第一个样点只用来 seed 滞回状态
+				const v0 = ev.values[0]
+				if (isFinite(v0)) state = v0 >= thrHi ? 1 : (v0 <= thrLo ? -1 : 0)
+				for (let k = 1; k < ev.values.length; k++) {
+					const v = ev.values[k]
+					if (!isFinite(v)) continue
+					const li = ev.lo + k
+					let edge = null
+					if (state <= 0 && v >= thrHi) { edge = 'rise'; state = 1 }
+					else if (state >= 0 && v <= thrLo) { edge = 'fall'; state = -1 }
+					else if (state === 0) state = v >= thrHi ? 1 : (v <= thrLo ? -1 : 0)
+					if (!edge) continue
+					if (edge === 'rise') {
+						res.nRise++
+						if (lastRise != null) {
+							const dp = li - lastRise
+							if (dp > 0) { sumP += dp; nP++ }
+							if (pendingFall != null && li > lastRise) { sumDuty += (pendingFall - lastRise) / (li - lastRise); nD++ }
+						}
+						pendingFall = null
+						lastRise = li
+					} else {
+						res.nFall++
+						if (lastRise != null) pendingFall = li
+					}
+				}
+				return
+			}
+			for (let k = 0; k < ev.values.length; k++) {
+				const v = ev.values[k]
+				if (!isFinite(v)) continue
+				const li = ev.lo + k
+				let edge = null
+				if (state <= 0 && v >= thrHi) { edge = 'rise'; state = 1 }
+				else if (state >= 0 && v <= thrLo) { edge = 'fall'; state = -1 }
+				else if (state === 0) state = v >= thrHi ? 1 : (v <= thrLo ? -1 : 0)
+				if (!edge) continue
+				if (edge === 'rise') {
+					res.nRise++
+					if (lastRise != null) {
+						const dp = li - lastRise
+						if (dp > 0) { sumP += dp; nP++ }
+						if (pendingFall != null && li > lastRise) { sumDuty += (pendingFall - lastRise) / (li - lastRise); nD++ }
+					}
+					pendingFall = null
+					lastRise = li
+				} else {
+					res.nFall++
+					if (lastRise != null) pendingFall = li
+				}
+			}
+		})
+		if (walk && walk.aborted) { res.aborted = true; return res }
+		if (nP > 0 && per > 0) {
+			res.periodSec = (sumP / nP) * per
+			res.freqHz = res.periodSec > 0 ? 1 / res.periodSec : null
+			res.nPeriod = nP
+		}
+		if (nD > 0) res.duty = sumDuty / nD
+		return res
+	}
+
+	/**
+	 * 组装一次分析。全部分析都基于**真实样点**（analyseExact）：
+	 *  - 冷块先等回读；回读失败 / 已淘汰 → 整份标记不完整，读数不冒充完整区间；
 	 *  - 周期与占空比只在段内配对；
-	 *  - FFT 遇到多个不连续段时拒绝计算（fft.reason = 'discontinuous'），除非调用方显式允许只取最长段；
-	 *  - 周期叠画只取最长的那一段。
+	 *  - FFT 遇到多个不连续段时拒绝计算（除非显式允许只取最长段）；
+	 *  - 周期叠画只取最长段。
 	 * @returns {Promise<object|null>}
 	 */
 	async function buildPack(o) {
@@ -364,94 +599,110 @@
 		const range = o.range
 		if (!wave || !range) return null
 		const per = o.samplePeriodSec > 0 ? o.samplePeriodSec : 0
-		const ext = await extractSegmentsExact(wave, range.a, range.b, { maxPts: o.maxSamples })
-		if (!ext || !ext.segments.length) return ext ? emptyPack(range, ext) : null
-		const all = []
-		for (let i = 0; i < ext.segments.length; i++) {
-			const s = ext.segments[i]
-			for (let k = 0; k < s.samples.length; k++) all.push(s.samples[k])
-		}
-		const basic = ANAL ? ANAL.basicStats(all) : null
-		const measure = measureCursors(wave, ext.a, ext.b, { samplePeriodSec: per })
-		const edges = measureEdges(wave, ext.a, ext.b, { samplePeriodSec: per })
-		const thr = isFinite(edges.thr) ? edges.thr : (basic ? (basic.min + basic.max) * 0.5 : 0)
-		const levels = ANAL ? ANAL.twoLevelStats(all, thr, Math.abs(basic ? basic.pp * 0.02 : 0)) : null
-		// 周期叠画只取最长的一段（跨段叠画会把不同状态拼在一起）
-		let longest = ext.segments[0]
-		for (let i = 1; i < ext.segments.length; i++) {
-			if (ext.segments[i].samples.length > longest.samples.length) longest = ext.segments[i]
-		}
-		const voltP = ext.volts
+		const core = await analyseExact(wave, range.a, range.b, {
+			samplePeriodSec: per,
+			edges: true,
+			thr: o.thr,
+			pp: o.pp,
+			maxSamples: o.maxSamples,
+		})
+		if (!core || core.aborted) return core && core.aborted ? { aborted: true, source: range.source } : null
+		if (!core.ok) return emptyPack(range, { a: core.a, b: core.b, nRaw: core.nRaw, gaps: core.gaps, dropped: core.dropped, missing: core.missing, unusable: [] })
+		const basic = core.basic
+		const thr = (core.edges && isFinite(core.edges.thr)) ? core.edges.thr : (basic ? (basic.min + basic.max) * 0.5 : 0)
 		const pack = {
 			source: range.source,
-			a: ext.a,
-			b: ext.b,
-			step: ext.segments[0].step,
-			nRaw: ext.nRaw,
-			rateHz: per > 0 ? 1 / (per * ext.segments[0].step) : 0,
+			a: core.a,
+			b: core.b,
+			step: core.longest ? core.longest.step : 1,
+			nRaw: core.nRaw,
+			rateHz: per > 0 ? 1 / per : 0,
 			periodSec: per,
 			basic: basic,
-			levels: levels,
-			edges: edges,
-			measure: measure,
-			voltageV: voltP,
-			voltsMixed: ext.voltsMixed,
-			gaps: ext.gaps,
-			dropped: ext.dropped,
-			missing: ext.missing,
-			unusable: ext.unusable,
-			segments: ext.segments.length,
-			qCycle: edges.periodSec != null && basic && basic.n ? basic.avg * edges.periodSec : null,
+			levels: null,
+			edges: core.edges || { thr: thr, hyst: 0, nRise: 0, nFall: 0, periodSec: null, freqHz: null, duty: null, nPeriod: 0, segments: 0 },
+			measure: null,
+			voltageV: core.volts,
+			voltsUnknown: core.voltsUnknown,
+			gaps: core.gaps,
+			dropped: core.dropped,
+			missing: core.missing,
+			unusable: [],
+			segments: core.segments.length,
+			complete: !!core.complete,
+			qCycle: null,
 			fft: null,
 			cycles: null,
 			battery: null,
 			spikes: null,
 			segmentList: null,
 		}
-		if (o.fft && ANAL) {
-			if (ext.segments.length > 1 && !o.fftLongestSegment) {
-				// 不连续区间拒绝算频谱：拼起来会产生虚假谱线
-				pack.fft = { ok: false, reason: 'discontinuous', n: 0, segments: ext.segments.length }
-			} else if (longest.samples.length >= 16) {
-				const fs = per > 0 ? 1 / (per * longest.step) : 0
+		// 游标读数与统计同口径：直接用精确扫描的结果
+		const exact = function () {
+			return {
+				ready: core.complete && basic != null, samples: core.samples,
+				gaps: core.gaps, segments: core.segments.length,
+				wallSec: per > 0 ? (core.b - core.a) * per : 0,
+				durSec: core.durSec,
+				gapRatio: 0,
+				avgI: basic ? basic.avg : 0, minI: basic ? basic.min : 0, maxI: basic ? basic.max : 0,
+				ppI: basic ? basic.pp : 0,
+				chargeUC: core.chargeUC, chargeUAh: core.chargeUC / 3600,
+				energyUWh: core.energyUWh, volts: core.volts,
+				iA: wave.iAtExact ? wave.iAtExact(core.a) : null,
+				iB: wave.iAtExact ? wave.iAtExact(core.b) : null,
+				dropped: core.dropped, missing: core.missing,
+				complete: core.complete,
+			}
+		}
+		pack.measure = exact()
+		if (pack.measure.wallSec > 0) pack.measure.gapRatio = Math.max(0, 1 - core.durSec / pack.measure.wallSec)
+		// 不完整：不拿部分样点算出「完整区间」的读数
+		if (!core.complete) {
+			pack.incomplete = true
+			pack.unavailableReason = core.missing > 0 ? 'samples_unavailable' : (core.dropped > 0 ? 'samples_evicted' : 'incomplete')
+			pack.measure.ready = false
+		}
+		const voltVal = core.volts > 0 ? core.volts : 0
+		if (basic) {
+			const all = core.longest && core.longest.values ? core.longest.values : new Float32Array(0)
+			pack.levels = ANAL ? ANAL.twoLevelStats(all, thr, Math.abs(basic.pp * 0.02)) : null
+		}
+		pack.qCycle = (core.edges && core.edges.periodSec != null && basic && basic.n) ? basic.avg * core.edges.periodSec : null
+		if (o.fft && ANAL && core.longest && core.longest.values && core.longest.values.length >= 16) {
+			const discont = core.segments.length > 1
+			if (discont && !o.fftLongestSegment) {
+				pack.fft = { ok: false, reason: 'discontinuous', n: 0, segments: core.segments.length }
+			} else {
+				const fs = per > 0 ? 1 / (per * core.longest.step) : 0
 				if (fs > 0) {
-					const f = ANAL.fftAnalysis(longest.samples, fs, { window: o.window || 'hann', topK: 8 })
+					const f = ANAL.fftAnalysis(core.longest.values, fs, { window: o.window || 'hann', topK: 8 })
 					pack.fft = f
-					pack.fft.segmentLo = longest.lo
-					pack.fft.segmentHi = longest.hi
-					pack.fft.partial = ext.segments.length > 1
+					pack.fft.segmentLo = core.longest.lo
+					pack.fft.segmentHi = core.longest.hi
+					pack.fft.partial = discont
 				}
 			}
 		}
-		if (o.cycles && ANAL && edges.periodSec != null && per > 0) {
-			const periodPts = Math.max(4, Math.round(edges.periodSec / (per * longest.step)))
-			if (periodPts * 2 <= longest.samples.length) {
-				pack.cycles = ANAL.extractCycles(longest.samples, periodPts, o.maxCycles)
-				pack.cycles.segmentLo = longest.lo
-				pack.cycles.segmentHi = longest.hi
+		if (o.cycles && ANAL && core.edges && core.edges.periodSec != null && per > 0 && core.longest) {
+			const periodPts = Math.max(4, Math.round(core.edges.periodSec / (per * core.longest.step)))
+			if (periodPts * 2 <= core.longest.values.length) {
+				pack.cycles = ANAL.extractCycles(core.longest.values, periodPts, o.maxCycles)
+				pack.cycles.segmentLo = core.longest.lo
+				pack.cycles.segmentHi = core.longest.hi
 			}
 		}
-		if (o.capacityMah > 0 && ANAL && basic && basic.n) {
+		if (o.capacityMah > 0 && ANAL && basic && basic.n && core.energyUWh != null) {
 			pack.battery = ANAL.estimateBatteryLife(basic.avg, o.capacityMah, { derate: 0.9 })
 		}
-		if (o.spikes && ANAL) {
-			const spikes = []
-			for (let i = 0; i < ext.segments.length; i++) {
-				const found = ANAL.findSpikes(ext.segments[i].samples, { thr: null, minWidthPts: Math.max(1, Math.round((o.spikeMinPts || 2) / ext.segments[i].step)), maxCount: 60 })
-				for (let k = 0; k < found.length; k++) spikes.push(found[k])
-			}
-			spikes.sort(function (x, y) { return Math.abs(y.peak) - Math.abs(x.peak) })
-			pack.spikes = spikes.slice(0, 60)
+		if (o.spikes && ANAL && core.longest && core.longest.values) {
+			pack.spikes = ANAL.findSpikes(core.longest.values, { thr: null, minWidthPts: Math.max(1, Math.round((o.spikeMinPts || 2) / core.longest.step)), maxCount: 60 })
 		}
-		if (o.segments && ANAL) {
-			// 分段统计也逐段做：跨段的「低/高电平」没有意义
-			const segsOut = []
-			for (let i = 0; i < ext.segments.length; i++) {
-				const one = ANAL.segmentByThreshold(ext.segments[i].samples, thr, { minSegPts: Math.max(2, Math.round(2 / ext.segments[i].step)), maxCount: 60 })
-				if (one && one.segments) for (let k = 0; k < one.segments.length; k++) segsOut.push(one.segments[k])
-			}
-			pack.segmentList = segsOut
+		if (o.segments && ANAL && core.longest && core.longest.values) {
+			const one = ANAL.segmentByThreshold(core.longest.values, thr, { minSegPts: Math.max(2, Math.round(2 / core.longest.step)), maxCount: 60 })
+			pack.segmentList = one && one.segments ? one.segments : []
 		}
+		void voltVal
 		return pack
 	}
 
@@ -528,6 +779,8 @@
 		pickRange: pickRange,
 		rangeGaps: rangeGaps,
 		extractSegmentsExact: extractSegmentsExact,
+		analyseExact: analyseExact,
+		scanEdgesExact: scanEdgesExact,
 		measureCursors: measureCursors,
 		measureEdges: measureEdges,
 		findEdges: findEdges,

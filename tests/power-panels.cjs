@@ -310,5 +310,60 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 		assert.equal(hot.deltaI != null, true)
 	}
 
+	// ---- 第 6/7 项：超过回读缓存容量也不截断；边沿/电量都来自真实样点 ----
+	{
+		const disk = new Map()
+		const store = {
+			init: async () => {}, getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				await new Promise(function (r) { setTimeout(r, 1) })
+				const v = disk.get(id)
+				if (!v) throw new Error('gone')
+				return v
+			},
+			removeChunk: async (id) => { disk.delete(id) },
+			clearSession: async () => { disk.clear() },
+		}
+		// 40 块（16 点/块）远超默认回读缓存（24 块）；方波周期 20 点 → 期望 39 个上升沿
+		const w = W.createWave({ store: store, chunkSize: 64, ramCapSamples: 64, voltage: () => 3.3, samplePeriod: () => 0.001 })
+		// 40 块 × 64 点 = 2560 点，远超默认回读缓存（24 块）
+		const N = 2560
+		const vals = []
+		for (let i = 0; i < N; i++) vals.push((i % 20) < 10 ? 3000 : 100)
+		for (let i = 0; i < N; i++) {
+			w.push(vals[i])
+			// 逐块让出：归档队列有上限，同步灌满会触发「写盘跟不上」停采
+			if ((i + 1) % 64 === 0) await new Promise(function (r) { setTimeout(r, 0) })
+		}
+		await new Promise(function (r) { setTimeout(r, 200) })
+		w.clearHydrateCache()
+		assert.ok(w.chunks.filter((c) => c.state === 'cold').length >= 30, '应大部分是冷块：' + w.chunks.filter((c) => c.state === 'cold').length)
+		// 直接按数据算期望值，避免和实现用同一套逻辑
+		let expectRise = 0
+		for (let i = 1; i < N; i++) if (vals[i] >= 1550 && vals[i - 1] < 1550) expectRise++
+		const pack = await P.buildPack({ wave: w, range: { a: 0, b: N - 1, source: 'window' }, samplePeriodSec: 0.001, fft: true, cycles: true, segments: true })
+		assert.equal(pack.complete, true, '全部回读成功时分析必须完整')
+		assert.equal(pack.missing, 0)
+		assert.equal(pack.edges.nRise, expectRise, '上升沿数必须等于真实值（不能因缓存容量被截断）：' + pack.edges.nRise + ' vs ' + expectRise)
+		assert.ok(Math.abs(pack.edges.periodSec - 0.02) < 1e-9, '周期 20 点 × 1 ms：' + pack.edges.periodSec)
+		assert.ok(Math.abs(pack.measure.chargeUC - (function () {
+			let q = 0
+			for (let i = 0; i < N - 1; i++) q += vals[i] * 0.001
+			return q
+		})()) < 1e-9, '电量按真实样点积分：' + pack.measure.chargeUC)
+		assert.ok(Math.abs(pack.measure.durSec - (N - 1) * 0.001) < 1e-12, '时长按真实样点：' + pack.measure.durSec)
+
+		// 回读失败：整份分析必须报不完整，读数不能冒充完整区间
+		disk.clear()
+		w.clearHydrateCache()
+		const bad = await P.buildPack({ wave: w, range: { a: 0, b: N - 1, source: 'window' }, samplePeriodSec: 0.001, fft: true })
+		assert.equal(bad.complete, false, '回读失败 → 不完整')
+		assert.ok(bad.missing > 0, '要报出多少个样点读不到：' + bad.missing)
+		assert.equal(bad.incomplete, true)
+		assert.equal(bad.measure.ready, false, '不完整时读数不能标记为 ready')
+		assert.equal(bad.unavailableReason, 'samples_unavailable')
+	}
+
 	console.log('power-panels: ok')
 })().catch((e) => { console.error(e); process.exit(1) })

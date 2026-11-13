@@ -1196,7 +1196,26 @@
 			set('an-cycles-meta', '—')
 			return
 		}
+		const incomplete = !!pack.incomplete || pack.complete === false
 		set('an-meta', pack.source + ' · ' + fmtCount(pack.nRaw) + ' pts · ' + (pack.step > 1 ? '1/' + pack.step : 'full') + ' · ' + fmt.fmtDuration(pack.periodSec * (pack.nRaw - 1)))
+		$('an-meta').dataset.warn = incomplete ? '1' : '0'
+		if (incomplete) {
+			// 有样点读不到或被淘汰：不拿部分样点冒充整个区间的读数
+			const why = pack.unavailableReason === 'samples_unavailable'
+				? fmtCount(pack.missing || 0) + ' sample(s) could not be read'
+				: (pack.unavailableReason === 'samples_evicted'
+					? fmtCount(pack.dropped || 0) + ' sample(s) were evicted'
+					: 'the range is not continuous')
+			;['an-avg', 'an-range', 'an-rms', 'an-levels', 'an-period', 'an-freq', 'an-qcycle', 'an-events'].forEach(function (id) { set(id, '—') })
+			set('an-meta', pack.source + ' · incomplete — ' + why)
+			$('an-gaps').textContent = why
+			$('an-gaps').dataset.warn = '1'
+			set('an-fft-meta', 'unavailable (incomplete range)')
+			$('an-fft').textContent = ''
+			set('an-battery', '—')
+			set('an-cycles-meta', 'unavailable (incomplete range)')
+			return
+		}
 		const b = pack.basic || {}
 		set('an-avg', fmt.fmtCurrent(b.avg))
 		set('an-range', fmt.fmtCurrent(b.min) + ' / ' + fmt.fmtCurrent(b.max))
