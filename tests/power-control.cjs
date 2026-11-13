@@ -393,6 +393,21 @@ test('采样沿停止：命中停沿后自动停采（异步发 STOP，不在入
 	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), '发了 AVERAGE_STOP')
 })
 
+test('启动前 STOP 写失败：中止启动、不写 START，返回原因并记错误日志', async () => {
+	const h = await connected()
+	h.state.writeFailAt = 1
+	const r = await h.control.startCapture()
+	assert.equal(r.ok, false)
+	assert.equal(r.code, 'capture_prestop_failed')
+	assert.equal(r.executed, false)
+	assert.match(String(r.ref), /STOP/)
+	assert.equal(h.state.writes.length, 1, '只尝试了前置 STOP，没有继续 START')
+	assert.equal(h.state.writes[0].bytes[0], 0x07)
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && /STOP/.test(String(l.msg))), '错误日志说明了 STOP 写失败')
+	assert.ok(!h.state.logs.some((l) => l.level === 'success'), '没有后续「采样已开始」盖掉失败')
+})
+
 test('长期模式：仍然维护折叠总览（minimap），但不进波形环', async () => {
 	const h = await connected()
 	h.control.setRecordMode('long')

@@ -528,7 +528,16 @@
 			// 先 STOP → 排空残留 → 再 START
 			link.setDrop(true)
 			const gen0 = genOf()
-			await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+			const preStop = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
+			if (!preStop || !preStop.ok) {
+				// 写不进 STOP 就不能保证设备处于已停止态，也说明这条链路现在写不通：中止启动并说明原因，
+				// 不能继续 START 让后面的「采样已开始」把这条失败盖掉
+				if (preStop && preStop.stale) {
+					return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), ref: msg('ctl.start_device_changed'), executed: false }
+				}
+				log(msg('ctl.prestop_failed_log', { err: errText(preStop) }), 'error')
+				return { ok: false, code: 'capture_prestop_failed', message: tr('ctl.prestop_failed', { err: errText(preStop) }), ref: msg('ctl.prestop_failed', { err: errText(preStop) }), executed: false }
+			}
 			await drainSampleRx(opts.rxDrainMs)
 			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), ref: msg('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {

@@ -220,8 +220,9 @@ function makeFakeSdk(state) {
 					err.code = 'bad_request'
 					throw err
 				}
-				if (state.failWrites) {
-					const err = new Error(state.failWrites)
+				// failOnByte：只让某一条命令写失败（例如只有启动前的 STOP 失败、START 本身能写出去）
+				if (state.failWrites || (state.failOnByte != null && bytes[0] === state.failOnByte)) {
+					const err = new Error(state.failWrites || state.failOnByteError || 'synthetic write failure')
 					err.code = 'internal'
 					throw err
 				}
@@ -732,18 +733,31 @@ const fireKey = (win, key, props) => {
 		click(document, 'btn-connect')
 		await tick(500)
 		assert.equal(text(document, 'btn-connect'), 'Disconnect')
-		// 1) 写入失败
-		state.failWrites = 'USB 写超时'
+		// 1) 阻塞 3：只有启动前的 STOP 写失败（START 本身能写出去）→ 中止启动，原因留在状态条上
+		state.writes.length = 0
+		state.failOnByte = 0x07
+		state.failOnByteError = 'USB 写超时'
 		click(document, 'btn-sample')
 		await tick(200)
-		state.failWrites = null
+		assert.ok(!state.writes.some((w) => w[0] === 0x06), 'STOP 写失败后不能继续 START')
 		assert.equal(text(document, 'chip-sampling'), 'start failed', '开始失败不能显示成 idle：' + text(document, 'chip-sampling'))
 		assert.equal(document.getElementById('chip-sampling').dataset.state, 'error')
 		const sl = document.getElementById('status-line')
 		assert.equal(sl.hidden, false, '状态条要显示出来')
 		assert.equal(sl.dataset.level, 'error')
-		assert.match(sl.textContent, /START could not be written.*USB 写超时/, '状态条写明原因：' + sl.textContent)
+		assert.match(sl.textContent, /STOP before START could not be written.*USB 写超时/, '状态条写明原因：' + sl.textContent)
+		await tick(400)
+		assert.match(sl.textContent, /STOP before START could not be written/, '失败不会被后续成功日志覆盖：' + sl.textContent)
 		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		state.failOnByte = null
+		// 1b) START 本身写失败：同样可见
+		state.failOnByte = 0x06
+		click(document, 'btn-sample')
+		await tick(200)
+		state.failOnByte = null
+		state.failOnByteError = null
+		assert.equal(text(document, 'chip-sampling'), 'start failed')
+		assert.match(sl.textContent, /Starting the capture failed: START could not be written.*USB 写超时/, '状态条：' + sl.textContent)
 		// 阻塞 4：语言切换时状态条按保存的键与参数重绘（不是保留旧语言的文本）
 		state.emit('app.locale', { locale: 'zh-CN' })
 		await tick(20)
