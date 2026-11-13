@@ -295,7 +295,8 @@ const click = (doc, id) => doc.getElementById(id).click()
 	state.pushRxSamples(600, 1000)
 	await tick(30)
 	state.pushRxSamples(300, 1200)
-	await tick(300) // 等读数刷新（400 ms 定时器 / rAF 循环）
+	// 读数与统计走 400 ms 的定时器（画布每帧重画，但读数不每帧算），等两拍再断言
+	await tick(520)
 	const kept = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
 	assert.ok(kept > 0, '样点进波形：' + ['st-samples', 'ro-samples', 'scope-meta'].map((id) => id + '=' + text(document, id)).join(' '))
 
