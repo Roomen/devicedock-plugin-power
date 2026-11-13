@@ -38,34 +38,89 @@ const LIMIT = E.MAX_EXPORT_BYTES
 		assert.equal(p.kind, 'summary')
 	}
 
-	// ---- 真实生成：超限时拒绝而不是截断 ----
+	// ---- 真实生成：超限时拒绝而不是截断（按真实数据判断） ----
 	{
-		// 用一个只报总数的假波形：CSV 每行固定开销足够大，直接走到拒绝分支
-		const fakeWave = { total: () => 4e6, iAt: () => 100, gaps: () => [] }
-		const r = E.buildCsv(fakeWave, 0, 4e6, { voltageMv: 3300, samplePeriodSec: 1e-5 })
+		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+		const big = Wave.createWave({ store: store, chunkSize: 262144, ramCapSamples: 262144 * 2, voltage: () => 3.3, samplePeriod: () => 1e-5 })
+		const n = 400000
+		for (let i = 0; i < n; i++) big.push(1000)
+		const r = await E.buildCsv(big, 0, n, { samplePeriodSec: 1e-5 })
 		assert.equal(r.ok, false)
 		assert.equal(r.code, 'too_large')
 		assert.equal(r.text, undefined, '拒绝时必须没有半截内容')
 		assert.match(r.message, /不会自动截断/)
 	}
 
-	// ---- 真实生成：小范围正常出 CSV，含表头与缺口标记 ----
+	// ---- 真实生成：小范围正常出 CSV，含表头、电压列与缺口标记 ----
 	{
 		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
 		const w = Wave.createWave({ store: store, chunkSize: 64, ramCapSamples: 64, voltage: () => 3.3, samplePeriod: () => 0.001 })
 		for (let i = 0; i < 40; i++) w.push(1000 + i)
 		w.noteGap(20)
-		const r = E.buildCsv(w, 0, w.total(), { voltageMv: 3300, samplePeriodSec: 0.001 })
+		const r = await E.buildCsv(w, 0, w.total(), { samplePeriodSec: 0.001 })
 		assert.equal(r.ok, true)
 		const lines = r.text.split('\n').filter((l) => l.length)
-		assert.equal(lines[0], 'index,time_s,current_uA,power_uW')
-		assert.equal(lines.filter((l) => l === '# gap').length, 1, '缺口处要有标记行')
-		assert.ok(lines.length >= 40 - 1 + 2, '每个样点一行（含缺口标记）')
+		assert.equal(lines[0], 'index,time_s,current_uA,power_uW,voltage_mV')
+		const gapLines = lines.filter((l) => l.indexOf('# gap') === 0)
+		assert.equal(gapLines.length, 1, '缺口处要有标记行：' + JSON.stringify(gapLines))
+		assert.equal(r.gaps, 1, '缺口要计数')
+		assert.ok(lines.length >= 40 + 2, '每个样点一行（含缺口标记）')
 		assert.ok(r.bytes <= LIMIT)
-		assert.equal(lines[1], '0,0,1000,3300', '首行是第 0 个样点')
-		// 功率 = 电流 × 电压
+		assert.equal(lines[1], '0,0,1000,3300,3300', '首行是第 0 个样点，含采样时的电压')
+		// 功率 = 电流 × 当时的电压
 		const row = lines.find((l) => l.indexOf('1,0.001,') === 0)
 		assert.ok(row, '第二行存在：' + lines[1])
+		assert.equal(row, '1,0.001,1001,3303.3,3300')
+	}
+
+	// ---- 冷块先等回读；回读失败写 gap 行，不拿近似值 ----
+	{
+		const disk = new Map()
+		const store = {
+			init: async () => {}, getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				await new Promise(function (r) { setTimeout(r, 3) })
+				const v = disk.get(id)
+				if (!v) throw new Error('gone')
+				return v
+			},
+			removeChunk: async (id) => { disk.delete(id) },
+			clearSession: async () => { disk.clear() },
+		}
+		const w = Wave.createWave({ store: store, chunkSize: 64, ramCapSamples: 64, voltage: () => 3.3, samplePeriod: () => 0.001 })
+		for (let i = 0; i < 128; i++) w.push(100 + i)
+		await new Promise(function (r) { setTimeout(r, 40) })
+		w.clearHydrateCache()
+		const ok = await E.buildCsv(w, 0, w.total(), { samplePeriodSec: 0.001 })
+		assert.equal(ok.ok, true)
+		assert.equal(ok.missing, 0, '回读成功时没有 missing')
+		const rows = ok.text.split('\n').filter((l) => /^\d+,/.test(l))
+		assert.equal(rows.length, 128, '每个真实样点一行：' + rows.length)
+		assert.ok(rows.some((l) => l.indexOf('0,0,100,') === 0), '老块回读后的真实值也在：' + rows[0])
+		// 冷块消失：写 gap 行并计数
+		disk.clear()
+		w.clearHydrateCache()
+		const bad = await E.buildCsv(w, 0, w.total(), { samplePeriodSec: 0.001 })
+		assert.equal(bad.ok, true, '仍然是一份诚实的 CSV（标了 gap 行）')
+		assert.ok(bad.missing > 0, '回读失败要报 missing：' + bad.missing)
+		assert.ok(bad.text.indexOf('# gap missing') >= 0, 'CSV 里要有 missing 标记行')
+	}
+
+	// ---- 长度复核按最终文本（含 gap 行）：超限提前拒绝 ----
+	{
+		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+		const w = Wave.createWave({ store: store, chunkSize: 65536, ramCapSamples: 65536, voltage: () => 3.3, samplePeriod: () => 0.001 })
+		for (let i = 0; i < 300; i++) w.push(1000)
+		// 人为把每行撑长：用一个很小的 limit 触发「最终文本超限」
+		const limit = 2000
+		const r = await E.buildCsv(w, 0, 300, { samplePeriodSec: 0.001, limitBytes: limit })
+		assert.equal(r.ok, false, '最终文本超过 limit 必须拒绝')
+		assert.equal(r.code, 'too_large')
+		assert.equal(r.text, undefined)
+		// 计划阶段估算通过、真实文本超限时也要拒绝（缺口行也算长度）
+		const planOk = E.planExport({ kind: 'range', start: 0, end: 300, limitBytes: limit })
+		if (planOk.ok) assert.equal(r.ok, false, '计划通过但真实超限时仍拒绝')
 	}
 
 	// ---- 导出服务：超限时既不调 saveFile 也不写文件 ----

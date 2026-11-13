@@ -1080,8 +1080,9 @@
 			return
 		}
 		const m = Panels.measureCursors(wave, sel.a, sel.b, { samplePeriodSec: per })
-		setText('cur-a', sel.a + ' · ' + fmt.fmtCurrent(wave.iAt(sel.a)))
-		setText('cur-b', sel.b + ' · ' + fmt.fmtCurrent(wave.iAt(sel.b)))
+		// 端点电流只用真值：冷块未回读 / 已淘汰就显示 "—"，不拿近似值冒充实测
+		setText('cur-a', sel.a + ' · ' + (m.iA == null ? '—' : fmt.fmtCurrent(m.iA)))
+		setText('cur-b', sel.b + ' · ' + (m.iB == null ? '—' : fmt.fmtCurrent(m.iB)))
 		setText('cur-dt', fmt.fmtDuration(m.wallSec) + ' / ' + fmt.fmtDuration(m.durSec) + (m.gaps ? ' · ' + m.gaps + ' gap' + (m.gaps > 1 ? 's' : '') : ''))
 		setText('cur-mean', fmt.fmtCurrent(m.avgI) + ' · ' + fmt.fmtCurrent(m.minI) + ' / ' + fmt.fmtCurrent(m.maxI))
 		setText('cur-charge', fmt.fmtCharge(m.chargeUC))
@@ -1095,7 +1096,8 @@
 			control ? control.state().voltageMv : '-', settings.capacityMah, show.fft, show.battery, show.cycles].join('|')
 	}
 
-	function refreshAnalysis(force) {
+	let analysisSeq = 0
+	async function refreshAnalysis(force) {
 		if (!wave || !control) return
 		const total = totalSamples()
 		const range = Panels.pickRange({
@@ -1112,18 +1114,21 @@
 			renderAnalysisPanel(null)
 			return
 		}
-		analysis.pack = Panels.buildPack({
+		// 分析要等冷块回读（真实样点），因此是异步的：用序号丢弃过期的结果
+		const seq = ++analysisSeq
+		const pack = await Panels.buildPack({
 			wave: wave,
 			range: range,
 			samplePeriodSec: control.getSamplePeriodSec(),
-			voltageMv: control.state().voltageMv,
 			capacityMah: settings.capacityMah,
 			fft: show.fft,
 			cycles: show.cycles,
 			segments: true,
 			spikes: true,
 		})
-		renderAnalysisPanel(analysis.pack)
+		if (seq !== analysisSeq) return
+		analysis.pack = pack
+		renderAnalysisPanel(pack)
 	}
 
 	function scheduleAnalysis(force) {
@@ -1159,10 +1164,13 @@
 		set('an-freq', ed.freqHz != null ? fmt.fmtFreq(ed.freqHz) : '—')
 		set('an-qcycle', pack.qCycle != null ? fmt.fmtCharge(pack.qCycle) : '—')
 		const sp = pack.spikes ? pack.spikes.length : 0
-		const sg = pack.segments && pack.segments.segments ? pack.segments.segments.length : 0
+		const sg = pack.segmentList ? pack.segmentList.length : 0
 		set('an-events', sp + ' spikes / ' + sg + ' segments')
-		set('an-gaps', String(pack.measure.gaps) + (pack.measure.gaps ? ' · ' + fmt.fmtPercent(pack.measure.gapRatio) + ' of range' : ''))
-		$('an-gaps').dataset.warn = pack.measure.gaps > 0 ? '1' : '0'
+		const msr = pack.measure || { gaps: 0, gapRatio: 0, dropped: 0 }
+		set('an-gaps', String(msr.gaps) + (pack.dropped ? ' · ' + fmtCount(pack.dropped) + ' evicted' : '') +
+			(pack.missing ? ' · ' + fmtCount(pack.missing) + ' unavailable' : '') +
+			(msr.gaps ? ' · ' + fmt.fmtPercent(msr.gapRatio) + ' of range' : ''))
+		$('an-gaps').dataset.warn = (msr.gaps > 0 || pack.missing > 0 || pack.dropped > 0) ? '1' : '0'
 		// FFT
 		if (show.fft) {
 			const f = pack.fft

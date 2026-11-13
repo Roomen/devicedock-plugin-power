@@ -44,22 +44,74 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 		assert.deepEqual(P.pickRange({ mode: 'selection', total, selection: { a: -5, b: 5000 } }), { a: 0, b: 999, source: 'selection' })
 	}
 
-	// ---- 抽稀 ----
+	// ---- 抽稀（真实样点、按段） ----
 	{
 		const w = makeWave()
 		for (let i = 0; i < 3000; i++) w.push(i)
-		const ext = P.extractSamples(w, 0, 2999, { maxPts: 100, samplePeriodSec: 0.001 })
-		assert.equal(ext.step, 30, '3000 点抽到 100 → 步长 30')
-		assert.equal(ext.samples.length, 100)
-		assert.equal(ext.samples[0], 0)
-		assert.equal(ext.samples[1], 30)
+		const ext = await P.extractSegmentsExact(w, 0, 2999, { maxPts: 100 })
+		assert.equal(ext.segments.length, 1, '没有缺口时只有一段')
+		assert.equal(ext.segments[0].step, 30, '3000 点抽到 100 → 步长 30')
+		assert.equal(ext.segments[0].samples.length, 100)
+		assert.equal(ext.segments[0].samples[0], 0)
+		assert.equal(ext.segments[0].samples[1], 30)
 		assert.equal(ext.nRaw, 3000)
-		assert.ok(Math.abs(ext.periodSec - 0.03) < 1e-12, '抽稀后周期同步放大')
-		const full = P.extractSamples(w, 0, 2999, { maxPts: 10000, samplePeriodSec: 0.001 })
-		assert.equal(full.step, 1)
-		assert.equal(full.samples.length, 3000)
-		assert.equal(P.extractSamples(w, 5, 5, {}).samples.length, 1)
-		assert.equal(P.extractSamples(w, 10, 5, {}).a, 5, '反向区间自动排序')
+		assert.equal(ext.missing, 0)
+		const full = await P.extractSegmentsExact(w, 0, 2999, { maxPts: 10000 })
+		assert.equal(full.segments[0].step, 1)
+		assert.equal(full.segments[0].samples.length, 3000)
+		// 缺口把区间切成两段：绝不拼成一段
+		w.noteGap(1500)
+		const split = await P.extractSegmentsExact(w, 0, 2999, { maxPts: 10000 })
+		assert.equal(split.segments.length, 2, '缺口两侧是两段：' + split.segments.length)
+		assert.equal(split.segments[0].hi, 1500)
+		assert.equal(split.segments[1].lo, 1500)
+		assert.equal(split.gaps, 1)
+		assert.equal(split.segments[0].samples.length + split.segments[1].samples.length, 3000)
+	}
+
+	// ---- 冷块必须等回读；回读失败 / 已淘汰的区间记为不可用 ----
+	{
+		// 用真实的 wave + 假冷存储：先写满让它归档，再验证分析会等回读
+		const disk = new Map()
+		const store = {
+			init: async () => {},
+			getDiskUsed: () => 0,
+			writeChunk: async (id, s) => { disk.set(id, new Float32Array(s)); return { byteSize: s.length * 4 } },
+			readChunk: async (id) => {
+				await new Promise(function (r) { setTimeout(r, 5) })
+				const v = disk.get(id)
+				if (!v) throw new Error('missing chunk')
+				return v
+			},
+			removeChunk: async (id) => { disk.delete(id) },
+			clearSession: async () => { disk.clear() },
+		}
+		const w = W.createWave({
+			store: store, chunkSize: 64, ramCapSamples: 64,
+			voltage: () => 3.3, samplePeriod: () => 0.001,
+		})
+		for (let i = 0; i < 256; i++) w.push(100 + (i % 7))
+		await new Promise(function (r) { setTimeout(r, 60) })
+		// 冷块已经不在缓存里：iAtExact 必须返回 null（不能造一个 (min+max)/2）
+		w.clearHydrateCache()
+		w.clearBucketCache()
+		assert.ok(w.chunks.some((c) => c.state === 'cold'), '应有冷块：' + w.chunks.map((c) => c.state).join(','))
+		const coldIdx = w.chunks.filter((c) => c.state === 'cold')[0].base + 1
+		assert.equal(w.iAtExact(coldIdx), null, '未回读的冷块不能给"实测值"')
+		// 分析会先等回读，拿到真实值
+		const ext = await P.extractSegmentsExact(w, 0, w.total() - 1, { maxPts: 100000 })
+		assert.equal(ext.missing, 0, '冷块回读成功：' + ext.missing)
+		const vals = []
+		for (const s of ext.segments) for (const v of s.samples) vals.push(v)
+		assert.equal(vals.length, 256)
+		for (let i = 0; i < 256; i++) assert.equal(vals[i], 100 + (i % 7), '第 ' + i + ' 个值必须是真实样点')
+		// 冷块读不出来：记为 missing，不拿近似值顶替
+		disk.clear()
+		w.clearHydrateCache()
+		w.clearBucketCache()
+		const ext2 = await P.extractSegmentsExact(w, 0, w.total() - 1, { maxPts: 100000 })
+		assert.ok(ext2.missing > 0, '读不出来的冷块要如实报 missing')
+		assert.ok(ext2.unusable.some((u) => u.kind === 'missing'))
 	}
 
 	// ---- 游标读数：时长 / 均值 / 能量不跨缺口 ----
@@ -135,59 +187,92 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 		assert.ok(near2 && (near2.index === 450 || near2.index === 500), '取最近的沿：' + (near2 && near2.index))
 	}
 
-	// ---- 分析包：读数额度 + FFT + 电池 + 叠画 ----
+	// ---- 分析包：真实样点 + 分段边沿/FFT/叠画 + 电池 ----
 	{
-		const w = makeWave({ periodSec: 0.001 })
-		// 1 kHz 采样、10 Hz 方波，叠画应能切出 10 个周期左右
+		const w = makeWave({ chunkSize: 65536, ramCap: 65536, periodSec: 0.001 })
+		// 1 kHz 采样、10 Hz 方波
 		for (let i = 0; i < 4000; i++) w.push((i % 100) < 50 ? 2000 : 200)
 		const range = { a: 0, b: 3999, source: 'window' }
-		const pack = P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001, voltageMv: 3300, capacityMah: 2000, fft: true, cycles: true, segments: true })
+		const pack = await P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001, voltageMv: 3300, capacityMah: 2000, fft: true, cycles: true, segments: true })
 		assert.ok(pack, '包应能建出来')
 		assert.equal(pack.source, 'window')
 		assert.equal(pack.nRaw, 4000)
-		assert.ok(pack.rateHz > 0)
+		assert.equal(pack.missing, 0, '热数据不需要回读')
 		assert.ok(pack.basic.n > 0)
 		assert.ok(pack.levels.lowAvg != null && pack.levels.highAvg != null, '双电平有两侧均值')
 		assert.ok(pack.levels.highAvg > pack.levels.lowAvg)
-		// 周期电量
 		assert.ok(pack.qCycle > 0, '每周期电量：' + pack.qCycle)
-		// FFT：10 Hz 处有峰
+		// 连续区间：FFT 可用，主峰在 10 Hz 附近
 		assert.ok(pack.fft && pack.fft.ok !== false, 'FFT 应可用')
 		const peaks = pack.fft.peaks || []
 		assert.ok(peaks.length > 0, 'FFT 有峰')
 		assert.ok(Math.abs(peaks[0].freqHz - 10) < 2, '主峰在 10 Hz 附近：' + peaks[0].freqHz)
-		// 电池：2 V? 用均值估算
+		assert.equal(pack.fft.partial, false)
+		// 电池
 		assert.ok(pack.battery && pack.battery.ok, '电池估算可用')
 		assert.ok(pack.battery.days > 0)
-		// 叠画：周期 100 点，4000 点 → 最多 32 段
+		// 叠画
 		assert.ok(pack.cycles && pack.cycles.nCycles > 0, '叠画有周期')
 		assert.ok(pack.cycles.cycles.length <= 32)
 		assert.equal(pack.cycles.mean.length, pack.cycles.cycles[0].length, '均值曲线与周期等长')
 		// 分段（Sleep/Active）
-		assert.ok(pack.segments && pack.segments.segments.length >= 2, '按阈值分段')
-		// 电压改了，能量跟着改
-		const pack2 = P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001, voltageMv: 5000 })
-		assert.ok(pack2.measure.energyUWh > pack.measure.energyUWh, '电压更高 → 能量更高')
+		assert.ok(pack.segmentList && pack.segmentList.length >= 2, '按阈值分段')
+		// 能量取自波形统计（历史电压），不再被当前设置改写
+		const pack2 = await P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001, voltageMv: 5000 })
+		assert.ok(Math.abs(pack2.measure.energyUWh - pack.measure.energyUWh) < 1e-9,
+			'改当前电压不能改写历史能量：' + pack.measure.energyUWh + ' vs ' + pack2.measure.energyUWh)
+		assert.ok(Math.abs(pack.measure.volts - 3.3) < 1e-6, '有效电压取波形记录：' + pack.measure.volts)
 		// 不带可选面板时不白算
-		const lean = P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001 })
+		const lean = await P.buildPack({ wave: w, range: range, samplePeriodSec: 0.001 })
 		assert.equal(lean.fft, null)
 		assert.equal(lean.cycles, null)
 		assert.equal(lean.battery, null)
-		assert.equal(P.buildPack({ wave: null, range: range }), null)
+		assert.equal(await P.buildPack({ wave: null, range: range }), null)
 	}
 
-	// ---- 缺口段里的分析包：时长与能量同口径 ----
+	// ---- 区间含缺口：FFT 拒绝、周期只在段内配对、时长/能量同口径 ----
 	{
-		const w = makeWave({ periodSec: 1 })
-		for (let i = 0; i < 30; i++) w.push(500)
-		w.noteGap(15)
-		for (let i = 0; i < 30; i++) w.push(500)
-		const pack = P.buildPack({ wave: w, range: { a: 0, b: 59, source: 'selection' }, samplePeriodSec: 1, voltageMv: 1000 })
-		assert.equal(pack.measure.gaps, 1)
-		assert.equal(pack.measure.durSec, 58, '59 个间隔减掉缺口那一个')
-		assert.ok(Math.abs(pack.measure.chargeUC - 500 * 58) < 1e-6)
-		// 双电平统计的是抽稀样点（含缺口两侧），但时长/能量走缺口口径
-		assert.ok(pack.basic.n > 0)
+		const w = makeWave({ chunkSize: 65536, ramCap: 65536, periodSec: 0.001 })
+		for (let i = 0; i < 2000; i++) w.push((i % 100) < 50 ? 2000 : 200)
+		w.noteGap(1000)
+		const pack = await P.buildPack({
+			wave: w, range: { a: 0, b: 1999, source: 'selection' },
+			samplePeriodSec: 0.001, voltageMv: 3300, fft: true, cycles: true, segments: true,
+		})
+		assert.equal(pack.segments, 2, '缺口把区间切成两段：' + pack.segments)
+		assert.equal(pack.gaps, 1)
+		// FFT 在不连续区间上拒绝计算
+		assert.equal(pack.fft.ok, false)
+		assert.equal(pack.fft.reason, 'discontinuous')
+		// 边沿只在段内配对：周期仍是 100 点 = 0.1 s，不能把缺口算成一个「超长周期」
+		assert.ok(pack.edges.nPeriod > 0, '段内仍有周期样本')
+		assert.ok(Math.abs(pack.edges.periodSec - 0.1) < 1e-9, '周期不能被缺口拉长：' + pack.edges.periodSec)
+		assert.ok(Math.abs(pack.edges.freqHz - 10) < 1e-6)
+		// 叠画只取最长段
+		assert.ok(pack.cycles && pack.cycles.nCycles > 0)
+		assert.ok(pack.cycles.segmentHi <= 1000 || pack.cycles.segmentLo >= 1000, '叠画只用单段：' + pack.cycles.segmentLo + '..' + pack.cycles.segmentHi)
+		// 允许显式只取最长段时，FFT 会算并标 partial
+		const pack2 = await P.buildPack({
+			wave: w, range: { a: 0, b: 1999, source: 'selection' },
+			samplePeriodSec: 0.001, fft: true, fftLongestSegment: true,
+		})
+		assert.ok(pack2.fft && pack2.fft.ok !== false, '显式允许时只算最长段')
+		assert.equal(pack2.fft.partial, true)
+		// 时长与能量按段累加
+		assert.equal(pack.measure.durSec, 1998 * 0.001, '两段各 999 个间隔：' + pack.measure.durSec)
+	}
+
+	// ---- 大区间：周期用 dp × per，不再重复乘抽稀步长 ----
+	{
+		const w = makeWave({ chunkSize: 262144, ramCap: 524288, periodSec: 0.001 })
+		// 20 万个点、周期 100 点 → 跨度超过 EDGE_SEARCH_MAX(80000)，会抽稀
+		const n = 200000
+		for (let i = 0; i < n; i++) w.push((i % 100) < 50 ? 2000 : 200)
+		const ed = P.measureEdges(w, 0, n - 1, { samplePeriodSec: 0.001 })
+		assert.ok(ed.step > 1, '大区间应该抽稀：' + ed.step)
+		assert.ok(Math.abs(ed.periodSec - 0.1) < 1e-6,
+			'周期必须是 0.1 s（dp × per），不能乘抽稀步长：' + ed.periodSec)
+		assert.ok(Math.abs(ed.freqHz - 10) < 1e-3, '频率 10 Hz：' + ed.freqHz)
 	}
 
 	// ---- 格式化口径一致 ----
@@ -204,6 +289,25 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 		assert.equal(P.fmtFreq(1000), '1.000 kHz')
 		assert.equal(P.fmtPercent(0.255), '25.5%')
 		assert.equal(P.fmtCurrent(NaN), '--')
+	}
+
+	// ---- 游标读数：端点电流只用真值，拿不到就是 null ----
+	{
+		const w = makeWave({ chunkSize: 64, ramCap: 64, periodSec: 0.001 })
+		for (let i = 0; i < 200; i++) w.push(500 + (i % 3))
+		await new Promise(function (r) { setTimeout(r, 40) })
+		w.clearHydrateCache()
+		const m = P.measureCursors(w, 1, 198, { samplePeriodSec: 0.001 })
+		assert.ok(m.ready)
+		assert.equal(m.iA, null, '冷块未回读时端点电流必须是 null（不能拿 min/max 中点充数）')
+		assert.equal(m.deltaI, null)
+		assert.equal(m.volts > 0, true, '有效电压来自块内记录：' + m.volts)
+		// 热块里的端点有真实值（ramCap=64：只有最后一个块还在热区）
+		const last = w.total() - 1
+		const hot = P.measureCursors(w, last - 3, last, { samplePeriodSec: 0.001 })
+		assert.ok(hot.iA != null && hot.iB != null, '热块端点有真实值：' + hot.iA + ' / ' + hot.iB)
+		assert.equal(typeof hot.iA, 'number')
+		assert.equal(hot.deltaI != null, true)
 	}
 
 	console.log('power-panels: ok')

@@ -5,9 +5,10 @@
 
 	// 与宿主 js/plugin-rpc.js 的 LIMITS.maxExportChars 对齐（按字符数计，UTF-8 下 CSV 全是 ASCII）
 	const MAX_EXPORT_BYTES = 8 * 1024 * 1024
-	const CSV_HEADER = 'index,time_s,current_uA,power_uW\n'
+	const CSV_HEADER = 'index,time_s,current_uA,power_uW,voltage_mV\n'
 	// 估算每个样点的固定开销：下标 + 逗号 + 时间 + 电流 + 功率 + 换行
-	const BYTES_PER_ROW_ESTIMATE = 44
+	// 每行固定开销的保守估计（下标 + 时间 + 电流 + 功率 + 电压 + 换行）
+	const BYTES_PER_ROW_ESTIMATE = 56
 
 	function estimateCsvBytes(n) {
 		const rows = Math.max(0, n | 0)
@@ -80,40 +81,64 @@
 	}
 
 	/**
-	 * 生成 CSV。只在计划通过后调用；真实长度超限时回 too_large（不截断）。
-	 * @param {object} wave power-wave（iAt / total / gaps）
+	 * 生成 CSV：**只写真实样点**，缺口 / 已淘汰 / 回读失败的区间写 \`# gap\` 标记行并计数。
+	 *
+	 * - 冷块先 await 回读（wave.walkExact），拿不到就标 gap，绝不用块级近似值冒充实测；
+	 * - 功率用**采样当时**的源电压（按块记录的 volts），不随界面当前设置改写；
+	 * - 最终文本长度复核（含 gap 行）：超限直接拒绝，不静默截断。
+	 *
+	 * @param {object} wave
 	 * @param {number} start 起始下标（含）
 	 * @param {number} end 结束下标（不含）
-	 * @param {object} ctx { voltageMv, samplePeriodSec, limitBytes }
+	 * @param {object} ctx { samplePeriodSec, limitBytes }
+	 * @returns {Promise<{ ok:boolean, text?:string, bytes?:number, gaps?:number, missing?:number,
+	 *   dropped?:number, code?:string, message?:string, plan?:object }>}
 	 */
-	function buildCsv(wave, start, end, ctx) {
+	async function buildCsv(wave, start, end, ctx) {
 		ctx = ctx || {}
 		const limit = ctx.limitBytes > 0 ? ctx.limitBytes : MAX_EXPORT_BYTES
 		const plan = planExport({ kind: 'range', start: start, end: end, limitBytes: limit })
 		if (!plan.ok) return { ok: false, code: plan.reason, message: plan.message, plan: plan }
 		const per = ctx.samplePeriodSec > 0 ? ctx.samplePeriodSec : 0
-		const volts = ctx.voltageMv != null ? ctx.voltageMv / 1000 : 0
-		const gaps = typeof wave.gaps === 'function' ? wave.gaps() : []
-		let ga = 0
 		const parts = [CSV_HEADER]
 		let size = CSV_HEADER.length
-		for (let li = start; li < end; li++) {
-			// 缺口处插标记行：消费方据此知道这段时间不连续，不会把它当成连续的能流
-			while (ga < gaps.length && gaps[ga] < li) ga++
-			if (ga < gaps.length && gaps[ga] === li) parts.push('# gap\n')
-			const v = wave.iAt(li)
-			const row = li + ',' + num((li - start) * per) + ',' + num(v) + ',' + num(v * volts) + '\n'
-			parts.push(row)
-			size += row.length
-			if (size > limit) {
-				return {
-					ok: false, code: 'too_large',
-					message: '导出内容超过 ' + formatBytes(limit) + '，已取消本次导出（不截断）。请缩短时间段或只导出摘要。',
-					plan: plan,
-				}
+		let gaps = 0
+		let missing = 0
+		let dropped = 0
+		const t0 = plan.requestedSamples
+		const push = function (text) {
+			parts.push(text)
+			size += text.length
+		}
+		await wave.walkExact(start, end, function (ev) {
+			if (ev.kind !== 'samples') {
+				// 缺口 / 淘汰 / 回读失败：写标记行（消费方据此知道这段不连续，不会当成连续能流）
+				if (ev.kind === 'gap') gaps++
+				else if (ev.kind === 'dropped') dropped += ev.hi - ev.lo
+				else missing += ev.hi - ev.lo
+				push('# gap ' + ev.kind + ' ' + ev.lo + '..' + ev.hi + '\n')
+				return
+			}
+			const volts = ev.volts > 0 ? ev.volts : 0
+			const vals = ev.values
+			let buf = ''
+			for (let k = 0; k < vals.length; k++) {
+				const li = ev.lo + k
+				const v = vals[k]
+				if (!isFinite(v)) continue
+				buf += li + ',' + num((li - start) * per) + ',' + num(v) + ',' + num(v * volts) + ',' + num(volts * 1000) + '\n'
+			}
+			push(buf)
+		})
+		// 长度复核：按**最终文本**（含 gap 行）判断，而不是按估算
+		if (size > limit) {
+			return {
+				ok: false, code: 'too_large',
+				message: '导出内容 ' + formatBytes(size) + ' 超过 ' + formatBytes(limit) + '，已取消本次导出（不截断）。请缩短时间段或只导出摘要。',
+				plan: plan,
 			}
 		}
-		return { ok: true, text: parts.join(''), bytes: size, plan: plan }
+		return { ok: true, text: parts.join(''), bytes: size, plan: plan, gaps: gaps, missing: missing, dropped: dropped, samples: t0 }
 	}
 
 	/** 摘要导出（JSON）：含缺口数与口径，便于归档 */
@@ -148,9 +173,7 @@
 			const e = Math.max(s, Math.min(total, end == null ? total : end | 0))
 			const plan = planExport({ kind: 'range', start: s, end: e, limitBytes: MAX_EXPORT_BYTES })
 			if (!plan.ok) return { ok: false, code: plan.reason, message: plan.message, plan: plan }
-			const st = control ? control.state() : {}
-			const csv = buildCsv(wave, s, e, {
-				voltageMv: st.voltageMv,
+			const csv = await buildCsv(wave, s, e, {
 				samplePeriodSec: control ? control.getSamplePeriodSec() : 0,
 				limitBytes: MAX_EXPORT_BYTES,
 			})
@@ -161,8 +184,8 @@
 			} catch (err) {
 				return { ok: false, code: (err && err.code) || 'save_failed', message: '保存文件失败：' + (err && err.message ? err.message : err) }
 			}
-			log('已导出 ' + name + '（' + formatBytes(csv.bytes) + '）', 'success')
-			return { ok: true, name: name, bytes: csv.bytes, samples: e - s }
+			log('已导出 ' + name + '（' + formatBytes(csv.bytes) + (csv.gaps ? ' · ' + csv.gaps + ' 处缺口已标记' : '') + '）', 'success')
+			return { ok: true, name: name, bytes: csv.bytes, samples: e - s, gaps: csv.gaps, missing: csv.missing, dropped: csv.dropped }
 		}
 
 		async function exportSummary(opts) {

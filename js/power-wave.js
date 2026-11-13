@@ -71,6 +71,8 @@
 		let waveEpoch = 0
 		const hydrateCache = new Map()
 		const hydratePending = new Set()
+		// 同一个冷块的并发回读共用这个 Promise（分析 / 导出 await 它）
+		const hydratePromises = new Map()
 		let hydrateInFlight = 0
 		let archiveQueuedSamples = 0
 		// 缺口：样点下标，表示「该下标与前一个下标不连续」。画布画竖标记，统计按段算。
@@ -206,27 +208,48 @@
 			return true
 		}
 
+		/**
+		 * 回读一个冷块，返回 Promise<Float32Array|null>。
+		 * 与 requestHydrate 的区别：这里给调用方一个可 await 的结果（分析 / 导出必须等真数据），
+		 * 并且同 id 的并发回读共用同一个 Promise，不会重复读盘。
+		 */
+		function hydrateChunk(ch) {
+			if (!ch) return Promise.resolve(null)
+			if (ch.state === 'dropped') return Promise.resolve(null)
+			const buf = getChunkBuf(ch)
+			if (buf) return Promise.resolve(buf)
+			if (ch.state === 'hot') return Promise.resolve(null)
+			if (!ch.diskBytes || !Store) return Promise.resolve(null)
+			const existing = hydratePromises.get(ch.id)
+			if (existing) return existing
+			const epoch = waveEpoch
+			hydrateInFlight++
+			hydratePending.add(ch.id)
+			const task = Store.readChunk(ch.id, ch.n).then(function (got) {
+				if (epoch !== waveEpoch) return null
+				touchHydrateCache(ch.id, got)
+				clearBucketCache()
+				scheduleUI()
+				return got
+			}).catch(function (e) {
+				if (epoch !== waveEpoch) return null
+				log('冷数据回读失败 ' + ch.id + '：' + (e && e.message ? e.message : e), 'warn')
+				return null
+			}).finally(function () {
+				hydrateInFlight--
+				hydratePending.delete(ch.id)
+				hydratePromises.delete(ch.id)
+			})
+			hydratePromises.set(ch.id, task)
+			return task
+		}
+
 		function requestHydrate(ch) {
 			if (!ch || ch.state === 'hot' || ch.state === 'dropped' || !Store) return
 			if (!ch.diskBytes) return
 			if (getChunkBuf(ch) || hydratePending.has(ch.id)) return
 			if (hydrateInFlight >= HYDRATE_CACHE_MAX) return
-			const epoch = waveEpoch
-			hydrateInFlight++
-			hydratePending.add(ch.id)
-			Store.readChunk(ch.id, ch.n).then(function (buf) {
-				if (epoch !== waveEpoch) return
-				touchHydrateCache(ch.id, buf)
-				hydratePending.delete(ch.id)
-				clearBucketCache()
-				scheduleUI()
-			}).catch(function (e) {
-				if (epoch !== waveEpoch) return
-				hydratePending.delete(ch.id)
-				log('冷数据回读失败 ' + ch.id + '：' + (e && e.message ? e.message : e), 'warn')
-			}).finally(function () {
-				hydrateInFlight--
-			})
+			hydrateChunk(ch)
 		}
 
 		function findChunkAt(li) {
@@ -238,15 +261,115 @@
 			return { ch: ch, off: off, index: i }
 		}
 
+		/** 全局逻辑下标 → 电流 µA（**显示用**：冷块未回读时用 min/max 中点占位并触发回读） */
 		function ringIAt(li) {
 			const loc = findChunkAt(li)
 			if (!loc) return 0
+			if (loc.ch.state === 'dropped') return 0
 			const buf = getChunkBuf(loc.ch)
 			if (buf) return buf[loc.off]
 			requestHydrate(loc.ch)
 			const ch = loc.ch
 			if (isFinite(ch.minI) && isFinite(ch.maxI)) return (ch.minI + ch.maxI) * 0.5
 			return 0
+		}
+
+		/**
+		 * 全局逻辑下标 → **真实**电流 µA，拿不到就返回 null（绝不造数据）。
+		 * 冷块还没回读、或者该下标所在的块已被淘汰，都返回 null。
+		 */
+		function iAtExact(li) {
+			const loc = findChunkAt(li)
+			if (!loc) return null
+			if (loc.ch.state === 'dropped') return null
+			const buf = getChunkBuf(loc.ch)
+			if (!buf) {
+				requestHydrate(loc.ch)
+				return null
+			}
+			const v = buf[loc.off]
+			return isFinite(v) ? v : null
+		}
+
+		/**
+		 * 逐段、逐块地把区间里的**真实**样点交给访问者，必要时等待冷块回读。
+		 * 访问者收到的事件：
+		 *   { kind: 'samples', lo, hi, values, volts, mixedVolts }  连续块内样点（[lo,hi) 全局下标）
+		 *   { kind: 'gap', lo, hi }        缺口（时间轴断开）
+		 *   { kind: 'dropped', lo, hi }    已淘汰（数据不可用）
+		 *   { kind: 'missing', lo, hi }    冷块回读失败（不可用，不造数）
+		 * 分析与导出都走这里：拿不到就明说不可用，绝不拿块级 min/max 中点充数。
+		 */
+		async function walkExact(start, end, visit) {
+			const a0 = Math.max(0, Math.min(totalCount, start | 0))
+			const b0 = Math.max(a0, Math.min(totalCount, end | 0))
+			const summary = { samples: 0, missing: 0, dropped: 0, gaps: 0 }
+			if (b0 <= a0) return summary
+			// 先把断点算好并按位置排序：断点必须与样点**交错**交付，
+			// 否则调用方（分析 / 导出）无法知道哪一处该开新段。
+			const breaks = []
+			for (let i = 0; i < gapList.length; i++) {
+				const g = gapList[i]
+				if (g > a0 && g < b0) breaks.push({ kind: 'gap', lo: g, hi: g })
+			}
+			const dr = droppedRanges()
+			for (let i = 0; i < dr.length; i++) {
+				const lo = Math.max(a0, dr[i][0])
+				const hi = Math.min(b0, dr[i][1])
+				if (hi > lo) breaks.push({ kind: 'dropped', lo: lo, hi: hi })
+			}
+			breaks.sort(function (x, y) { return x.lo - y.lo })
+			let bi = 0
+			const flushBreaksBefore = function (pos) {
+				while (bi < breaks.length && breaks[bi].lo <= pos) {
+					const b = breaks[bi++]
+					if (b.hi > b.lo) {
+						summary.dropped += b.hi - b.lo
+					} else {
+						summary.gaps++
+					}
+					if (visit) visit(b)
+				}
+			}
+			const segs = segments(a0, b0)
+			for (let s = 0; s < segs.length; s++) {
+				const segA = segs[s][0]
+				const segB = segs[s][1]
+				let i0 = chunkIndexAt(segA)
+				let base = waveChunks[i0] ? waveChunks[i0].base : 0
+				for (let i = i0; i < waveChunks.length; i++) {
+					const ch = waveChunks[i]
+					const ch0 = base
+					const ch1 = base + ch.n
+					const lo = Math.max(segA, ch0)
+					const hi = Math.min(segB, ch1)
+					base = ch1
+					if (base > segB) base = ch1
+					if (hi > lo) {
+						flushBreaksBefore(lo)
+						const buf = await hydrateChunk(ch)
+						if (!buf) {
+							summary.missing += hi - lo
+							if (visit) visit({ kind: 'missing', lo: lo, hi: hi })
+						} else {
+							summary.samples += hi - lo
+							if (visit) {
+								visit({
+									kind: 'samples',
+									lo: lo,
+									hi: hi,
+									values: buf.subarray(lo - ch0, hi - ch0),
+									volts: chunkVolts(ch),
+									mixedVolts: !!ch.voltsMixed,
+								})
+							}
+						}
+					}
+					if (base >= segB) break
+				}
+			}
+			flushBreaksBefore(b0)
+			return summary
 		}
 
 		/**
@@ -928,6 +1051,11 @@
 			// 读取
 			findChunkAt: findChunkAt,
 			iAt: ringIAt,
+			iAtExact: iAtExact,
+			walkExact: walkExact,
+			hydrateChunk: hydrateChunk,
+			droppedRanges: droppedRanges,
+			chunkVolts: chunkVolts,
 			ringIAt: ringIAt,
 			stats: calcStats,
 			calcStats: calcStats,
@@ -941,6 +1069,7 @@
 			frameReset: frameReset,
 			cache: hydrateCache,
 			pending: hydratePending,
+			clearHydrateCache: function () { hydrateCache.clear() },
 			// 缺口
 			noteGap: noteGap,
 			gaps: gaps,
