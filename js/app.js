@@ -1216,8 +1216,12 @@
 			return
 		}
 		const incomplete = !!pack.incomplete || pack.complete === false
-		set('an-meta', pack.source + ' · ' + fmtCount(pack.nRaw) + ' pts · ' + (pack.step > 1 ? '1/' + pack.step : 'full') + ' · ' + fmt.fmtDuration(pack.periodSec * (pack.nRaw - 1)))
-		$('an-meta').dataset.warn = incomplete ? '1' : '0'
+		// partial：分析样本被抽稀 / 只取了最长段 / 超出容量；必须在界面上说清楚
+		const partial = !!pack.partial
+		const metaBits = [pack.source, fmtCount(pack.nRaw) + ' pts', pack.step > 1 ? '1/' + pack.step : 'full', fmt.fmtDuration(pack.periodSec * (pack.nRaw - 1))]
+		if (partial) metaBits.push('partial')
+		set('an-meta', metaBits.join(' · '))
+		$('an-meta').dataset.warn = (incomplete || partial) ? '1' : '0'
 		if (incomplete) {
 			// 有样点读不到或被淘汰：不拿部分样点冒充整个区间的读数
 			const why = pack.unavailableReason === 'samples_unavailable'
