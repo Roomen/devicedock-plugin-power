@@ -118,6 +118,39 @@ body {
 .chip[data-state='on'] { color: var(--success); border-color: currentColor; }
 .chip[data-state='busy'] { color: var(--accent); border-color: currentColor; }
 .chip[data-state='warn'] { color: var(--warning); border-color: currentColor; }
+.chip[data-state='error'] { color: var(--danger); border-color: currentColor; }
+
+/* ---- 状态条：最近一条错误 / 警告 / 成功，失败不许只躲在下方日志里 ---- */
+.status-line {
+	flex: 0 0 auto;
+	margin: 0;
+	padding: var(--sp-1) var(--sp-3);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-lg);
+	background: var(--bg-surface);
+	color: var(--text-secondary);
+	font-size: var(--fs-small);
+	word-break: break-word;
+}
+.status-line[hidden] { display: none; }
+.status-line[data-level='error'] { color: var(--danger); border-color: currentColor; }
+.status-line[data-level='warn'] { color: var(--warning); border-color: currentColor; }
+.status-line[data-level='success'] { color: var(--success); }
+
+/* ---- 诊断面板 ---- */
+.diag { flex: 0 0 auto; }
+.diag[hidden] { display: none; }
+.diag-grid {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: 2px var(--sp-3);
+	margin: 0;
+	padding: var(--sp-2) var(--sp-3);
+	font-family: var(--font-mono);
+	font-size: var(--fs-micro);
+}
+.diag-grid dt { color: var(--text-muted); }
+.diag-grid dd { margin: 0; word-break: break-word; }
 
 /* ---- 工具条 ---- */
 .bar {

@@ -346,6 +346,12 @@
 		}
 
 		// ---- 写 ----
+		function errText(w) {
+			const e = w && w.error
+			if (!e) return ''
+			return '（' + (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') + '）'
+		}
+
 		function writeRaw(bytes, note) {
 			if (!link || typeof link.write !== 'function') return Promise.resolve({ ok: false, stale: false })
 			return link.write(bytes, note)
@@ -436,7 +442,17 @@
 		async function fetchModifiers() {
 			metaCollecting = true
 			metaBuf = ''
-			await writeRaw(PROTO.cmdMeta(), 'GET_META_DATA')
+			const mw = await writeRaw(PROTO.cmdMeta(), 'GET_META_DATA')
+			if (!mw || !mw.ok) {
+				// 请求都没写出去就不用干等 3 s：直接按默认参数走，并把原因写清楚
+				metaCollecting = false
+				metaBuf = ''
+				modifiers = PROTO.defaultModifiers()
+				modifiersOk = false
+				log('读取设备参数失败：GET_META_DATA 写入失败' + errText(mw) + '，使用默认 R/O 表', 'error')
+				onChange()
+				return false
+			}
 			const deadline = clock.now() + 3000
 			let text = metaBuf
 			while (clock.now() < deadline) {
@@ -562,9 +578,9 @@
 				}
 				sampling = false
 				link.setDrop(true)
-				log('开始采样失败：START 写入失败', 'error')
+				log('开始采样失败：START 写入失败' + errText(startW), 'error')
 				onChange()
-				return { ok: false, code: 'capture_start_failed', message: 'START 写入失败，未开始采样' }
+				return { ok: false, code: 'capture_start_failed', message: 'START 写入失败，未开始采样' + errText(startW) }
 			}
 			// START 已下发后再接收样点（此前 drop 挡住 STOP 尾包与竞态）
 			link.setDrop(false)
@@ -682,17 +698,27 @@
 			probe = { vals: [] }
 			link.setDrop(false)
 			link.resetParser(false)
+			let pw = null
 			try {
-				await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START · DUT 供电探测')
+				pw = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START · DUT 供电探测')
+				if (!pw || !pw.ok) {
+					probe = null
+					log('DUT 供电探测未执行：START 写入失败' + errText(pw), 'error')
+					return null
+				}
 				await new Promise(function (r) { clock.setTimeout(r, opts.probeMs) })
 			} catch (e) {
 				probe = null
+				log('DUT 供电探测异常：' + (e && e.message ? e.message : e), 'error')
 				return null
 			}
 			try { await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP · DUT 供电探测') } catch (e) { /* 忽略 */ }
 			const vals = probe ? probe.vals.slice() : []
 			probe = null
-			if (vals.length < 200) return null
+			if (vals.length < 200) {
+				log('DUT 供电探测无结果：' + opts.probeMs + ' ms 内只解出 ' + vals.length + ' 个样点（设备可能未响应 START）', 'warn')
+				return null
+			}
 			vals.sort(function (a, b) { return a - b })
 			const med = vals[vals.length >> 1]
 			return { on: med >= opts.dutOnThresholdUA, medianUA: med, n: vals.length }

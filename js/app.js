@@ -50,6 +50,12 @@
 	let viewStatsCache = null
 	let laneTrack = null
 	let stall = null
+	// 本轮采样开始时的链路计数基线（看门狗用它区分「无应答」与「解析失败」）
+	let captureBase = null
+	let diagOpen = false
+	// 采样 chip 的告警（开始失败 / 无应答 / 解析失败 / 中断）。界面每 400 ms 重绘一次，
+	// 告警必须记在状态里，否则重绘会立刻把它刷回 capturing / idle。
+	let sampleAlert = null
 
 	// ---- 视图与显示状态（会话级，不落盘的部分只影响本次看波形） ----
 	const view = { xZoom: 1, xOffset: 0, live: true, yMode: 'linear', yZoom: 1, yPan: 0, cursorA: null, cursorB: null }
@@ -107,6 +113,41 @@
 		while (list.childNodes.length > 300) list.removeChild(list.firstChild)
 		list.scrollTop = list.scrollHeight
 		setText('log-meta', logLines + ' lines')
+		// 日志区在页面下方，常常看不到：错误 / 警告 / 成功同步到顶部状态条，失败不能静默
+		if (level === 'error' || level === 'warn' || level === 'success') setStatus(String(message), level)
+	}
+
+	function setStatus(message, level) {
+		const el = $('status-line')
+		if (!el) return
+		el.textContent = message
+		el.dataset.level = level || ''
+		el.hidden = false
+	}
+
+	// ---------- 诊断 ----------
+	function fmtAgo(at) {
+		if (!at) return 'never'
+		const ms = Date.now() - at
+		return ms < 1000 ? ms + ' ms ago' : (ms / 1000).toFixed(1) + ' s ago'
+	}
+
+	function renderDiagnostics() {
+		if (!diagOpen || !link) return
+		const st = link.stats()
+		setText('diag-tx', st.txWrites + ' writes · ' + fmtCount(st.txBytes) + ' B · ' + st.txFailures + ' failed · last ' + fmtAgo(st.lastTxAt))
+		setText('diag-rx', st.events + ' batches · ' + fmtCount(st.bytes) + ' B · last ' + fmtAgo(st.lastRxAt))
+		setText('diag-decode', fmtCount(st.samples) + ' samples decoded · ' + fmtCount(st.drainedBytes) + ' B drained · ' + st.decodeErrors + ' decode errors · ' + st.parserGaps + ' parser gaps')
+		setText('diag-link', (link.isOpen() ? 'open' : 'closed') + ' · claim ' + (link.claimId() || '—') + ' · stream gen ' + link.streamGen() + ' · ' + (link.isDropping() ? 'dropping' : 'receiving'))
+		setText('diag-error', st.lastError ? new Date(st.lastError.at).toLocaleTimeString() + ' ' + st.lastError.message : 'none')
+	}
+
+	function toggleDiagnostics() {
+		diagOpen = !diagOpen
+		const panel = $('diag')
+		if (panel) panel.hidden = !diagOpen
+		$('btn-diag').setAttribute('aria-pressed', String(diagOpen))
+		renderDiagnostics()
 	}
 
 	// ---------- 设置 ----------
@@ -180,7 +221,8 @@
 
 		link = Claim.createClaimLink({
 			host: sdk,
-			baudRate: 115200,
+			// 与原实现一致（USB CDC 虚拟串口，波特率只是占位，但保持同一取值）
+			baudRate: 1000000,
 			createParser: function () {
 				const mods = control ? control.getModifiers() : PROTO.defaultModifiers()
 				return new PROTO.SampleParser(new PROTO.Converter(mods))
@@ -373,6 +415,7 @@
 		const isOpen = !!(st && st.open)
 		if (linkWasOpen && !isOpen && !closingByUs) {
 			const wasSampling = control ? control.isSampling() : false
+			sampleAlert = null
 			if (control) control.abortSession('连接已断开')
 			releaseBusy()
 			if (stall) stall.stop()
@@ -401,6 +444,7 @@
 				}
 				releaseBusy()
 				if (stall) stall.stop()
+				setSampleAlert(null)
 				log('串口已释放')
 				hostLog('released the analyzer port')
 			} else {
@@ -459,7 +503,13 @@
 	}
 
 	async function startCapture() {
-		if (!link.isOpen()) return
+		if (!link.isOpen()) {
+			log('无法开始采样：串口未连接', 'error')
+			return
+		}
+		let failed = ''
+		sampleAlert = null
+		setStatus('正在开始采样…', '')
 		await acquireBusy()
 		try {
 			const r = await control.startCapture()
@@ -473,23 +523,34 @@
 				trigUserOverride = false
 				view.live = true
 				view.xOffset = 0
+				const ls = link.stats()
+				captureBase = { bytes: ls.bytes, samples: ls.samples }
 				if (stall) stall.start()
+				const typed = Math.round(Number($('voltage').value))
+				if (isFinite(typed) && st.voltageMv != null && typed !== st.voltageMv) {
+					log('Source 输入框是 ' + typed + ' mV 但尚未 Apply：设备仍按 ' + st.voltageMv + ' mV 供电，功率 / 能量也按 ' + st.voltageMv + ' mV 计算', 'warn')
+				}
 			}
 			if (!r || !r.ok) {
-				log('开始采样失败：' + ((r && r.message) || '未知原因'), 'error')
+				failed = '开始采样失败：' + ((r && (r.message || r.code)) || '未知原因')
+				log(failed, 'error')
 				releaseBusy()
 			}
 		} catch (e) {
 			releaseBusy()
-			log('开始采样异常：' + (e && e.message ? e.message : e), 'error')
+			failed = '开始采样异常：' + (e && e.message ? e.message : e)
+			log(failed, 'error')
 		}
+		if (failed) sampleAlert = { state: 'error', text: 'start failed' }
 		renderSessionPanel()
 		updateSampleButton()
+		renderDiagnostics()
 		scheduleDraw()
 		startDrawLoop()
 	}
 
 	async function stopCapture(reason) {
+		sampleAlert = null
 		try {
 			const r = await control.stopCapture()
 			if (r && !r.ok) log('停止采样：' + (r.message || r.code), 'warn')
@@ -513,8 +574,18 @@
 		btn.textContent = sampling ? 'Stop capture' : 'Start capture'
 		btn.dataset.primary = sampling ? '0' : '1'
 		const chip = $('chip-sampling')
+		if (sampleAlert) {
+			chip.dataset.state = sampleAlert.state
+			chip.textContent = sampleAlert.text
+			return
+		}
 		chip.dataset.state = sampling ? 'busy' : 'off'
 		chip.textContent = sampling ? 'capturing' : 'idle'
+	}
+
+	function setSampleAlert(state, text) {
+		sampleAlert = state ? { state: state, text: text } : null
+		updateSampleButton()
 	}
 
 	// ---------- 视口 ----------
@@ -1752,6 +1823,7 @@
 			const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : 'none'
 			setText('chip-port', 'port: ' + label)
 		})
+		$('btn-diag').addEventListener('click', toggleDiagnostics)
 		$('btn-sample').addEventListener('click', function () {
 			if (control.isSampling()) stopCapture()
 			else startCapture()
@@ -1969,24 +2041,34 @@
 		bindUi()
 
 		// 停滞看门狗：长时间没有新样点就提示 + 标缺口（不自动重连）
+		// 必须注入定时器：createStallWatch 没有 setInterval 时不会自己巡检，看门狗形同虚设
 		stall = View.createStallWatch({
 			intervalMs: 500,
 			thresholdMs: 2500,
+			setInterval: function (fn, ms) { return setInterval(fn, ms) },
+			clearInterval: function (t) { clearInterval(t) },
 			onStall: function (info) {
 				const idle = Math.round(info.idleMs)
-				if (control) control.noteGap({ reason: 'stall', idleMs: idle })
-				updateGapChip()
-				log('采样流中断 ' + (idle / 1000).toFixed(1) + ' s（设备停发或 USB 卡顿），已标记缺口；不自动重连', 'warn')
-				hostLog('sample stream stalled for ' + idle + ' ms, marked as a gap')
-				const chip = $('chip-sampling')
-				chip.dataset.state = 'warn'
-				chip.textContent = 'stalled'
-				$('gaps-hint').dataset.warn = '1'
+				const ls = link ? link.stats() : { bytes: 0, samples: 0 }
+				const base = captureBase || { bytes: 0, samples: 0 }
+				const d = View.describeStall({ idleMs: idle, rxBytes: ls.bytes - base.bytes, samples: ls.samples - base.samples })
+				if (d.kind === 'stall') {
+					if (control) control.noteGap({ reason: 'stall', idleMs: idle })
+					updateGapChip()
+					$('gaps-hint').dataset.warn = '1'
+					setSampleAlert('warn', 'stalled')
+				} else {
+					// 从来没收到过样点：不是缺口，是设备无应答 / 解析失败
+					setSampleAlert('error', d.kind === 'no_response' ? 'no response' : 'decode failed')
+				}
+				log(d.message, d.level)
+				hostLog('capture watchdog: ' + d.kind + ' after ' + idle + ' ms (rx ' + (ls.bytes - base.bytes) + ' B since start)')
+				renderDiagnostics()
 			},
 			onResume: function () {
 				log('采样流已恢复', 'success')
 				$('gaps-hint').dataset.warn = '0'
-				updateSampleButton()
+				setSampleAlert(null)
 			},
 		})
 
@@ -2038,6 +2120,7 @@
 		readoutTimer = setInterval(function () {
 			renderSessionPanel()
 			updateStoragePanel()
+			renderDiagnostics()
 		}, 400)
 	}
 

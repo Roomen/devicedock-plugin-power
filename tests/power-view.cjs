@@ -360,4 +360,19 @@ const near = (a, b, eps) => Math.abs(a - b) <= (eps == null ? 1e-9 : eps)
 	assert.equal(V.minimapSeekIndex({ width: 400, px: 200, total: 1000 }), 500)
 }
 
+// ---- 看门狗命中：区分设备无应答 / 解析失败 / 中断（前两种不能报成「中断」或缺口）----
+{
+	const none = V.describeStall({ idleMs: 2600, rxBytes: 0, samples: 0 })
+	assert.equal(none.kind, 'no_response')
+	assert.equal(none.level, 'error')
+	assert.match(none.message, /无应答.*2\.6 s/)
+	const junk = V.describeStall({ idleMs: 2600, rxBytes: 512, samples: 0 })
+	assert.equal(junk.kind, 'undecodable')
+	assert.equal(junk.level, 'error')
+	assert.match(junk.message, /512 字节/)
+	const stall = V.describeStall({ idleMs: 3000, rxBytes: 4000, samples: 1000 })
+	assert.equal(stall.kind, 'stall')
+	assert.equal(stall.level, 'warn')
+}
+
 console.log('power-view: ok')

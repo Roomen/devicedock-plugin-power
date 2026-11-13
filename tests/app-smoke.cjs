@@ -183,9 +183,20 @@ function makeFakeSdk(state) {
 			close: async (id) => { const c = claims.get(id); if (c) c.open = false; return { closed: true } },
 			release: async (id) => { claims.delete(id); return { released: true } },
 			write: async (id, bytes) => {
+				// 与宿主 plugin-rpc.toBytes 同一契约：只收 0..255 的普通数组或十六进制串，Uint8Array 一律 bad_request
+				if (!Array.isArray(bytes) && typeof bytes !== 'string') {
+					const err = new Error('数据必须是字节数组或十六进制串')
+					err.code = 'bad_request'
+					throw err
+				}
+				if (state.failWrites) {
+					const err = new Error(state.failWrites)
+					err.code = 'internal'
+					throw err
+				}
 				state.writes.push(Array.from(bytes))
 				if (bytes[0] === 0x19) state.pushRxText('R0=1031.64\r\nVDD=3300 mV\r\nEND\r\n')
-				if (bytes[0] === 0x06) state.pushRxSamples(300, 1000)
+				if (bytes[0] === 0x06 && !state.silent) state.pushRxSamples(300, 1000)
 				return { bytes: bytes.length }
 			},
 			onRx(fn) { state.rxHandler = fn; return function () {} },
@@ -622,6 +633,48 @@ const fireKey = (win, key, props) => {
 		assert.ok(state.writes.some((w) => w[0] === 0x06), '新连接必须真的发 START（不能因为旧 sampling=true 直接返回）')
 		click(document, 'btn-sample')
 		await tick(150)
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// ---- 失败必须可见：START 写失败 / 设备无应答都要写到状态条，不能静默回到 idle ----
+	{
+		click(document, 'btn-connect')
+		await tick(500)
+		assert.equal(text(document, 'btn-connect'), 'Disconnect')
+		// 1) 写入失败
+		state.failWrites = 'USB 写超时'
+		click(document, 'btn-sample')
+		await tick(200)
+		state.failWrites = null
+		assert.equal(text(document, 'chip-sampling'), 'start failed', '开始失败不能显示成 idle：' + text(document, 'chip-sampling'))
+		assert.equal(document.getElementById('chip-sampling').dataset.state, 'error')
+		const sl = document.getElementById('status-line')
+		assert.equal(sl.hidden, false, '状态条要显示出来')
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /START 写入失败.*USB 写超时/, '状态条写明原因：' + sl.textContent)
+		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		// 诊断面板：发送失败计数与最近错误
+		click(document, 'btn-diag')
+		await tick(10)
+		assert.equal(document.getElementById('diag').hidden, false, '诊断面板可展开')
+		assert.match(text(document, 'diag-tx'), /writes .* [1-9]\d* failed/, '诊断显示发送统计：' + text(document, 'diag-tx'))
+		assert.match(text(document, 'diag-rx'), /batches .* B/)
+		assert.match(text(document, 'diag-error'), /USB 写超时/, '诊断显示最近错误：' + text(document, 'diag-error'))
+		// 2) 设备无应答：START 写成功但一个字节都不回 → 看门狗报「无应答」，不是缺口
+		state.silent = true
+		const gapsBefore = text(document, 'chip-gaps')
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		await tick(3200)
+		assert.equal(text(document, 'chip-sampling'), 'no response', '看门狗必须真的在跑：' + text(document, 'chip-sampling'))
+		assert.match(sl.textContent, /设备无应答/, '状态条：' + sl.textContent)
+		assert.equal(text(document, 'chip-gaps'), gapsBefore, '从未收到数据不算缺口')
+		state.silent = false
+		click(document, 'btn-sample')
+		await tick(200)
+		click(document, 'btn-diag')
 		click(document, 'btn-connect')
 		await tick(150)
 	}

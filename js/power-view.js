@@ -715,6 +715,25 @@
 		return api
 	}
 
+	/**
+	 * 看门狗命中时判断是哪一种「没数据」：设备完全无应答 / 收到字节但解不出样点 / 有过数据后中断。
+	 * 三种原因处理方式不同，界面必须说清楚，不能都叫「中断」。
+	 * @param {{ idleMs: number, rxBytes: number, samples: number }} o 采样开始以来的增量
+	 */
+	function describeStall(o) {
+		o = o || {}
+		const sec = ((Number(o.idleMs) || 0) / 1000).toFixed(1)
+		const rx = Math.max(0, Number(o.rxBytes) || 0)
+		const n = Math.max(0, Number(o.samples) || 0)
+		if (rx === 0) {
+			return { kind: 'no_response', level: 'error', message: '设备无应答：START 后 ' + sec + ' s 内未收到任何字节（检查设备是否为功耗仪、USB 连接与供电）' }
+		}
+		if (n === 0) {
+			return { kind: 'undecodable', level: 'error', message: '解析失败：START 后收到 ' + rx + ' 字节但没有解出任何样点（帧格式不符或数据错位）' }
+		}
+		return { kind: 'stall', level: 'warn', message: '采样流中断 ' + sec + ' s（设备停发或 USB 卡顿），已标记缺口；不自动重连' }
+	}
+
 	// ---------- 总览条（minimap） ----------
 	/** 总览条里视口框的像素区间 */
 	function minimapViewRect(o) {
@@ -778,6 +797,7 @@
 		setAcqStartMode: setAcqStartMode,
 		setAcqStopMode: setAcqStopMode,
 		createStallWatch: createStallWatch,
+		describeStall: describeStall,
 		minimapViewRect: minimapViewRect,
 		minimapSeekIndex: minimapSeekIndex,
 	}

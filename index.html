@@ -53,7 +53,24 @@
 		<div class="group">
 			<button type="button" id="btn-sample" data-primary="1">Start capture</button>
 			<button type="button" id="btn-clear">Clear</button>
+			<button type="button" id="btn-diag" aria-pressed="false" title="Show bytes sent / received and the last error">Diagnostics</button>
 		</div>
+	</section>
+
+	<p class="status-line" id="status-line" role="status" aria-live="polite" hidden></p>
+
+	<section class="panel diag" id="diag" hidden>
+		<div class="panel-head">
+			<h2>Diagnostics</h2>
+			<div class="meta">serial claim link</div>
+		</div>
+		<dl class="diag-grid">
+			<dt>Sent</dt><dd id="diag-tx">—</dd>
+			<dt>Received</dt><dd id="diag-rx">—</dd>
+			<dt>Decoded</dt><dd id="diag-decode">—</dd>
+			<dt>Link</dt><dd id="diag-link">—</dd>
+			<dt>Last error</dt><dd id="diag-error">none</dd>
+		</dl>
 	</section>
 
 	<section class="bar">
