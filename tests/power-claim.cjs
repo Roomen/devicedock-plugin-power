@@ -418,7 +418,65 @@ function trimWithInterleavedBreaks() {
 	assert.equal(events.filter((e) => e.kind === 'samples').reduce((s, e) => s + e.n, 0), 4, '只剩最后一批 4 点：' + JSON.stringify(events))
 }
 
-openFailureCase().then(closeCase).then(trimWithInterleavedBreaks).then(function () {
+// ---- 写入契约：宿主 claim.write 只收普通数组 / 十六进制串（plugin-rpc.toBytes），Uint8Array 会整条 bad_request ----
+// 实机「Start capture 闪一下没反应」的根因：所有命令（0x19 / START / REGULATOR）都被宿主拒掉。
+async function writeContractCase() {
+	const sent = []
+	let failNext = null
+	const host = {
+		claim: {
+			acquire: async () => ({ claimId: 'cW' }),
+			open: async () => ({ open: true }),
+			release: async () => ({ released: true }),
+			write: async (id, bytes) => {
+				if (!Array.isArray(bytes) && typeof bytes !== 'string') {
+					const e = new Error('数据必须是字节数组或十六进制串')
+					e.code = 'bad_request'
+					throw e
+				}
+				if (failNext) {
+					const e = new Error(failNext)
+					e.code = 'internal'
+					failNext = null
+					throw e
+				}
+				sent.push(bytes.slice())
+				return { bytes: bytes.length }
+			},
+			ack: async () => ({ ack: true }),
+		},
+	}
+	const logs = []
+	const link = Claim.createClaimLink({ host, scheduleDrain: function (fn) { fn() }, onLog: function (m, l) { logs.push([l, m]) } })
+	await link.open('p1')
+	const w = await link.write(P.cmdAverageStart(), 'AVERAGE_START')
+	assert.equal(w.ok, true, 'START 必须能写出去：' + JSON.stringify(logs))
+	assert.deepEqual(sent[0], [0x06], '发给宿主的是普通字节数组')
+	const w2 = await link.write(new Uint8Array([0x0d, 0x0c, 0xe4]), 'REGULATOR')
+	assert.equal(w2.ok, true)
+	assert.deepEqual(sent[1], [0x0d, 0x0c, 0xe4])
+	let st = link.stats()
+	assert.equal(st.txWrites, 2)
+	assert.equal(st.txBytes, 4)
+	assert.equal(st.txFailures, 0)
+	assert.ok(st.lastTxAt > 0)
+	assert.equal(st.lastError, null)
+	// 写失败：计数 + 最近错误带宿主错误码，供诊断面板显示
+	failNext = 'USB 写超时'
+	const w3 = await link.write(P.cmdAverageStop(), 'AVERAGE_STOP')
+	assert.equal(w3.ok, false)
+	assert.equal(w3.stale, false)
+	st = link.stats()
+	assert.equal(st.txFailures, 1)
+	assert.match(st.lastError.message, /AVERAGE_STOP.*USB 写超时.*internal/)
+	assert.ok(logs.some(([l, m]) => l === 'error' && /USB 写超时/.test(m)), '写失败必须进日志')
+	// 收到字节要记时间（诊断：区分「设备没回」与「回了但解不出」）
+	link.handleRx({ claimId: 'cW', gen: 1, seq: 1, offset: 0, at: 1, bytes: new Uint8Array([1, 2, 3]) })
+	assert.ok(link.stats().lastRxAt > 0)
+	assert.equal(link.stats().bytes, 3)
+}
+
+openFailureCase().then(closeCase).then(trimWithInterleavedBreaks).then(writeContractCase).then(function () {
 	console.log('power-claim: ok')
 }).catch(function (e) {
 	console.error(e)

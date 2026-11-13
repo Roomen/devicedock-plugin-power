@@ -111,7 +111,18 @@
 			decodeErrors: 0,
 			backlogDropped: 0,
 			drainedBytes: 0,
+			// 诊断：收发字节与最近一次错误（实机回报用）
+			txWrites: 0,
+			txBytes: 0,
+			txFailures: 0,
+			lastTxAt: 0,
+			lastRxAt: 0,
+			lastError: null,
 			lastGap: null,
+		}
+
+		function noteError(message) {
+			stats.lastError = { at: now(), message: String(message) }
 		}
 
 		function emitState() {
@@ -367,6 +378,7 @@
 			if (seq) lastSeq = seq
 			stats.events++
 			stats.bytes += bytes.length
+			if (bytes.length) stats.lastRxAt = now()
 			if (offset != null) expectedOffset = offset + bytes.length
 			else if (bytes.length) expectedOffset += bytes.length
 
@@ -385,6 +397,7 @@
 			} catch (e) {
 				// 回调抛错会被宿主当成「已消费」而吞掉，所以这里必须自己接住并标缺口
 				stats.decodeErrors++
+				noteError('样点解码失败：' + (e && e.message ? e.message : e))
 				onLog('样点解码失败：' + (e && e.message ? e.message : e), 'error')
 				enqueueBreak({ reason: 'decode_error', at: at, gen: streamGen })
 				breakStream()
@@ -500,6 +513,7 @@
 				lastSeq = 0
 				resetStream(0, 0)
 				stats.openFailures++
+				noteError('打开串口失败：' + (e && e.message ? e.message : e))
 				onLog('打开串口失败：' + (e && e.message ? e.message : e), 'error')
 				throw e
 			} finally {
@@ -542,16 +556,25 @@
 			const myGen = gen
 			const myId = claimId
 			if (!open || !myId) {
+				noteError('写入失败（串口未打开）' + (note ? '：' + note : ''))
 				if (note) onLog('写入失败（未打开）：' + note, 'error')
 				return { ok: false, stale: false }
 			}
-			const data = toBytes(bytes)
+			// 宿主 claim.write 只收 0..255 的普通数组或十六进制串（plugin-rpc.toBytes）；
+			// Uint8Array 经 postMessage 结构化克隆后仍是 Uint8Array，会被整条拒成 bad_request。
+			const data = Array.from(toBytes(bytes))
+			stats.txWrites++
 			try {
 				await host.claim.write(myId, data)
 			} catch (e) {
-				onLog('写入错误' + (note ? '（' + note + '）' : '') + '：' + (e && e.message ? e.message : e), 'error')
+				const msg = (e && e.message ? e.message : String(e)) + (e && e.code ? ' [' + e.code + ']' : '')
+				stats.txFailures++
+				noteError('写入失败' + (note ? '（' + note + '）' : '') + '：' + msg)
+				onLog('写入错误' + (note ? '（' + note + '）' : '') + '：' + msg, 'error')
 				return { ok: false, stale: false, error: e }
 			}
+			stats.txBytes += data.length
+			stats.lastTxAt = now()
 			if (!open || gen !== myGen || claimId !== myId) {
 				if (note) onLog('写入完成时连接已变化：' + note, 'warn')
 				return { ok: false, stale: true }
