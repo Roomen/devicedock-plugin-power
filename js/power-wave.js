@@ -240,6 +240,25 @@
 			return 0
 		}
 
+		/**
+		 * 区间内最小的正电流（供 log floor 自适应）。
+		 * 只抽样约 2000 点：floor 会被贴到 10ⁿ，抽样足够，也不为画一帧扫全量。
+		 */
+		function minPositiveIn(start, end) {
+			if (totalCount < 1) return 0
+			let a = Math.max(0, start | 0)
+			let b = Math.min(totalCount - 1, (end == null ? totalCount : end) | 0)
+			if (b < a) return 0
+			const span = b - a + 1
+			const step = Math.max(1, Math.ceil(span / 2000))
+			let mp = Infinity
+			for (let i = a; i <= b; i += step) {
+				const v = ringIAt(i)
+				if (isFinite(v) && v > 0 && v < mp) mp = v
+			}
+			return isFinite(mp) ? mp : 0
+		}
+
 		function diskUsedBytes() {
 			if (!Store) return 0
 			return Store.getDiskUsed ? Store.getDiskUsed() : 0
@@ -802,6 +821,7 @@
 			ringIAt: ringIAt,
 			stats: calcStats,
 			calcStats: calcStats,
+			minPositiveIn: minPositiveIn,
 			bucketEntry: getBucketEntry,
 			getBucketEntry: getBucketEntry,
 			computeBucketSize: computeBucketSize,

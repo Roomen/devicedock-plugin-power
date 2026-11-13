@@ -10,6 +10,7 @@
 	'use strict'
 
 	const PROTO = global.PowerProtocol || (typeof require === 'function' ? require('./power-protocol.js') : null)
+	const VIEW = global.PowerView || (typeof require === 'function' ? require('./power-view.js') : null)
 
 	const DEFAULTS = {
 		rxDrainMs: 50,
@@ -68,6 +69,12 @@
 		let rawStreamFirstMs = 0
 		let peakRateHz = 0
 		let ignoredSamples = 0
+		// 采样沿触发（start / stop）与它需要的触发电平
+		let acq = VIEW ? VIEW.createAcqTrigger() : null
+		let trigLevelUA = null
+		let stopScheduled = false
+		// 长期模式的折叠总览（minimap）：长跑时不进波形环，只留 min/max 总览
+		const folding = new PROTO.FoldingBuffer(10000)
 		let warmupLeft = 0
 		let acqStoreEnabled = true
 		let firstStoredMs = 0
@@ -218,10 +225,56 @@
 				const t = at - (total - 1 - (from + i)) * stepMs
 				const outs = rateAdj.push(s.iUA, t)
 				for (let k = 0; k < outs.length; k++) {
-					if (ingest(outs[k].tMs, outs[k].iUA, s)) stored++
+					const ua = outs[k].iUA
+					// 采样沿触发：等启动沿期间只累计 pre-range，命中后才开闸入库
+					if (acq && !acq.storeEnabled) {
+						if (feedAcq(ua, 'start')) {
+							acq.storeEnabled = true
+							acq.startLatched = true
+							log('已命中采样启动沿，开始入库', 'success')
+						}
+						continue
+					}
+					if (ingest(outs[k].tMs, ua, s)) stored++
+					// 停沿：入库之后生效，STOP 排到回调外异步发
+					if (acq && acq.stop !== 'off' && acq.storeEnabled && feedAcq(ua, 'stop')) {
+						requestStop('已命中采样停止沿，停止采样')
+						break
+					}
 				}
 			}
 			return stored
+		}
+
+		/** 触发电平：用户设了就用它，否则用最近窗口 min/max 中点（Auto） */
+		function trigLevel() {
+			if (trigLevelUA != null && isFinite(trigLevelUA)) return trigLevelUA
+			if (!wave) return 0
+			const total = wave.total()
+			if (total < 8) return 0
+			const win = Math.min(total, 4000)
+			const st = wave.stats(total - win, total)
+			return (st.minI + st.maxI) * 0.5
+		}
+
+		function feedAcq(ua, kind) {
+			if (!acq || !VIEW) return false
+			return VIEW.feedAcqEdge(acq, { iUA: ua, kind: kind, thr: trigLevel() })
+		}
+
+		/** 停采排到回调之外：绝不能在这条入库路径里 await */
+		function requestStop(reason) {
+			if (stopScheduled) return
+			stopScheduled = true
+			log(reason, 'warn')
+			clock.setTimeout(function () {
+				stopScheduled = false
+				if (!sampling) return
+				// stopSampling 内部只发一条 STOP，失败会自己记日志
+				stopSampling().catch(function (e) {
+					log('停止采样失败：' + (e && e.message ? e.message : e), 'error')
+				})
+			}, 0)
 		}
 
 		function ingest(tMs, iUA, info) {
@@ -245,6 +298,8 @@
 				if (iUA < longStats.minI) longStats.minI = iUA
 				if (iUA > longStats.maxI) longStats.maxI = iUA
 				longStats.energyUAs += iUA * dt
+				// 长期模式不进波形环，但仍然维护一条折叠总览（min/max 分桶），供 minimap 用
+				folding.addData(iUA, tSec)
 				return true
 			}
 			if (!wave) return false
@@ -392,6 +447,7 @@
 			lastTMs = 0
 			gapPending = false
 			resetLongStats()
+			folding.reset()
 			voltageChanges = 0
 			deviceStreamHz = 0
 			rawStreamCount = 0
@@ -451,6 +507,17 @@
 			metaCollecting = false
 			metaBuf = ''
 			acqStoreEnabled = true
+			// 采样沿触发：Arm 后先 START 设备，等沿再入库
+			if (acq) {
+				acq.startState = 0
+				acq.stopState = 0
+				acq.startLatched = acq.start === 'off'
+				acq.storeEnabled = acq.start === 'off'
+				acq.preMin = Infinity
+				acq.preMax = -Infinity
+				if (acq.start !== 'off') log('采样沿启动已 Arm：等待 ' + acq.start + ' 后开始入库（电平 ' + (trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : 'Auto') + '）')
+			}
+			stopScheduled = false
 			sampling = true
 			onChange()
 
@@ -648,6 +715,19 @@
 			return out
 		}
 
+		function acqState() {
+			if (!acq) return null
+			return {
+				start: acq.start,
+				stop: acq.stop,
+				storeEnabled: acq.storeEnabled,
+				startLatched: acq.startLatched,
+				waiting: acq.start !== 'off' && !acq.storeEnabled,
+				preMin: acq.preMin,
+				preMax: acq.preMax,
+			}
+		}
+
 		function state() {
 			return {
 				connected: isConnected(),
@@ -678,6 +758,21 @@
 			pushSamples: pushSamples,
 			ingestProbe: ingestProbe,
 			deviceStreamHz: function () { return deviceStreamHz },
+			// 采样沿触发（start / stop）与触发电平
+			setAcqTriggers: function (startMode, stopMode) {
+				if (!acq || !VIEW) return null
+				VIEW.setAcqStartMode(acq, startMode, sampling)
+				VIEW.setAcqStopMode(acq, stopMode, sampling)
+				return acqState()
+			},
+			setTrigLevel: function (ua) {
+				trigLevelUA = ua == null || !isFinite(ua) ? null : Number(ua)
+			},
+			trigLevel: trigLevel,
+			acqState: acqState,
+			// 长期模式的折叠总览（minimap）
+			minimapData: function () { return folding.getData() },
+			foldingLength: function () { return folding.length },
 			isSampling: function () { return sampling },
 			setRecordMode: setRecordMode,
 			setTargetRateHz: setTargetRateHz,

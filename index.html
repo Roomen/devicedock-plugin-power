@@ -15,6 +15,7 @@
 		<div class="chips">
 			<span class="chip" id="chip-port" data-state="off">port: none</span>
 			<span class="chip" id="chip-sampling" data-state="off">idle</span>
+			<span class="chip" id="chip-trigger" data-state="off">trigger: off</span>
 			<span class="chip" id="chip-gaps">gaps: 0</span>
 			<span class="chip" id="chip-theme">theme: light</span>
 		</div>
@@ -43,7 +44,7 @@
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label for="voltage">Source voltage (mV)</label>
+			<label for="voltage">Source (mV)</label>
 			<input type="number" id="voltage" min="500" max="5000" step="100" value="3300">
 			<button type="button" id="btn-apply-voltage">Apply</button>
 			<button type="button" id="btn-power" aria-pressed="false">DUT on</button>
@@ -55,6 +56,61 @@
 		</div>
 	</section>
 
+	<section class="bar">
+		<div class="group">
+			<label>Y axis</label>
+			<span class="seg">
+				<button type="button" id="btn-ylin" aria-pressed="true">Linear</button>
+				<button type="button" id="btn-ylog" aria-pressed="false">Log</button>
+				<button type="button" id="btn-ysym" aria-pressed="false">Symlog</button>
+			</span>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<label>Show</label>
+			<button type="button" id="btn-env" aria-pressed="true" title="min/max envelope">Envelope</button>
+			<button type="button" id="btn-band" aria-pressed="true" title="mean ±1σ band">mean ±1σ</button>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<label for="trig-mode">Display trigger</label>
+			<select id="trig-mode" aria-label="Display trigger edge">
+				<option value="off">off</option>
+				<option value="rise">rise</option>
+				<option value="fall">fall</option>
+				<option value="either">either</option>
+			</select>
+			<input type="text" id="trig-level" placeholder="auto µA" aria-label="Trigger level in µA" size="8">
+			<label for="trig-pre">pre</label>
+			<select id="trig-pre" aria-label="Pre-trigger position">
+				<option value="0.1">10%</option>
+				<option value="0.25" selected>25%</option>
+				<option value="0.5">50%</option>
+			</select>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<label for="acq-start">Capture trigger</label>
+			<select id="acq-start" aria-label="Capture start edge">
+				<option value="off">start off</option>
+				<option value="rise">start ↑</option>
+				<option value="fall">start ↓</option>
+				<option value="either">start ↕</option>
+			</select>
+			<select id="acq-stop" aria-label="Capture stop edge">
+				<option value="off">stop off</option>
+				<option value="rise">stop ↑</option>
+				<option value="fall">stop ↓</option>
+				<option value="either">stop ↕</option>
+			</select>
+		</div>
+		<div class="sep"></div>
+		<div class="group">
+			<button type="button" id="btn-reset" title="Reset zoom and pan (0)">Reset view</button>
+			<button type="button" id="btn-max" aria-pressed="false" title="Maximize (F)">Maximize</button>
+		</div>
+	</section>
+
 	<main class="body">
 		<section class="panel">
 			<div class="panel-head">
@@ -62,8 +118,11 @@
 				<div class="meta" id="scope-meta">no data</div>
 			</div>
 			<div class="scope-wrap">
-				<canvas id="wave"></canvas>
+				<canvas id="wave" tabindex="0" aria-label="Current waveform. Drag to pan, shift-drag to zoom into a box, drag a cursor line to move it."></canvas>
 				<div class="scope-empty" id="scope-empty">Connect the analyzer and start a capture</div>
+				<div class="minimap-wrap">
+					<canvas id="minimap" aria-label="Session overview"></canvas>
+				</div>
 			</div>
 			<div class="readouts">
 				<div class="readout" data-accent="1">
@@ -81,6 +140,32 @@
 				<div class="readout">
 					<div class="k">Samples kept</div>
 					<div class="v" id="ro-samples">0</div>
+				</div>
+			</div>
+			<div class="cursors" id="cursor-strip">
+				<div class="cur-block">
+					<span class="k">Cursor A</span>
+					<span class="v" id="cur-a">—</span>
+				</div>
+				<div class="cur-block">
+					<span class="k">Cursor B</span>
+					<span class="v" id="cur-b">—</span>
+				</div>
+				<div class="cur-block">
+					<span class="k">Δt (wall / summed)</span>
+					<span class="v" id="cur-dt">—</span>
+				</div>
+				<div class="cur-block">
+					<span class="k">Mean · min / max</span>
+					<span class="v" id="cur-mean">—</span>
+				</div>
+				<div class="cur-block">
+					<span class="k">Charge</span>
+					<span class="v" id="cur-charge">—</span>
+				</div>
+				<div class="cur-block">
+					<span class="k">Energy</span>
+					<span class="v" id="cur-energy">—</span>
 				</div>
 			</div>
 		</section>
@@ -101,12 +186,65 @@
 						<dt>Charge</dt><dd id="st-charge">—</dd>
 						<dt>Power state</dt><dd id="st-power">unknown</dd>
 					</dl>
-					<p class="hint" id="gaps-hint">Gaps come from the host dropping batches or from the device losing samples; time and energy never span a gap.</p>
+					<p class="hint" id="gaps-hint">Gaps come from the host dropping batches, from the device losing samples or from a stalled stream; time and energy never span a gap.</p>
 					<dl class="rows">
 						<dt>Window start</dt><dd id="win-start">0</dd>
 						<dt>Window mean</dt><dd id="win-mean">—</dd>
 						<dt>Window min / max</dt><dd id="win-range">—</dd>
 					</dl>
+				</div>
+			</section>
+
+			<section class="panel">
+				<div class="panel-head">
+					<h2>Analysis</h2>
+					<div class="meta" id="an-meta">—</div>
+				</div>
+				<div class="panel-section">
+					<div class="actions">
+						<label for="an-source">Range</label>
+						<select id="an-source" aria-label="Analysis range">
+							<option value="auto">auto</option>
+							<option value="selection">cursors</option>
+							<option value="window">window</option>
+						</select>
+						<button type="button" id="btn-an-refresh">Recompute</button>
+					</div>
+					<dl class="rows">
+						<dt>Average</dt><dd id="an-avg">—</dd>
+						<dt>Min / max</dt><dd id="an-range">—</dd>
+						<dt>RMS / pp</dt><dd id="an-rms">—</dd>
+						<dt>Low / high level</dt><dd id="an-levels">—</dd>
+						<dt>Period / duty</dt><dd id="an-period">—</dd>
+						<dt>Frequency</dt><dd id="an-freq">—</dd>
+						<dt>Charge per cycle</dt><dd id="an-qcycle">—</dd>
+						<dt>Spikes / segments</dt><dd id="an-events">—</dd>
+						<dt>Gaps in range</dt><dd id="an-gaps" data-warn="0">0</dd>
+					</dl>
+				</div>
+				<div class="panel-section">
+					<div class="actions">
+						<button type="button" id="btn-fft" aria-pressed="false">FFT</button>
+						<button type="button" id="btn-battery" aria-pressed="false">Battery</button>
+						<button type="button" id="btn-cycles" aria-pressed="false">Cycles</button>
+					</div>
+					<div id="an-fft-block" hidden>
+						<div class="meta" id="an-fft-meta">—</div>
+						<ol class="peaks" id="an-fft"></ol>
+					</div>
+					<div id="an-battery-block" hidden>
+						<div class="actions">
+							<label for="an-capacity">Capacity (mAh)</label>
+							<input type="number" id="an-capacity" min="1" max="100000" step="10" value="2000">
+						</div>
+						<dl class="rows">
+							<dt>Estimated life</dt><dd id="an-battery">—</dd>
+						</dl>
+					</div>
+					<div id="an-cycles-block" hidden>
+						<div class="meta" id="an-cycles-meta">—</div>
+						<p class="hint">The overlay is drawn in the waveform corner while Cycles is on.</p>
+					</div>
 				</div>
 			</section>
 
@@ -167,10 +305,12 @@
 
 	<script src="sdk/devicedock-plugin.js"></script>
 	<script src="js/power-protocol.js"></script>
+	<script src="js/power-view.js"></script>
 	<script src="js/power-lane.js"></script>
 	<script src="js/power-analysis.js"></script>
 	<script src="js/power-store.js"></script>
 	<script src="js/power-wave.js"></script>
+	<script src="js/power-panels.js"></script>
 	<script src="js/power-claim.js"></script>
 	<script src="js/power-control.js"></script>
 	<script src="js/power-export.js"></script>

@@ -339,6 +339,68 @@ test('原始流 100 kHz + 目标 1 kHz：重采样后入库，不存 100 倍数�
 	assert.ok(Math.abs(h.control.getSamplePeriodSec() - 0.001) < 1e-6, '周期按输出速率：' + h.control.getSamplePeriodSec())
 })
 
+test('采样沿启动：命中启动沿之前不入库，命中后开闸', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('rise', 'off')
+	await h.control.startSampling()
+	assert.equal(h.control.acqState().waiting, true, 'Arm 后先等沿')
+	// 设备满速 100 kHz、目标 1 kHz：每 100 个原始点出 1 个入库点
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	// 低电平：只累计 pre-range，不入库
+	assert.equal(feed(10, 300), 0, '等沿期间不入库')
+	assert.equal(h.control.acqState().preMin, 10)
+	assert.equal(h.wave.pushed, 0)
+	// 高电平：命中上升沿后开始入库
+	const stored = feed(100, 300)
+	assert.ok(stored > 0, '命中启动沿后入库：' + stored)
+	assert.equal(h.control.acqState().storeEnabled, true)
+	assert.equal(h.control.acqState().startLatched, true)
+	assert.ok(h.wave.pushed > 0)
+})
+
+test('采样沿停止：命中停沿后自动停采（异步发 STOP，不在入库路径里 await）', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startSampling()
+	h.state.writes.length = 0
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300) // 高：seed 成 high
+	assert.equal(h.control.isSampling(), true)
+	feed(0, 300) // 低：命中下降沿 → 排队停采
+	// 停采是异步的（requestStop → setTimeout → stopSampling → 写 STOP），多等几拍
+	for (let i = 0; i < 20 && h.control.isSampling(); i++) await new Promise(function (r) { setTimeout(r, 5) })
+	await new Promise(function (r) { setTimeout(r, 20) })
+	assert.equal(h.control.isSampling(), false, '停沿后应停止采样')
+	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), '发了 AVERAGE_STOP')
+})
+
+test('长期模式：仍然维护折叠总览（minimap），但不进波形环', async () => {
+	const h = await connected()
+	h.control.setRecordMode('long')
+	h.control.ingest(1000, 100)
+	h.control.ingest(2000, 300)
+	assert.equal(h.wave.pushed, 0, '长期模式不进波形环')
+	assert.ok(h.control.foldingLength() > 0, '折叠总览有数据')
+	const data = h.control.minimapData()
+	assert.ok(data.length >= 2, '总览点：' + data.length)
+	assert.ok(data.every((d) => isFinite(d.x) && isFinite(d.y)))
+	// 清空会话时总览也清掉
+	h.control.clearSessionState()
+	assert.equal(h.control.foldingLength(), 0)
+})
+
 test('电压在采样中改变：摘要标出这一点', async () => {
 	const h = await connected()
 	await h.control.startSampling()

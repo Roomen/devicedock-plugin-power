@@ -1,10 +1,13 @@
 // 功耗分析插件的界面接线：所有能力都走宿主 RPC（device.read / serial.claim / app / log）。
 // 设备字符串（口名 / 产品名 / 序列号 / metadata 文本）一律 textContent，不拼 HTML。
+// 几何与映射全部来自 js/power-view.js，统计来自 js/power-panels.js —— 这里只负责画和收事件。
 ;(function () {
 	'use strict'
 
 	const sdk = window.DeviceDockPlugin
 	const PROTO = window.PowerProtocol
+	const View = window.PowerView
+	const Panels = window.PowerPanels
 	const WaveMod = window.PowerWave
 	const StoreMod = window.PowerMemoryStore
 	const Claim = window.PowerClaim
@@ -13,6 +16,9 @@
 
 	const $ = function (id) { return document.getElementById(id) }
 	const MIB = 1024 * 1024
+	const fmt = Panels
+	const C = View.C
+
 	const DEFAULT_SETTINGS = {
 		recordMode: 'wave',
 		rateHz: 1000,
@@ -21,6 +27,12 @@
 		ramMiB: 32,
 		capMiB: 512,
 		viewSec: 10,
+		yMode: 'linear',
+		showEnvelope: true,
+		showBand: true,
+		trigPre: 0.25,
+		anSource: 'auto',
+		capacityMah: 2000,
 	}
 	let settings = Object.assign({}, DEFAULT_SETTINGS)
 	let saveTimer = 0
@@ -35,53 +47,23 @@
 	let rafId = 0
 	let readoutTimer = 0
 	let viewStatsCache = null
+	let laneTrack = null
+	let stall = null
+
+	// ---- 视图与显示状态（会话级，不落盘的部分只影响本次看波形） ----
+	const view = { xZoom: 1, xOffset: 0, live: true, yMode: 'linear', yZoom: 1, yPan: 0, cursorA: null, cursorB: null }
+	const show = { envelope: true, band: true, cycles: false, fft: false, battery: false }
+	const trigUI = { mode: 'off', levelAuto: true, levelUA: null, preFrac: 0.25 }
+	const trig = View.createScopeTrigger()
+	let trigScanFrom = null
+	let trigUserOverride = false
+	const analysis = { source: 'auto', pack: null, key: '', timer: 0 }
+	let edgeCache = { key: '', edges: null }
+	let drag = null
+	let plotRect = { x: 0, y: 0, w: 1, h: 1 }
+	let marginLeft = 56
 
 	// ---------- 小工具 ----------
-	function fmtCurrent(ua) {
-		const a = Math.abs(ua)
-		if (!isFinite(ua)) return '—'
-		if (a >= 1e6) return (ua / 1e6).toFixed(3) + ' A'
-		if (a >= 1e3) return (ua / 1e3).toFixed(3) + ' mA'
-		if (a >= 1) return ua.toFixed(2) + ' µA'
-		if (a === 0) return '0 µA'
-		return ua.toFixed(3) + ' µA'
-	}
-	function fmtPower(uw) {
-		if (!isFinite(uw)) return '—'
-		const a = Math.abs(uw)
-		if (a >= 1e6) return (uw / 1e6).toFixed(3) + ' W'
-		if (a >= 1e3) return (uw / 1e3).toFixed(2) + ' mW'
-		return uw.toFixed(1) + ' µW'
-	}
-	function fmtCharge(uc) {
-		if (!isFinite(uc)) return '—'
-		const a = Math.abs(uc)
-		if (a >= 1e6) return (uc / 1e6).toFixed(3) + ' C'
-		if (a >= 1e3) return (uc / 1e3).toFixed(3) + ' mC'
-		return uc.toFixed(2) + ' µC'
-	}
-	function fmtEnergy(uwh) {
-		if (!isFinite(uwh)) return '—'
-		const a = Math.abs(uwh)
-		if (a >= 1e6) return (uwh / 1e6).toFixed(3) + ' Wh'
-		if (a >= 1e3) return (uwh / 1e3).toFixed(3) + ' mWh'
-		return uwh.toFixed(1) + ' µWh'
-	}
-	function fmtDuration(sec) {
-		if (!isFinite(sec) || sec <= 0) return '0 s'
-		if (sec < 1) return (sec * 1000).toFixed(0) + ' ms'
-		if (sec < 60) return sec.toFixed(2) + ' s'
-		const m = Math.floor(sec / 60)
-		const s = sec - m * 60
-		if (m < 60) return m + ' min ' + s.toFixed(0) + ' s'
-		return Math.floor(m / 60) + ' h ' + (m % 60) + ' min'
-	}
-	function fmtBytes(n) {
-		const a = Math.abs(n || 0)
-		if (a >= MIB) return (n / MIB).toFixed(1) + ' MiB'
-		if (a >= 1024) return (n / 1024).toFixed(1) + ' KiB'
-		return (n || 0) + ' B'
-	}
 	function fmtCount(n) {
 		return (n || 0).toLocaleString('en-US')
 	}
@@ -89,8 +71,19 @@
 		const el = $(id)
 		if (el) el.textContent = text
 	}
+	function fmtBytes(n) {
+		const a = Math.abs(n || 0)
+		if (a >= MIB) return (n / MIB).toFixed(1) + ' MiB'
+		if (a >= 1024) return (n / 1024).toFixed(1) + ' KiB'
+		return (n || 0) + ' B'
+	}
+	function fmtTime(sec) {
+		if (!isFinite(sec)) return '—'
+		if (Math.abs(sec) >= 60) return fmt.fmtDuration(Math.abs(sec))
+		return sec.toFixed(3) + ' s'
+	}
 
-	// 宿主日志（能力 log）：只在关键节点写，别把插件自己的每一条都推给宿主
+	// 宿主日志（能力 log）：只在关键节点写
 	function hostLog(text) {
 		try {
 			sdk.log.write(text).catch(function () { /* 宿主日志不可用不影响功能 */ })
@@ -128,8 +121,16 @@
 		if (isFinite(ram) && ram >= 8 && ram <= 1024) out.ramMiB = Math.round(ram)
 		const cap = Number(raw.capMiB)
 		if (isFinite(cap) && cap >= 16 && cap <= 4096) out.capMiB = Math.round(cap)
-		const view = Number(raw.viewSec)
-		if (isFinite(view) && view > 0) out.viewSec = view
+		const vs = Number(raw.viewSec)
+		if (isFinite(vs) && vs > 0) out.viewSec = vs
+		if (raw.yMode === 'linear' || raw.yMode === 'log' || raw.yMode === 'symlog') out.yMode = raw.yMode
+		if (typeof raw.showEnvelope === 'boolean') out.showEnvelope = raw.showEnvelope
+		if (typeof raw.showBand === 'boolean') out.showBand = raw.showBand
+		const pre = Number(raw.trigPre)
+		if (pre === 0.1 || pre === 0.25 || pre === 0.5) out.trigPre = pre
+		if (raw.anSource === 'auto' || raw.anSource === 'selection' || raw.anSource === 'window') out.anSource = raw.anSource
+		const cap2 = Number(raw.capacityMah)
+		if (isFinite(cap2) && cap2 > 0) out.capacityMah = cap2
 		return out
 	}
 
@@ -137,14 +138,21 @@
 		if (saveTimer) clearTimeout(saveTimer)
 		saveTimer = setTimeout(function () {
 			saveTimer = 0
-			// 单值上限 64 KiB：这里只是几十字节的配置，序列化一次即可
 			sdk.app.storageSet('settings', settings).catch(function (e) {
 				log('保存设置失败：' + (e && e.message ? e.message : e), 'warn')
 			})
 		}, 400)
 	}
 
-	// ---------- 波形 / 存储 / 链路 / 控制 ----------
+	function syncViewFromSettings() {
+		view.yMode = settings.yMode
+		show.envelope = settings.showEnvelope
+		show.band = settings.showBand
+		trigUI.preFrac = settings.trigPre
+		analysis.source = settings.anSource
+	}
+
+	// ---------- 管线 ----------
 	function createPipeline() {
 		store = StoreMod.createMemoryWaveStore({
 			capRawBytes: settings.capMiB * MIB,
@@ -155,7 +163,6 @@
 			store: store,
 			chunkSize: 65536,
 			ramCapSamples: Math.max(65536, Math.round((settings.ramMiB * MIB) / 4)),
-			// 块索引的元数据预算 = 热区 + 32 MiB（要装得下热区预留的那一份）；超了才是停采
 			metaBudgetBytes: settings.ramMiB * MIB + 32 * MIB,
 			voltage: function () {
 				const st = control ? control.state() : null
@@ -166,7 +173,6 @@
 			scheduleUI: scheduleDraw,
 			onStorageStop: function (reason) {
 				log(reason, 'error')
-				// 存储触顶：停采（busy 源随之释放）
 				if (control && control.isSampling()) stopCapture('storage')
 			},
 		})
@@ -189,7 +195,6 @@
 			},
 			onState: function () { renderConnState() },
 			onLog: log,
-			// metadata（0x19）回的是文本，不能按样点解析
 			onBytes: function (bytes) {
 				if (!control || !control.isMetaCollecting()) return false
 				let text = ''
@@ -227,15 +232,62 @@
 		})
 	}
 
-	let laneTrack = null
 	if (window.PowerSerialLane && typeof window.PowerSerialLane.createAnchorTrack === 'function') {
 		laneTrack = window.PowerSerialLane.createAnchorTrack({ intervalMs: 200, gapMs: 20 })
 	}
 
-	// 样点批次（回调外异步来）：测量设备速率 → 重采样到目标速率 → 入库
+	// ---------- 数据到达 ----------
 	function onSamples(list, at, meta) {
 		if (!control) return
 		control.pushSamples(list, at, meta)
+		if (stall) stall.note()
+		scanTriggers()
+		scheduleDraw()
+	}
+
+	/**
+	 * 显示触发扫描：只扫上一批之后的新点。命中后退出 Live 并把触发点钉在 pre 位置。
+	 * 用户主动平移 / 缩放后暂停钉住（trigUserOverride），直到下一次新沿。
+	 */
+	function scanTriggers() {
+		if (trigUI.mode === 'off' || !wave || !control || control.state().recordMode !== 'wave') return
+		const total = wave.total()
+		if (total < 8) return
+		const from = trigScanFrom == null ? Math.max(1, total - 20000) : Math.max(1, trigScanFrom + 1)
+		trigScanFrom = total - 1
+		if (from >= total) return
+		const win = Math.min(total, 4000)
+		const st = wave.stats(total - win, total)
+		const thr = trigUI.levelAuto ? View.autoTrigLevel({ min: st.minI, max: st.maxI }) : trigUI.levelUA
+		const hyst = View.trigHysteresis({ min: st.minI, max: st.maxI }, thr)
+		const res = View.scanScopeTrigger(trig, {
+			mode: trigUI.mode,
+			total: total,
+			from: from,
+			to: total - 1,
+			sampleAt: function (i) { return wave.iAt(i) },
+			thr: thr,
+			hyst: hyst,
+			viewPts: View.viewPoints(total, view.xZoom),
+		})
+		updateTriggerChip(thr)
+		if (res.fired != null) {
+			view.live = false
+			trigUserOverride = false
+		}
+	}
+
+	function updateTriggerChip(thr) {
+		const chip = $('chip-trigger')
+		if (!chip) return
+		if (trigUI.mode === 'off') {
+			chip.dataset.state = 'off'
+			chip.textContent = 'trigger: off'
+			return
+		}
+		const lvl = trigUI.levelAuto ? fmt.fmtCurrent(thr == null ? 0 : thr) : fmt.fmtCurrent(trigUI.levelUA)
+		chip.dataset.state = trig.lockLi == null ? 'warn' : 'busy'
+		chip.textContent = 'trigger: ' + trigUI.mode + ' @ ' + lvl
 	}
 
 	// ---------- 端口 ----------
@@ -303,6 +355,7 @@
 				if (control.isSampling()) await control.stopCapture()
 				await link.close()
 				releaseBusy()
+				if (stall) stall.stop()
 				log('串口已释放')
 				hostLog('released the analyzer port')
 			} else {
@@ -316,7 +369,6 @@
 				const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : key
 				log('已独占占用串口（mode=exclusive）', 'success')
 				hostLog('claimed ' + label + ' exclusively')
-				// 先读设备修正参数（R/O/VDD），再探测 DUT 是否带电
 				const ok = await control.fetchModifiers()
 				if (ok) {
 					const mv = control.readVoltageMv()
@@ -360,13 +412,19 @@
 
 	async function startCapture() {
 		if (!link.isOpen()) return
-		// 采样期间挡住应用更新：插件正在持有串口与内存里的数据
 		await acquireBusy()
 		try {
 			const r = await control.startCapture()
 			if (r && r.ok) {
 				const st = control.state()
 				hostLog('capture started at ' + fmtCount(st.targetRateHz) + ' Hz (' + (st.recordMode === 'wave' ? 'waveform' : 'long stats') + ')')
+				// 新一轮采集：触发扫描与视图从 Live 重新开始
+				View.resetScopeTrigger(trig)
+				trigScanFrom = null
+				trigUserOverride = false
+				view.live = true
+				view.xOffset = 0
+				if (stall) stall.start()
 			}
 			if (!r || !r.ok) {
 				log('开始采样失败：' + ((r && r.message) || '未知原因'), 'error')
@@ -390,6 +448,7 @@
 			log('停止采样异常：' + (e && e.message ? e.message : e), 'error')
 		} finally {
 			releaseBusy()
+			if (stall) stall.stop()
 			if (reason === 'storage') log('因存储上限已停止采样', 'warn')
 			const s = control.captureSummary()
 			hostLog('capture stopped: ' + fmtCount(s.totalSamples) + ' samples, ' + s.gaps + ' gap(s)')
@@ -409,6 +468,521 @@
 		chip.textContent = sampling ? 'capturing' : 'idle'
 	}
 
+	// ---------- 视口 ----------
+	function totalSamples() {
+		if (!wave) return 0
+		if (control && control.state().recordMode === 'long') return 0
+		return wave.total()
+	}
+
+	function currentRange() {
+		const total = totalSamples()
+		if (total < 2) return { start: 0, end: 0, count: 0, viewPts: 0, xOffset: 0 }
+		return View.viewRange({
+			total: total,
+			xZoom: view.xZoom,
+			xOffset: view.xOffset,
+			live: view.live,
+			trigLockLi: (trigUI.mode !== 'off' && !trigUserOverride) ? trig.lockLi : null,
+			trigPosFrac: trigUI.preFrac,
+			periodSec: control ? control.getSamplePeriodSec() : 0,
+		})
+	}
+
+	function applyRangeState(r) {
+		if (r && typeof r.xOffset === 'number') view.xOffset = r.xOffset
+	}
+
+	function resetView() {
+		view.xZoom = 1
+		view.xOffset = 0
+		view.live = true
+		view.yZoom = 1
+		view.yPan = 0
+		trigUserOverride = false
+		viewStatsCache = null
+		scheduleDraw()
+		renderSessionPanel()
+		log('视图已复位（Live / 缩放 1× / Y 1×）')
+	}
+
+	function markUserView() {
+		view.live = false
+		if (trigUI.mode !== 'off') trigUserOverride = true
+	}
+
+	// ---------- 画布 ----------
+	function cssVar(name, fallback) {
+		const v = getComputedStyle(document.documentElement).getPropertyValue(name)
+		return (v && v.trim()) || fallback
+	}
+
+	function canvasLayout(cv) {
+		const dpr = window.devicePixelRatio || 1
+		const w = Math.max(1, cv.clientWidth)
+		const h = Math.max(1, cv.clientHeight)
+		if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+			cv.width = Math.round(w * dpr)
+			cv.height = Math.round(h * dpr)
+		}
+		const g = cv.getContext('2d')
+		if (g) g.setTransform(dpr, 0, 0, dpr, 0, 0)
+		return { g: g, w: w, h: h }
+	}
+
+	function drawWave() {
+		const cv = $('wave')
+		if (!cv || !wave) return
+		const lat = canvasLayout(cv)
+		const g = lat.g
+		if (!g) return
+		const w = lat.w
+		const h = lat.h
+		const colBg = cssVar('--bg-sunken', '#eef1f5')
+		const colGrid = cssVar('--border-light', 'rgba(17,24,39,0.07)')
+		const colTrace = cssVar('--accent', '#1f5fbf')
+		const colBand = cssVar('--accent-light', 'rgba(31,95,191,0.08)')
+		const colText = cssVar('--text-muted', '#6b7487')
+		const colGap = cssVar('--warning', '#b45309')
+		const colBorder = cssVar('--border-color', 'rgba(17,24,39,0.12)')
+
+		g.clearRect(0, 0, w, h)
+		g.fillStyle = colBg
+		g.fillRect(0, 0, w, h)
+
+		marginLeft = 56
+		const mTop = 6
+		const mBottom = 18
+		plotRect = { x: marginLeft, y: mTop, w: Math.max(1, w - marginLeft - 8), h: Math.max(1, h - mTop - mBottom) }
+
+		const total = totalSamples()
+		const longMode = control && control.state().recordMode === 'long'
+		if (total < 2) {
+			g.fillStyle = colText
+			g.font = '12px ' + cssVar('--font-sans', 'sans-serif')
+			g.textBaseline = 'middle'
+			g.fillText(longMode ? 'Long stats mode: no waveform (see the minimap below)' : 'No samples yet', marginLeft + 8, h / 2)
+			drawMinimap()
+			return
+		}
+		const range = currentRange()
+		applyRangeState(range)
+		const span = Math.max(1, range.count - 1)
+		const period = control ? control.getSamplePeriodSec() : 0
+		// 视窗统计由 renderSessionPanel 每 400 ms 算一次并缓存；画布每帧只读缓存
+		const stats = (viewStatsCache && viewStatsCache.start === range.start && viewStatsCache.end === range.end)
+			? viewStatsCache.stats
+			: wave.stats(range.start, range.end + 1)
+		const yScale = View.buildYScale({
+			mode: view.yMode,
+			yMin: stats.minI,
+			yMax: stats.maxI,
+			minPositive: wave.minPositiveIn ? wave.minPositiveIn(range.start, range.end + 1) : stats.minI,
+			yZoom: view.yZoom,
+			yPan: view.yPan,
+		})
+		const xOf = function (li) { return plotRect.x + View.indexToPixel(li, range, plotRect.w) }
+		const yOf = function (v) { return plotRect.y + yScale.toPixel(v, plotRect.h) }
+		const clipToPlot = function () {
+			g.beginPath()
+			g.rect(plotRect.x, plotRect.y, plotRect.w, plotRect.h)
+			g.clip()
+		}
+
+		// ---- 网格与 Y 刻度 ----
+		g.strokeStyle = colGrid
+		g.lineWidth = 1
+		const yTicks = yScale.ticks.major.filter(function (v) { return isFinite(v) })
+		const shownY = []
+		for (let i = 0; i < yTicks.length; i++) {
+			const y = yOf(yTicks[i])
+			if (y < plotRect.y - 1 || y > plotRect.y + plotRect.h + 1) continue
+			shownY.push({ v: yTicks[i], y: y })
+			g.beginPath()
+			g.moveTo(plotRect.x, Math.round(y) + 0.5)
+			g.lineTo(plotRect.x + plotRect.w, Math.round(y) + 0.5)
+			g.stroke()
+		}
+		// 淡线（log 的 3,4,6,7,8,9 与 symlog 外侧）
+		g.strokeStyle = colGrid
+		const faint = yScale.ticks.faint
+		for (let i = 0; i < faint.length; i++) {
+			const y = yOf(faint[i])
+			if (y < plotRect.y - 1 || y > plotRect.y + plotRect.h + 1) continue
+			g.beginPath()
+			g.moveTo(plotRect.x, Math.round(y) + 0.5)
+			g.lineTo(plotRect.x + plotRect.w, Math.round(y) + 0.5)
+			g.stroke()
+		}
+		// 边框
+		g.strokeStyle = colBorder
+		g.strokeRect(plotRect.x + 0.5, plotRect.y + 0.5, plotRect.w - 1, plotRect.h - 1)
+
+		// ---- 波形 ----
+		const bs = wave.computeBucketSize(range.count, Math.max(1, Math.floor(plotRect.w)))
+		wave.frameReset()
+		const first = Math.floor(range.start / bs)
+		const last = Math.floor(range.end / bs)
+		const entries = []
+		for (let bi = first; bi <= last; bi++) {
+			const e = wave.bucketEntry(bi, bs, 0, range.end)
+			if (!e) continue
+			entries.push(e)
+		}
+		g.save()
+		clipToPlot()
+		// 包络：每个桶的 min/max 竖线（列）
+		if (show.envelope) {
+			g.strokeStyle = colTrace
+			g.globalAlpha = 0.45
+			g.lineWidth = 1
+			g.beginPath()
+			for (let i = 0; i < entries.length; i++) {
+				const e = entries[i]
+				const x = Math.round(xOf(e.loAbs)) + 0.5
+				const yTop = yOf(e.max)
+				const yBot = yOf(e.min)
+				g.moveTo(x, yTop)
+				g.lineTo(x, Math.max(yBot, yTop + 1))
+			}
+			g.stroke()
+			g.globalAlpha = 1
+		}
+		// 均值 ±1σ 带
+		if (show.band) {
+			g.fillStyle = colBand
+			for (let i = 0; i < entries.length; i++) {
+				const e = entries[i]
+				const x = xOf(e.loAbs)
+				const wpx = Math.max(1, xOf(e.hiAbs) - x)
+				const hi = yOf(e.mean + e.sd)
+				const lo = yOf(e.mean - e.sd)
+				g.fillRect(x, hi, wpx, Math.max(1, lo - hi))
+			}
+		}
+		// 均值折线
+		g.strokeStyle = colTrace
+		g.lineWidth = 1.25
+		g.beginPath()
+		for (let i = 0; i < entries.length; i++) {
+			const e = entries[i]
+			const x = xOf(e.loAbs)
+			const y = yOf(e.mean)
+			if (i === 0) g.moveTo(x, y)
+			else g.lineTo(x, y)
+		}
+		g.stroke()
+
+		// 缺口：竖线 + 顶部短刻度（缺口处数据不连续，绝不能画成连续线）
+		const gaps = wave.gaps()
+		g.strokeStyle = colGap
+		g.lineWidth = 1
+		g.beginPath()
+		for (let i = 0; i < gaps.length; i++) {
+			const gi = gaps[i]
+			if (gi < range.start || gi > range.end) continue
+			const x = Math.round(xOf(gi)) + 0.5
+			g.moveTo(x, plotRect.y)
+			g.lineTo(x, plotRect.y + plotRect.h)
+		}
+		g.stroke()
+		g.fillStyle = colGap
+		for (let i = 0; i < gaps.length; i++) {
+			const gi = gaps[i]
+			if (gi < range.start || gi > range.end) continue
+			g.fillRect(Math.round(xOf(gi)) - 1, plotRect.y, 3, 4)
+		}
+
+		// 选择区（两游标之间）
+		const sel = View.selection(view.cursorA, view.cursorB, total)
+		if (sel) {
+			const x0 = xOf(sel.a)
+			const x1 = xOf(sel.b)
+			g.fillStyle = colBand
+			g.fillRect(x0, plotRect.y, Math.max(1, x1 - x0), plotRect.h)
+		}
+		g.restore()
+
+		// 游标线
+		const drawCursor = function (li, label) {
+			if (li == null) return
+			const x = xOf(li)
+			if (x < plotRect.x - 1 || x > plotRect.x + plotRect.w + 1) return
+			g.strokeStyle = colText
+			g.lineWidth = 1
+			g.setLineDash([4, 3])
+			g.beginPath()
+			g.moveTo(Math.round(x) + 0.5, plotRect.y)
+			g.lineTo(Math.round(x) + 0.5, plotRect.y + plotRect.h)
+			g.stroke()
+			g.setLineDash([])
+			g.fillStyle = colText
+			g.font = '10px ' + cssVar('--font-mono', 'monospace')
+			g.textBaseline = 'top'
+			g.fillText(label, Math.round(x) + 3, plotRect.y + 2)
+		}
+		drawCursor(view.cursorA, 'A')
+		drawCursor(view.cursorB, 'B')
+
+		// 触发点标记
+		if (trigUI.mode !== 'off' && trig.lockLi != null && !trigUserOverride) {
+			const x = xOf(trig.lockLi)
+			if (x >= plotRect.x && x <= plotRect.x + plotRect.w) {
+				g.fillStyle = colTrace
+				g.beginPath()
+				g.moveTo(x - 4, plotRect.y)
+				g.lineTo(x + 4, plotRect.y)
+				g.lineTo(x, plotRect.y + 7)
+				g.closePath()
+				g.fill()
+			}
+		}
+
+		// 框选中的橡皮筋
+		if (drag && drag.kind === 'box' && drag.current != null) {
+			const x0 = xOf(drag.anchor)
+			const x1 = xOf(drag.current)
+			g.fillStyle = colBand
+			g.fillRect(Math.min(x0, x1), plotRect.y, Math.abs(x1 - x0), plotRect.h)
+			g.strokeStyle = colTrace
+			g.setLineDash([3, 3])
+			g.strokeRect(Math.min(x0, x1) + 0.5, plotRect.y + 0.5, Math.abs(x1 - x0), plotRect.h - 1)
+			g.setLineDash([])
+		}
+
+		// ---- 轴标注 ----
+		g.fillStyle = colText
+		g.font = '10px ' + cssVar('--font-mono', 'monospace')
+		g.textAlign = 'right'
+		g.textBaseline = 'middle'
+		for (let i = 0; i < shownY.length; i++) {
+			g.fillText(fmt.fmtCurrent(shownY[i].v), marginLeft - 6, shownY[i].y)
+		}
+		g.textAlign = 'left'
+		g.textBaseline = 'bottom'
+		g.fillText('+' + fmtTime(span * period), plotRect.x, h - 3)
+		g.textAlign = 'center'
+		g.fillText(fmtTime((span * period) / 2), plotRect.x + plotRect.w / 2, h - 3)
+		g.textAlign = 'right'
+		g.fillText('0', plotRect.x + plotRect.w, h - 3)
+		g.textAlign = 'left'
+		g.textBaseline = 'top'
+		const modeLabel = 'Y ' + view.yMode + (view.yZoom !== 1 ? ' ×' + view.yZoom.toFixed(1) : '') +
+			' · X ' + view.xZoom.toFixed(view.xZoom < 1 ? 3 : 1) + '×' + (view.live ? ' · Live' : '') +
+			(trig.lockLi != null && !trigUserOverride && trigUI.mode !== 'off' ? ' · trig ' + trigUI.mode : '')
+		g.fillText(modeLabel, marginLeft + 4, plotRect.y + 2)
+
+		// ---- 周期叠画（右下角内嵌） ----
+		if (show.cycles && analysis.pack && analysis.pack.cycles && analysis.pack.cycles.cycles.length) {
+			drawCycleInset(g, analysis.pack.cycles, colTrace, colBand, colText, colBorder)
+		}
+
+		drawMinimap()
+	}
+
+	function drawCycleInset(g, cycles, colTrace, colBand, colText, colBorder) {
+		const n = cycles.cycles.length
+		const pts = cycles.periodPts
+		if (!n || !pts) return
+		const w = Math.min(230, Math.max(120, plotRect.w * 0.3))
+		const h = Math.min(110, Math.max(64, plotRect.h * 0.34))
+		const x0 = plotRect.x + plotRect.w - w - 8
+		const y0 = plotRect.y + plotRect.h - h - 8
+		let lo = Infinity
+		let hi = -Infinity
+		for (let c = 0; c < n; c++) {
+			const arr = cycles.cycles[c]
+			for (let i = 0; i < arr.length; i++) {
+				if (arr[i] < lo) lo = arr[i]
+				if (arr[i] > hi) hi = arr[i]
+			}
+		}
+		if (!(hi > lo)) return
+		const pad = (hi - lo) * 0.1 || 1
+		lo -= pad
+		hi += pad
+		const yOf = function (v) { return y0 + h - ((v - lo) / (hi - lo)) * h }
+		const xOf = function (i) { return x0 + (i / Math.max(1, pts - 1)) * w }
+		g.fillStyle = colBand
+		g.fillRect(x0, y0, w, h)
+		g.strokeStyle = colBorder
+		g.lineWidth = 1
+		g.strokeRect(x0 + 0.5, y0 + 0.5, w - 1, h - 1)
+		g.strokeStyle = colTrace
+		g.globalAlpha = 0.32
+		for (let c = 0; c < n; c++) {
+			const arr = cycles.cycles[c]
+			g.beginPath()
+			for (let i = 0; i < arr.length; i++) {
+				const x = xOf(i)
+				const y = yOf(arr[i])
+				if (i === 0) g.moveTo(x, y)
+				else g.lineTo(x, y)
+			}
+			g.stroke()
+		}
+		g.globalAlpha = 1
+		g.strokeStyle = colTrace
+		g.lineWidth = 1.5
+		g.beginPath()
+		const mean = cycles.mean
+		for (let i = 0; i < mean.length; i++) {
+			const x = xOf(i)
+			const y = yOf(mean[i])
+			if (i === 0) g.moveTo(x, y)
+			else g.lineTo(x, y)
+		}
+		g.stroke()
+		g.fillStyle = colText
+		g.font = '10px ' + cssVar('--font-mono', 'monospace')
+		g.textBaseline = 'top'
+		g.textAlign = 'left'
+		g.fillText(n + ' cycles × ' + pts + ' pts', x0 + 4, y0 + 3)
+		g.textAlign = 'right'
+		g.textBaseline = 'bottom'
+		g.fillText(fmt.fmtCurrent(hi) + ' / ' + fmt.fmtCurrent(lo), x0 + w - 4, y0 + h - 3)
+	}
+
+	/** 总览条：波形模式用分桶包络，长期模式用 FoldingBuffer 的点 */
+	function drawMinimap() {
+		const cv = $('minimap')
+		if (!cv || !wave || !control) return
+		const lat = canvasLayout(cv)
+		const g = lat.g
+		if (!g) return
+		const w = lat.w
+		const h = lat.h
+		const colBg = cssVar('--bg-surface', '#ffffff')
+		const colTrace = cssVar('--accent', '#1f5fbf')
+		const colBand = cssVar('--accent-light', 'rgba(31,95,191,0.08)')
+		const colText = cssVar('--text-muted', '#6b7487')
+		const colBorder = cssVar('--border-color', 'rgba(17,24,39,0.12)')
+		g.clearRect(0, 0, w, h)
+		g.fillStyle = colBg
+		g.fillRect(0, 0, w, h)
+		const longMode = control.state().recordMode === 'long'
+		const total = longMode ? 0 : wave.total()
+		if (longMode) {
+			const data = control.minimapData()
+			if (data.length < 2) {
+				g.fillStyle = colText
+				g.font = '10px ' + cssVar('--font-sans', 'sans-serif')
+				g.textBaseline = 'middle'
+				g.textAlign = 'center'
+				g.fillText('No long-run overview yet', w / 2, h / 2)
+				return
+			}
+			let xMin = data[0].x
+			let xMax = data[0].x
+			let yMin = data[0].y
+			let yMax = data[0].y
+			for (let i = 1; i < data.length; i++) {
+				if (data[i].x < xMin) xMin = data[i].x
+				if (data[i].x > xMax) xMax = data[i].x
+				if (data[i].y < yMin) yMin = data[i].y
+				if (data[i].y > yMax) yMax = data[i].y
+			}
+			if (!(xMax > xMin)) xMax = xMin + 1
+			if (!(yMax > yMin)) yMax = yMin + 1
+			g.strokeStyle = colTrace
+			g.globalAlpha = 0.85
+			g.lineWidth = 1
+			g.beginPath()
+			for (let i = 0; i < data.length; i++) {
+				const x = ((data[i].x - xMin) / (xMax - xMin)) * (w - 1)
+				const y = h - 2 - ((data[i].y - yMin) / (yMax - yMin)) * (h - 4)
+				if (i === 0) g.moveTo(x, y)
+				else g.lineTo(x, y)
+			}
+			g.stroke()
+			g.globalAlpha = 1
+			g.fillStyle = colText
+			g.font = '10px ' + cssVar('--font-mono', 'monospace')
+			g.textBaseline = 'top'
+			g.textAlign = 'left'
+			g.fillText('long stats · ' + fmtCount(control.longStats().n) + ' samples', 6, 3)
+			return
+		}
+		if (total < 2) {
+			g.fillStyle = colText
+			g.font = '10px ' + cssVar('--font-sans', 'sans-serif')
+			g.textBaseline = 'middle'
+			g.textAlign = 'center'
+			g.fillText('Minimap', w / 2, h / 2)
+			return
+		}
+		const bs = wave.computeBucketSize(total, Math.max(1, Math.floor(w)))
+		const lastBucket = Math.floor((total - 1) / bs)
+		let lo = Infinity
+		let hi = -Infinity
+		const cols = []
+		for (let bi = 0; bi <= lastBucket; bi++) {
+			const e = wave.bucketEntry(bi, bs, 0, total - 1)
+			if (!e) continue
+			cols.push(e)
+			if (e.min < lo) lo = e.min
+			if (e.max > hi) hi = e.max
+		}
+		if (!cols.length || !(hi >= lo)) {
+			g.fillStyle = colText
+			g.textAlign = 'center'
+			g.textBaseline = 'middle'
+			g.font = '10px ' + cssVar('--font-sans', 'sans-serif')
+			g.fillText('Minimap', w / 2, h / 2)
+			return
+		}
+		const pad = (hi - lo) * 0.08 || 1
+		lo -= pad
+		hi += pad
+		const yOf = function (v) { return h - 2 - ((v - lo) / (hi - lo)) * (h - 4) }
+		g.strokeStyle = colTrace
+		g.globalAlpha = 0.8
+		g.lineWidth = 1
+		g.beginPath()
+		for (let i = 0; i < cols.length; i++) {
+			const e = cols[i]
+			const x = (e.loAbs / Math.max(1, total - 1)) * (w - 1)
+			g.moveTo(x, yOf(e.max))
+			g.lineTo(x, yOf(e.min))
+		}
+		g.stroke()
+		g.globalAlpha = 1
+		// 视口框
+		const range = currentRange()
+		const rect = View.minimapViewRect({ width: w, total: total, range: range })
+		g.fillStyle = colBand
+		g.fillRect(rect.x0, 0, rect.w, h)
+		g.strokeStyle = colTrace
+		g.strokeRect(rect.x0 + 0.5, 0.5, rect.w, h - 1)
+		g.fillStyle = colText
+		g.font = '10px ' + cssVar('--font-mono', 'monospace')
+		g.textBaseline = 'top'
+		g.textAlign = 'left'
+		g.fillText('session · ' + fmtCount(total) + ' samples', 6, 3)
+		g.textAlign = 'right'
+		g.fillText(fmtBytes(store.getRawUsed()) + ' cold', w - 6, 3)
+		void colBorder
+	}
+
+	function scheduleDraw() {
+		if (drawQueued) return
+		drawQueued = true
+		requestAnimationFrame(function () {
+			drawQueued = false
+			drawWave()
+		})
+	}
+
+	function startDrawLoop() {
+		if (rafId) return
+		const tick = function () {
+			rafId = 0
+			drawWave()
+			if (control && control.isSampling()) rafId = requestAnimationFrame(tick)
+		}
+		rafId = requestAnimationFrame(tick)
+	}
+
 	// ---------- 面板渲染 ----------
 	function updateGapChip() {
 		const gaps = wave ? wave.gaps().length : 0
@@ -424,27 +998,37 @@
 		if (!control) return
 		const st = control.state()
 		const summary = control.captureSummary()
-		setText('st-duration', fmtDuration(summary.durationSec))
+		setText('st-duration', fmt.fmtDuration(summary.durationSec))
 		setText('st-rate', st.targetRateHz > 0 ? fmtCount(st.targetRateHz) + ' Hz' : '—')
 		setText('st-samples', fmtCount(summary.totalSamples) + (summary.retainedSamples !== summary.totalSamples ? ' (' + fmtCount(summary.retainedSamples) + ' kept)' : ''))
-		setText('st-energy', summary.energyUWh == null ? 'n/a' : fmtEnergy(summary.energyUWh))
-		setText('st-charge', fmtCharge(summary.chargeUC))
+		setText('st-energy', summary.energyUWh == null ? 'n/a' : fmt.fmtEnergy(summary.energyUWh))
+		setText('st-charge', fmt.fmtCharge(summary.chargeUC))
 		setText('st-power', st.powered.state === 'on' ? 'on (' + st.powered.source + ')' : (st.powered.state === 'off' ? 'off (' + st.powered.source + ')' : 'unknown'))
 		$('btn-power').setAttribute('aria-pressed', String(st.powered.state === 'on'))
 		$('btn-power').textContent = st.powered.state === 'on' ? 'DUT off' : 'DUT on'
 		updateGapChip()
 		updateSampleButton()
-		if (wave && wave.total() > 0) {
-			const range = currentViewRange()
+
+		const acq = control.acqState()
+		if (acq && acq.waiting) {
+			$('chip-trigger').dataset.state = 'warn'
+			$('chip-trigger').textContent = 'waiting for ' + acq.start + ' edge'
+		}
+
+		const total = totalSamples()
+		if (total > 0) {
+			const range = currentRange()
+			applyRangeState(range)
 			const win = wave.stats(range.start, range.end + 1)
 			viewStatsCache = { start: range.start, end: range.end, stats: win }
 			setText('win-start', fmtCount(range.start))
-			setText('win-mean', fmtCurrent(win.avgI))
-			setText('win-range', fmtCurrent(win.minI) + ' / ' + fmtCurrent(win.maxI))
-			setText('ro-current', fmtCurrent(win.avgI))
-			setText('ro-power', fmtPower(win.avgP))
+			setText('win-mean', fmt.fmtCurrent(win.avgI))
+			setText('win-range', fmt.fmtCurrent(win.minI) + ' / ' + fmt.fmtCurrent(win.maxI))
+			setText('ro-current', fmt.fmtCurrent(win.avgI))
+			setText('ro-power', fmt.fmtPower(win.avgP))
 			setText('ro-samples', fmtCount(summary.retainedSamples))
-			setText('scope-meta', fmtCount(range.end - range.start + 1) + ' samples · ' + fmtDuration((range.end - range.start) * control.getSamplePeriodSec()))
+			const span = range.count > 1 ? (range.count - 1) * control.getSamplePeriodSec() : 0
+			setText('scope-meta', fmtCount(range.count) + ' samples · ' + fmt.fmtDuration(span) + ' · ' + (view.live ? 'live' : 'paused'))
 		} else {
 			viewStatsCache = null
 			setText('win-start', '0')
@@ -456,7 +1040,9 @@
 			setText('scope-meta', 'no data')
 		}
 		setText('ro-voltage', st.voltageMv == null ? '—' : String(st.voltageMv))
-		$('scope-empty').style.display = wave && wave.total() > 0 ? 'none' : 'flex'
+		$('scope-empty').style.display = total > 0 ? 'none' : 'flex'
+		renderCursorPanel()
+		refreshAnalysis(false)
 	}
 
 	function updateStoragePanel() {
@@ -469,156 +1055,135 @@
 		setText('export-meta', 'limit ' + fmtBytes(ExportMod.MAX_EXPORT_BYTES))
 	}
 
-	// ---------- 波形绘制 ----------
-	function currentViewRange() {
-		const total = wave ? wave.total() : 0
-		if (total <= 0) return { start: 0, end: 0 }
-		const end = total - 1
+	// ---------- 游标读数 ----------
+	function renderCursorPanel() {
+		const total = totalSamples()
 		const per = control ? control.getSamplePeriodSec() : 0
-		const windowSamples = per > 0 ? Math.max(2, Math.round((settings.viewSec || 10) / per)) : total
-		const start = Math.max(0, end - windowSamples + 1)
-		return { start: start, end: end }
+		const sel = View.selection(view.cursorA, view.cursorB, total)
+		if (!sel || total < 2) {
+			setText('cur-a', view.cursorA == null ? '—' : String(view.cursorA))
+			setText('cur-b', view.cursorB == null ? '—' : String(view.cursorB))
+			setText('cur-dt', '—')
+			setText('cur-mean', '—')
+			setText('cur-charge', '—')
+			setText('cur-energy', '—')
+			return
+		}
+		const m = Panels.measureCursors(wave, sel.a, sel.b, { samplePeriodSec: per })
+		setText('cur-a', sel.a + ' · ' + fmt.fmtCurrent(wave.iAt(sel.a)))
+		setText('cur-b', sel.b + ' · ' + fmt.fmtCurrent(wave.iAt(sel.b)))
+		setText('cur-dt', fmt.fmtDuration(m.wallSec) + ' / ' + fmt.fmtDuration(m.durSec) + (m.gaps ? ' · ' + m.gaps + ' gap' + (m.gaps > 1 ? 's' : '') : ''))
+		setText('cur-mean', fmt.fmtCurrent(m.avgI) + ' · ' + fmt.fmtCurrent(m.minI) + ' / ' + fmt.fmtCurrent(m.maxI))
+		setText('cur-charge', fmt.fmtCharge(m.chargeUC))
+		setText('cur-energy', fmt.fmtEnergy(m.energyUWh))
+		$('cur-dt').dataset.warn = m.gaps > 0 ? '1' : '0'
 	}
 
-	function cssVar(name, fallback) {
-		const v = getComputedStyle(document.documentElement).getPropertyValue(name)
-		return (v && v.trim()) || fallback
+	// ---------- 分析 ----------
+	function analysisPackKey(range) {
+		return [analysis.source, range ? range.a : '-', range ? range.b : '-', control ? control.getSamplePeriodSec() : 0,
+			control ? control.state().voltageMv : '-', settings.capacityMah, show.fft, show.battery, show.cycles].join('|')
 	}
 
-	function drawWave() {
-		const cv = $('wave')
-		if (!cv || !wave) return
-		const dpr = window.devicePixelRatio || 1
-		const w = Math.max(1, cv.clientWidth)
-		const h = Math.max(1, cv.clientHeight)
-		if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
-			cv.width = Math.round(w * dpr)
-			cv.height = Math.round(h * dpr)
-		}
-		const g = cv.getContext('2d')
-		if (!g) return
-		g.setTransform(dpr, 0, 0, dpr, 0, 0)
-		// 颜色从 CSS 变量取：主题切换后重画即可，不留硬编码色
-		const colBg = cssVar('--bg-sunken', '#eef1f5')
-		const colGrid = cssVar('--border-light', 'rgba(17,24,39,0.07)')
-		const colTrace = cssVar('--accent', '#1f5fbf')
-		const colBand = cssVar('--accent-light', 'rgba(31,95,191,0.08)')
-		const colText = cssVar('--text-muted', '#6b7487')
-		const colGap = cssVar('--warning', '#b45309')
-
-		g.clearRect(0, 0, w, h)
-		g.fillStyle = colBg
-		g.fillRect(0, 0, w, h)
-
-		// 网格：4 条水平发丝线，不画竖线（避免和缺口标记抢注意力）
-		g.strokeStyle = colGrid
-		g.lineWidth = 1
-		for (let i = 1; i < 4; i++) {
-			const y = Math.round((h * i) / 4) + 0.5
-			g.beginPath()
-			g.moveTo(0, y)
-			g.lineTo(w, y)
-			g.stroke()
-		}
-
-		const total = wave.total()
-		if (total <= 0) return
-		const range = currentViewRange()
-		const span = Math.max(1, range.end - range.start)
-		// 视窗统计由 renderSessionPanel 每 400 ms 算一次并缓存，画布每帧只读缓存
-		const stats = (viewStatsCache && viewStatsCache.start === range.start && viewStatsCache.end === range.end)
-			? viewStatsCache.stats
-			: wave.stats(range.start, range.end + 1)
-		let lo = stats.minI
-		let hi = stats.maxI
-		if (!isFinite(lo) || !isFinite(hi) || hi <= lo) { lo = 0; hi = 1 }
-		const padY = (hi - lo) * 0.12 || 1
-		lo -= padY
-		hi += padY
-		const yOf = function (v) { return h - ((v - lo) / (hi - lo)) * h }
-		const xOf = function (i) { return ((i - range.start) / span) * (w - 1) }
-
-		// 每像素一桶的 min/max 包络 + 均值折线
-		const bs = wave.computeBucketSize(span + 1, Math.max(1, Math.floor(w)))
-		wave.frameReset()
-		const first = Math.floor(range.start / bs)
-		const last = Math.floor(range.end / bs)
-		g.strokeStyle = colBand
-		g.lineWidth = 1
-		g.beginPath()
-		for (let bi = first; bi <= last; bi++) {
-			const e = wave.getBucketEntry(bi, bs, 0, range.end)
-			if (!e) continue
-			const x0 = Math.max(0, Math.min(w - 1, xOf(e.loAbs)))
-			const yTop = yOf(e.max)
-			const yBot = yOf(e.min)
-			g.moveTo(x0 + 0.5, yTop)
-			g.lineTo(x0 + 0.5, Math.max(yBot, yTop + 1))
-		}
-		g.stroke()
-
-		g.strokeStyle = colTrace
-		g.lineWidth = 1.25
-		g.beginPath()
-		let started = false
-		for (let bi = first; bi <= last; bi++) {
-			const e = wave.getBucketEntry(bi, bs, 0, range.end)
-			if (!e) continue
-			const x0 = Math.max(0, Math.min(w - 1, xOf(e.loAbs)))
-			const x1 = Math.max(x0, Math.min(w - 1, xOf(e.hiAbs)))
-			const yA = yOf(started ? e.first : e.first)
-			if (!started) { g.moveTo(x0, yA); started = true } else g.lineTo(x0, yA)
-			g.lineTo(x1, yOf(e.last))
-		}
-		g.stroke()
-
-		// 缺口：竖线 + 顶部短刻度（缺口处数据不连续，不能画成连续线）
-		const gaps = wave.gaps()
-		g.strokeStyle = colGap
-		g.lineWidth = 1
-		g.beginPath()
-		for (let i = 0; i < gaps.length; i++) {
-			const gi = gaps[i]
-			if (gi < range.start || gi > range.end) continue
-			const x = Math.round(xOf(gi)) + 0.5
-			g.moveTo(x, 0)
-			g.lineTo(x, h)
-		}
-		g.stroke()
-		g.fillStyle = colGap
-		for (let i = 0; i < gaps.length; i++) {
-			const gi = gaps[i]
-			if (gi < range.start || gi > range.end) continue
-			g.fillRect(Math.round(xOf(gi)) - 1, 0, 3, 4)
-		}
-
-		// 轴标注：最大 / 最小 / 零点
-		g.fillStyle = colText
-		g.font = '11px ' + cssVar('--font-mono', 'ui-monospace, monospace')
-		g.textBaseline = 'top'
-		g.fillText(fmtCurrent(hi), 6, 4)
-		g.textBaseline = 'bottom'
-		g.fillText(fmtCurrent(lo), 6, h - 4)
-	}
-
-	function scheduleDraw() {
-		if (drawQueued) return
-		drawQueued = true
-		requestAnimationFrame(function () {
-			drawQueued = false
-			drawWave()
+	function refreshAnalysis(force) {
+		if (!wave || !control) return
+		const total = totalSamples()
+		const range = Panels.pickRange({
+			mode: analysis.source,
+			total: total,
+			selection: View.selection(view.cursorA, view.cursorB, total),
+			viewRange: currentRange(),
 		})
+		const key = analysisPackKey(range)
+		if (!force && key === analysis.key && analysis.pack) return
+		analysis.key = key
+		if (!range) {
+			analysis.pack = null
+			renderAnalysisPanel(null)
+			return
+		}
+		analysis.pack = Panels.buildPack({
+			wave: wave,
+			range: range,
+			samplePeriodSec: control.getSamplePeriodSec(),
+			voltageMv: control.state().voltageMv,
+			capacityMah: settings.capacityMah,
+			fft: show.fft,
+			cycles: show.cycles,
+			segments: true,
+			spikes: true,
+		})
+		renderAnalysisPanel(analysis.pack)
 	}
 
-	// 采集中只重画画布；读数 / 统计走 400 ms 的定时器（统计要扫整个视窗，不能每帧算）
-	function startDrawLoop() {
-		if (rafId) return
-		const tick = function () {
-			rafId = 0
-			drawWave()
-			if (control && control.isSampling()) rafId = requestAnimationFrame(tick)
+	function scheduleAnalysis(force) {
+		if (analysis.timer) clearTimeout(analysis.timer)
+		analysis.timer = setTimeout(function () {
+			analysis.timer = 0
+			refreshAnalysis(!!force)
+		}, 120)
+	}
+
+	function renderAnalysisPanel(pack) {
+		const set = setText
+		if (!pack) {
+			set('an-meta', 'no range')
+			;['an-avg', 'an-range', 'an-rms', 'an-levels', 'an-period', 'an-freq', 'an-qcycle', 'an-events'].forEach(function (id) { set(id, '—') })
+			set('an-gaps', '0')
+			set('an-fft-meta', '—')
+			$('an-fft').textContent = ''
+			set('an-battery', '—')
+			set('an-cycles-meta', '—')
+			return
 		}
-		rafId = requestAnimationFrame(tick)
+		set('an-meta', pack.source + ' · ' + fmtCount(pack.nRaw) + ' pts · ' + (pack.step > 1 ? '1/' + pack.step : 'full') + ' · ' + fmt.fmtDuration(pack.periodSec * (pack.nRaw - 1)))
+		const b = pack.basic || {}
+		set('an-avg', fmt.fmtCurrent(b.avg))
+		set('an-range', fmt.fmtCurrent(b.min) + ' / ' + fmt.fmtCurrent(b.max))
+		set('an-rms', fmt.fmtCurrent(b.rms) + ' / ' + fmt.fmtCurrent(b.pp))
+		const lv = pack.levels || {}
+		set('an-levels', (lv.lowAvg != null ? fmt.fmtCurrent(lv.lowAvg) : '—') + ' / ' + (lv.highAvg != null ? fmt.fmtCurrent(lv.highAvg) : '—') +
+			(lv.duty != null ? ' · ' + fmt.fmtPercent(lv.duty) : ''))
+		const ed = pack.edges || {}
+		set('an-period', (ed.periodSec != null ? fmt.fmtDuration(ed.periodSec) + ' · n=' + ed.nPeriod : '—') + ' / ' + (ed.duty != null ? fmt.fmtPercent(ed.duty) : '—'))
+		set('an-freq', ed.freqHz != null ? fmt.fmtFreq(ed.freqHz) : '—')
+		set('an-qcycle', pack.qCycle != null ? fmt.fmtCharge(pack.qCycle) : '—')
+		const sp = pack.spikes ? pack.spikes.length : 0
+		const sg = pack.segments && pack.segments.segments ? pack.segments.segments.length : 0
+		set('an-events', sp + ' spikes / ' + sg + ' segments')
+		set('an-gaps', String(pack.measure.gaps) + (pack.measure.gaps ? ' · ' + fmt.fmtPercent(pack.measure.gapRatio) + ' of range' : ''))
+		$('an-gaps').dataset.warn = pack.measure.gaps > 0 ? '1' : '0'
+		// FFT
+		if (show.fft) {
+			const f = pack.fft
+			const list = $('an-fft')
+			list.textContent = ''
+			if (!f || f.ok === false) {
+				set('an-fft-meta', f && f.reason ? f.reason : 'n/a')
+			} else {
+				set('an-fft-meta', fmtCount(f.nfft) + ' bins · ' + fmt.fmtFreq(f.binHz) + '/bin · ' + (f.window || 'hann'))
+				const peaks = (f.peaks || []).slice(0, 6)
+				peaks.forEach(function (p, i) {
+					const li = document.createElement('li')
+					li.textContent = fmt.fmtFreq(p.freqHz) + ' · ' + fmt.fmtCurrent(p.magUA)
+					if (i === 0) li.dataset.top = '1'
+					list.appendChild(li)
+				})
+				if (!peaks.length) set('an-fft-meta', 'no peaks')
+			}
+		}
+		// Battery
+		if (show.battery) {
+			const bat = pack.battery
+			set('an-battery', bat && bat.ok
+				? fmt.fmtDuration(bat.hours * 3600) + ' at ' + fmt.fmtCurrent(bat.avgUA) + ' · ' + bat.capacityMah + ' mAh ×' + bat.derate
+				: (bat && bat.reason) || 'n/a')
+		}
+		// Cycles
+		if (show.cycles) {
+			const cy = pack.cycles
+			set('an-cycles-meta', cy && cy.nCycles ? cy.nCycles + ' cycles × ' + cy.periodPts + ' pts' : 'no period found')
+		}
 	}
 
 	// ---------- 导出 ----------
@@ -632,13 +1197,12 @@
 		if (kind === 'summary') {
 			r = await exportSvc.exportSummary()
 		} else if (kind === 'view') {
-			const range = currentViewRange()
+			const range = currentRange()
 			r = await exportSvc.exportRange(range.start, range.end + 1, { name: 'power-window.csv' })
 		} else {
 			r = await exportSvc.exportRange(0, wave.total(), { name: 'power-session.csv' })
 		}
 		if (!r || !r.ok) {
-			// 超限时明确说清楚：多大、上限多少、可以怎么做，绝不静默截断
 			const msg = (r && r.message) ? r.message : '导出失败'
 			hint.textContent = msg
 			hint.dataset.warn = '1'
@@ -649,7 +1213,340 @@
 		hint.textContent = 'Saved ' + r.name + (r.bytes ? ' (' + fmtBytes(r.bytes) + ')' : '')
 	}
 
-	// ---------- 事件绑定 ----------
+	// ---------- 交互 ----------
+	function canvasPoint(ev) {
+		const cv = $('wave')
+		const rect = cv.getBoundingClientRect()
+		return { x: ev.clientX - rect.left, y: ev.clientY - rect.top }
+	}
+
+	function plotX(px) {
+		return px - plotRect.x
+	}
+
+	function inPlot(p) {
+		return p.x >= plotRect.x && p.x <= plotRect.x + plotRect.w && p.y >= plotRect.y && p.y <= plotRect.y + plotRect.h
+	}
+
+	function indexAtPx(px) {
+		const range = currentRange()
+		return View.pixelToIndex(Math.max(0, Math.min(plotRect.w - 1, px)), range, plotRect.w)
+	}
+
+	function pxOfIndex(li) {
+		return View.indexToPixel(li, currentRange(), plotRect.w)
+	}
+
+	/** 吸附到最近的沿（视图内），阈值按像素折算 */
+	function snapIndex(li, snapPx) {
+		const total = totalSamples()
+		if (total < 3) return li
+		const range = currentRange()
+		const key = range.start + ':' + range.end
+		if (edgeCache.key !== key) {
+			edgeCache = {
+				key: key,
+				edges: Panels.findEdges(wave, range.start, range.end, { samplePeriodSec: control.getSamplePeriodSec() }),
+			}
+		}
+		const ed = edgeCache.edges
+		if (!ed) return li
+		const all = ed.rises.concat(ed.falls)
+		if (!all.length) return li
+		const pxPerPt = plotRect.w / Math.max(1, range.count - 1)
+		const maxPts = Math.max(1, (snapPx || 6) / Math.max(1e-6, pxPerPt))
+		let best = li
+		let bestD = maxPts
+		for (let i = 0; i < all.length; i++) {
+			const d = Math.abs(all[i] - li)
+			if (d <= bestD) { bestD = d; best = all[i] }
+		}
+		return best
+	}
+
+	function bindCanvas() {
+		const cv = $('wave')
+		cv.addEventListener('pointerdown', function (ev) {
+			if (ev.button !== 0) return
+			if (totalSamples() < 2) return
+			cv.focus()
+			const p = canvasPoint(ev)
+			const px = plotX(p.x)
+			// Y 轴区域：拖动 = Y 平移
+			if (p.x < plotRect.x) {
+				drag = { kind: 'y', lastY: p.y }
+			} else {
+				const xa = view.cursorA == null ? null : pxOfIndex(view.cursorA)
+				const xb = view.cursorB == null ? null : pxOfIndex(view.cursorB)
+				const hit = View.cursorHit(px, xa, xb)
+				if (hit) {
+					drag = { kind: 'cursor', which: hit }
+				} else if (ev.shiftKey || ev.altKey) {
+					drag = { kind: 'box', anchor: indexAtPx(px), current: null, startX: px }
+				} else {
+					drag = { kind: 'pan', lastX: px, moved: 0 }
+				}
+			}
+			try { cv.setPointerCapture(ev.pointerId) } catch (e) { /* 忽略 */ }
+			ev.preventDefault()
+			scheduleDraw()
+		})
+
+		cv.addEventListener('pointermove', function (ev) {
+			if (!drag) return
+			const p = canvasPoint(ev)
+			const px = plotX(p.x)
+			if (drag.kind === 'pan') {
+				const d = px - drag.lastX
+				drag.lastX = px
+				drag.moved += Math.abs(d)
+				if (drag.moved > C.DRAG_THRESHOLD_PX) {
+					const r = View.panByPixels({ total: totalSamples(), xZoom: view.xZoom, xOffset: view.xOffset, deltaPx: d, plotWidth: plotRect.w })
+					view.xOffset = r.xOffset
+					markUserView()
+				}
+			} else if (drag.kind === 'box') {
+				drag.current = indexAtPx(px)
+			} else if (drag.kind === 'cursor') {
+				const li = snapIndex(indexAtPx(px), 6)
+				if (drag.which === 'a') view.cursorA = li
+				else view.cursorB = li
+				renderCursorPanel()
+			} else if (drag.kind === 'y') {
+				const dy = p.y - drag.lastY
+				drag.lastY = p.y
+				view.yPan += (dy / Math.max(1, plotRect.h)) * (2 / view.yZoom)
+				view.yPan = Math.max(-4, Math.min(4, view.yPan))
+				viewStatsCache = null
+			}
+			scheduleDraw()
+			ev.preventDefault()
+		})
+
+		function endDrag(ev) {
+			if (!drag) return
+			const finished = drag
+			drag = null
+			try { cv.releasePointerCapture(ev.pointerId) } catch (e) { /* 忽略 */ }
+			if (finished.kind === 'box') {
+				const cur = indexAtPx(plotX(canvasPoint(ev).x))
+				const sel = View.boxSelect(finished.anchor, cur, totalSamples())
+				if (sel && sel.b - sel.a >= 2) {
+					view.cursorA = sel.a
+					view.cursorB = sel.b
+					// 框选 = 放大到该区间
+					const n = sel.b - sel.a + 1
+					view.xZoom = View.clampXZoom(C.DEFAULT_VIEW_POINTS / n, control.getSamplePeriodSec())
+					const c = View.centerOnIndex({ total: totalSamples(), xZoom: view.xZoom, index: Math.round((sel.a + sel.b) / 2) })
+					view.xOffset = c.xOffset
+					markUserView()
+					log('框选放大：' + sel.a + ' → ' + sel.b + '（' + n + ' 点）')
+				}
+			}
+			renderCursorPanel()
+			scheduleAnalysis(true)
+			scheduleDraw()
+		}
+		cv.addEventListener('pointerup', endDrag)
+		cv.addEventListener('pointercancel', function (ev) {
+			drag = null
+			try { cv.releasePointerCapture(ev.pointerId) } catch (e) { /* 忽略 */ }
+			scheduleDraw()
+		})
+
+		cv.addEventListener('wheel', function (ev) {
+			if (totalSamples() < 2) return
+			ev.preventDefault()
+			const p = canvasPoint(ev)
+			const overYAxis = p.x < plotRect.x
+			const dir = ev.deltaY < 0 ? 1 : -1
+			if (overYAxis || ev.shiftKey) {
+				const factor = dir > 0 ? 1.25 : 0.8
+				view.yZoom = Math.max(C.Y_ZOOM_MIN, Math.min(C.Y_ZOOM_MAX, view.yZoom * factor))
+				viewStatsCache = null
+			} else {
+				const factor = dir > 0 ? 1.6 : 0.625
+				const r = View.zoomAtPoint({
+					total: totalSamples(),
+					xZoom: view.xZoom,
+					xOffset: view.xOffset,
+					live: view.live,
+					plotWidth: plotRect.w,
+					pixel: Math.max(0, plotX(p.x)),
+					factor: factor,
+					periodSec: control.getSamplePeriodSec(),
+				})
+				view.xZoom = r.xZoom
+				view.xOffset = r.xOffset
+				markUserView()
+			}
+			scheduleDraw()
+			renderSessionPanel()
+		}, { passive: false })
+
+		cv.addEventListener('dblclick', function (ev) {
+			ev.preventDefault()
+			resetView()
+		})
+
+		// 总览条：点击 / 拖动定位
+		const mm = $('minimap')
+		let mmDrag = false
+		function mmSeek(ev) {
+			if (totalSamples() < 2) return
+			const rect = mm.getBoundingClientRect()
+			const px = Math.max(0, Math.min(rect.width, ev.clientX - rect.left))
+			const center = View.minimapSeekIndex({ width: rect.width, px: px, total: totalSamples() })
+			const c = View.centerOnIndex({ total: totalSamples(), xZoom: view.xZoom, index: center })
+			view.xOffset = c.xOffset
+			markUserView()
+			scheduleDraw()
+			renderSessionPanel()
+		}
+		mm.addEventListener('pointerdown', function (ev) {
+			if (ev.button !== 0) return
+			mmDrag = true
+			mmSeek(ev)
+			ev.preventDefault()
+		})
+		mm.addEventListener('pointermove', function (ev) { if (mmDrag) mmSeek(ev) })
+		mm.addEventListener('pointerup', function () { mmDrag = false })
+		mm.addEventListener('pointercancel', function () { mmDrag = false })
+	}
+
+	function isEditableTarget(el) {
+		if (!el) return false
+		const tag = (el.tagName || '').toUpperCase()
+		return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA'
+	}
+
+	function bindKeys() {
+		window.addEventListener('keydown', function (ev) {
+			if (isEditableTarget(ev.target)) return
+			const total = totalSamples()
+			const per = control ? control.getSamplePeriodSec() : 0
+			const step = Math.max(1, Math.round(0.1 * View.viewPoints(total, view.xZoom)))
+			const key = ev.key
+			if (key === 'Escape') {
+				if (drag && drag.kind === 'box') {
+					drag = null
+					scheduleDraw()
+					ev.preventDefault()
+					return
+				}
+				if (document.body.dataset.max === '1') {
+					toggleMax()
+					ev.preventDefault()
+				}
+				return
+			}
+			if (total < 2) return
+			if (key === 'ArrowLeft' || key === 'ArrowRight') {
+				const delta = (key === 'ArrowLeft' ? 1 : -1) * (ev.shiftKey ? 1 : step)
+				const r = View.panByPixels({ total: total, xZoom: view.xZoom, xOffset: view.xOffset, deltaPx: (delta / Math.max(1, View.viewPoints(total, view.xZoom) - 1)) * Math.max(1, plotRect.w - 1), plotWidth: plotRect.w })
+				view.xOffset = r.xOffset
+				markUserView()
+				scheduleDraw()
+				renderSessionPanel()
+				ev.preventDefault()
+			} else if (key === '+' || key === '=') {
+				zoomBy(1.6, 0.5)
+				ev.preventDefault()
+			} else if (key === '-' || key === '_') {
+				zoomBy(1 / 1.6, 0.5)
+				ev.preventDefault()
+			} else if (key === 'ArrowUp' || key === 'ArrowDown') {
+				if (ev.shiftKey) {
+					view.yPan += key === 'ArrowUp' ? 0.2 : -0.2
+				} else {
+					view.yZoom = Math.max(C.Y_ZOOM_MIN, Math.min(C.Y_ZOOM_MAX, view.yZoom * (key === 'ArrowUp' ? 1.25 : 0.8)))
+				}
+				viewStatsCache = null
+				scheduleDraw()
+				ev.preventDefault()
+			} else if (key === '0') {
+				resetView()
+				ev.preventDefault()
+			} else if (key === 'f' || key === 'F') {
+				toggleMax()
+				ev.preventDefault()
+			} else if (key === '[') {
+				const range = currentRange()
+				view.cursorA = snapIndex(Math.round((range.start + range.end) / 2), 0)
+				renderCursorPanel()
+				scheduleAnalysis(true)
+				scheduleDraw()
+				ev.preventDefault()
+			} else if (key === ']') {
+				const range = currentRange()
+				view.cursorB = snapIndex(Math.round((range.start + range.end) / 2), 0)
+				if (view.cursorA == null) view.cursorA = Math.max(0, (view.cursorB || 0) - Math.max(1, Math.round(step / 4)))
+				renderCursorPanel()
+				scheduleAnalysis(true)
+				scheduleDraw()
+				ev.preventDefault()
+			} else if (key === '\\') {
+				view.cursorA = null
+				view.cursorB = null
+				renderCursorPanel()
+				scheduleDraw()
+				ev.preventDefault()
+			}
+			void per
+		})
+	}
+
+	function zoomBy(factor, anchorFrac) {
+		const total = totalSamples()
+		if (total < 2) return
+		const r = View.zoomAtPoint({
+			total: total,
+			xZoom: view.xZoom,
+			xOffset: view.xOffset,
+			live: view.live,
+			plotWidth: plotRect.w,
+			pixel: Math.round(Math.max(0, Math.min(plotRect.w - 1, (anchorFrac == null ? 0.5 : anchorFrac) * plotRect.w))),
+			factor: factor,
+			periodSec: control.getSamplePeriodSec(),
+		})
+		view.xZoom = r.xZoom
+		view.xOffset = r.xOffset
+		markUserView()
+		scheduleDraw()
+		renderSessionPanel()
+	}
+
+	// ---------- 最大化 / 全屏 ----------
+	function setMaxUi(on) {
+		document.body.dataset.max = on ? '1' : '0'
+		const btn = $('btn-max')
+		btn.setAttribute('aria-pressed', String(on))
+		btn.textContent = on ? 'Restore' : 'Maximize'
+		scheduleDraw()
+	}
+
+	function toggleMax() {
+		const on = document.body.dataset.max !== '1'
+		setMaxUi(on)
+		// 优先用 Fullscreen API；不可用（或被拒）就只在面板内最大化
+		try {
+			if (on && document.documentElement.requestFullscreen) {
+				const p = document.documentElement.requestFullscreen()
+				if (p && p.catch) p.catch(function () { /* 面板内最大化已经生效 */ })
+			} else if (!on && document.fullscreenElement && document.exitFullscreen) {
+				const p = document.exitFullscreen()
+				if (p && p.catch) p.catch(function () { /* 忽略 */ })
+			}
+		} catch (e) { /* 忽略 */ }
+	}
+
+	function bindFullscreenSync() {
+		document.addEventListener('fullscreenchange', function () {
+			if (!document.fullscreenElement && document.body.dataset.max === '1') setMaxUi(false)
+		})
+	}
+
+	// ---------- 设置 / 控件 ----------
 	function bindUi() {
 		$('btn-refresh').addEventListener('click', function () { refreshPorts() })
 		$('btn-connect').addEventListener('click', function () { toggleConnect() })
@@ -667,6 +1564,13 @@
 			control.clearSessionState()
 			if (laneTrack) laneTrack.reset()
 			viewStatsCache = null
+			view.cursorA = null
+			view.cursorB = null
+			View.resetScopeTrigger(trig)
+			trigScanFrom = null
+			analysis.pack = null
+			analysis.key = ''
+			edgeCache = { key: '', edges: null }
 			updateGapChip()
 			renderSessionPanel()
 			updateStoragePanel()
@@ -702,6 +1606,10 @@
 		})
 		$('view').addEventListener('change', function () {
 			settings.viewSec = Number($('view').value) || 10
+			// 窗口时长 → 缩放：新视口点数由时长与采样周期决定
+			const per = control.getSamplePeriodSec()
+			if (per > 0) view.xZoom = View.clampXZoom(C.DEFAULT_VIEW_POINTS / Math.max(4, Math.round(settings.viewSec / per)), per)
+			settings.yMode = view.yMode
 			saveSettingsSoon()
 			scheduleDraw()
 			renderSessionPanel()
@@ -722,7 +1630,127 @@
 		$('btn-export-all').addEventListener('click', function () { doExport('all') })
 		$('btn-export-summary').addEventListener('click', function () { doExport('summary') })
 
+		// Y 轴模式
+		$('btn-ylin').addEventListener('click', function () { setYMode('linear') })
+		$('btn-ylog').addEventListener('click', function () { setYMode('log') })
+		$('btn-ysym').addEventListener('click', function () { setYMode('symlog') })
+		// 显示开关
+		$('btn-env').addEventListener('click', function () {
+			show.envelope = !show.envelope
+			settings.showEnvelope = show.envelope
+			$('btn-env').setAttribute('aria-pressed', String(show.envelope))
+			saveSettingsSoon()
+			scheduleDraw()
+		})
+		$('btn-band').addEventListener('click', function () {
+			show.band = !show.band
+			settings.showBand = show.band
+			$('btn-band').setAttribute('aria-pressed', String(show.band))
+			saveSettingsSoon()
+			scheduleDraw()
+		})
+		// 显示触发
+		$('trig-mode').addEventListener('change', function () {
+			trigUI.mode = $('trig-mode').value
+			View.resetScopeTrigger(trig)
+			trigScanFrom = null
+			trigUserOverride = false
+			updateTriggerChip(control ? control.trigLevel() : 0)
+			scheduleDraw()
+			log('显示触发：' + trigUI.mode)
+		})
+		$('trig-level').addEventListener('change', function () {
+			const raw = String($('trig-level').value || '').trim()
+			if (!raw) {
+				trigUI.levelAuto = true
+				trigUI.levelUA = null
+				control.setTrigLevel(null)
+			} else {
+				const n = Number(raw)
+				if (!isFinite(n)) {
+					log('触发电平必须是数字（µA），空 = Auto', 'warn')
+					return
+				}
+				trigUI.levelAuto = false
+				trigUI.levelUA = n
+				control.setTrigLevel(n)
+			}
+			View.resetScopeTrigger(trig)
+			trigScanFrom = null
+			updateTriggerChip(control.trigLevel())
+			scheduleDraw()
+		})
+		$('trig-pre').addEventListener('change', function () {
+			trigUI.preFrac = Number($('trig-pre').value) || 0.25
+			settings.trigPre = trigUI.preFrac
+			saveSettingsSoon()
+			scheduleDraw()
+		})
+		// 采样沿触发
+		$('acq-start').addEventListener('change', function () {
+			control.setAcqTriggers($('acq-start').value, $('acq-stop').value)
+			log('采样启动沿：' + $('acq-start').value + (control.isSampling() ? '（采样中，立即生效）' : '（下次开始采样生效）'))
+			renderSessionPanel()
+		})
+		$('acq-stop').addEventListener('change', function () {
+			control.setAcqTriggers($('acq-start').value, $('acq-stop').value)
+			log('采样停止沿：' + $('acq-stop').value)
+			renderSessionPanel()
+		})
+		$('btn-reset').addEventListener('click', function () { resetView() })
+		$('btn-max').addEventListener('click', function () { toggleMax() })
+		// 分析
+		$('an-source').addEventListener('change', function () {
+			analysis.source = $('an-source').value
+			settings.anSource = analysis.source
+			saveSettingsSoon()
+			scheduleAnalysis(true)
+		})
+		$('btn-an-refresh').addEventListener('click', function () { scheduleAnalysis(true) })
+		$('btn-fft').addEventListener('click', function () {
+			show.fft = !show.fft
+			$('btn-fft').setAttribute('aria-pressed', String(show.fft))
+			$('an-fft-block').hidden = !show.fft
+			scheduleAnalysis(true)
+			scheduleDraw()
+		})
+		$('btn-battery').addEventListener('click', function () {
+			show.battery = !show.battery
+			$('btn-battery').setAttribute('aria-pressed', String(show.battery))
+			$('an-battery-block').hidden = !show.battery
+			scheduleAnalysis(true)
+		})
+		$('btn-cycles').addEventListener('click', function () {
+			show.cycles = !show.cycles
+			$('btn-cycles').setAttribute('aria-pressed', String(show.cycles))
+			$('an-cycles-block').hidden = !show.cycles
+			scheduleAnalysis(true)
+			scheduleDraw()
+		})
+		$('an-capacity').addEventListener('change', function () {
+			const v = Number($('an-capacity').value)
+			if (isFinite(v) && v > 0) {
+				settings.capacityMah = v
+				saveSettingsSoon()
+				scheduleAnalysis(true)
+			}
+		})
+
+		bindCanvas()
+		bindKeys()
+		bindFullscreenSync()
 		window.addEventListener('resize', scheduleDraw)
+	}
+
+	function setYMode(mode) {
+		view.yMode = mode === 'log' || mode === 'symlog' ? mode : 'linear'
+		settings.yMode = view.yMode
+		$('btn-ylin').setAttribute('aria-pressed', String(view.yMode === 'linear'))
+		$('btn-ylog').setAttribute('aria-pressed', String(view.yMode === 'log'))
+		$('btn-ysym').setAttribute('aria-pressed', String(view.yMode === 'symlog'))
+		saveSettingsSoon()
+		scheduleDraw()
+		log('Y 轴：' + view.yMode + (view.yMode === 'log' ? '（下限 1 nA，随窗口自适应）' : ''))
 	}
 
 	function setMode(mode) {
@@ -732,6 +1760,7 @@
 		$('btn-mode-long').setAttribute('aria-pressed', String(settings.recordMode === 'long'))
 		saveSettingsSoon()
 		renderSessionPanel()
+		scheduleDraw()
 		log('记录模式：' + (settings.recordMode === 'wave' ? '波形' : '长期统计（不进波形环）'))
 	}
 
@@ -740,7 +1769,28 @@
 		createPipeline()
 		bindUi()
 
-		// 主题：SDK 已把宿主 tokens 写到 :root；这里只负责重画画布与标识
+		// 停滞看门狗：长时间没有新样点就提示 + 标缺口（不自动重连）
+		stall = View.createStallWatch({
+			intervalMs: 500,
+			thresholdMs: 2500,
+			onStall: function (info) {
+				const idle = Math.round(info.idleMs)
+				if (control) control.noteGap({ reason: 'stall', idleMs: idle })
+				updateGapChip()
+				log('采样流中断 ' + (idle / 1000).toFixed(1) + ' s（设备停发或 USB 卡顿），已标记缺口；不自动重连', 'warn')
+				hostLog('sample stream stalled for ' + idle + ' ms, marked as a gap')
+				const chip = $('chip-sampling')
+				chip.dataset.state = 'warn'
+				chip.textContent = 'stalled'
+				$('gaps-hint').dataset.warn = '1'
+			},
+			onResume: function () {
+				log('采样流已恢复', 'success')
+				$('gaps-hint').dataset.warn = '0'
+				updateSampleButton()
+			},
+		})
+
 		sdk.on('theme-change', function (t) {
 			setText('chip-theme', 'theme: ' + ((t && t.theme) || 'light'))
 			scheduleDraw()
@@ -755,14 +1805,23 @@
 		} catch (e) {
 			log('读取设置失败，使用默认值：' + (e && e.message ? e.message : e), 'warn')
 		}
-		// 应用到控件与管线
+		syncViewFromSettings()
 		$('rate').value = String(settings.rateHz)
 		$('voltage').value = settings.voltageMv == null ? '' : String(settings.voltageMv)
 		$('cap').value = String(settings.capMiB)
 		$('view').value = String(settings.viewSec)
+		$('trig-pre').value = String(settings.trigPre)
+		$('an-source').value = settings.anSource
+		$('an-capacity').value = String(settings.capacityMah)
+		$('btn-env').setAttribute('aria-pressed', String(show.envelope))
+		$('btn-band').setAttribute('aria-pressed', String(show.band))
+		setYModeInternal()
 		control.setTargetRateHz(settings.rateHz)
 		control.setVoltageSource(settings.voltageMv)
-		if (settings.recordMode === 'long') setMode('long')
+		if (settings.recordMode === 'long') {
+			settings.recordMode = 'wave'
+			setMode('long')
+		}
 		store.setCapBytes(settings.capMiB * MIB)
 		wave.setRamCap(Math.max(65536, Math.round((settings.ramMiB * MIB) / 4)))
 
@@ -774,12 +1833,20 @@
 		renderSessionPanel()
 		updateStoragePanel()
 		updateGapChip()
+		updateTriggerChip(0)
 		scheduleDraw()
 		log('已就绪：设备串口会被独占声明（serial.claim），不影响通信调试的 S/A/B 路')
 		readoutTimer = setInterval(function () {
 			renderSessionPanel()
 			updateStoragePanel()
 		}, 400)
+	}
+
+	function setYModeInternal() {
+		view.yMode = settings.yMode
+		$('btn-ylin').setAttribute('aria-pressed', String(view.yMode === 'linear'))
+		$('btn-ylog').setAttribute('aria-pressed', String(view.yMode === 'log'))
+		$('btn-ysym').setAttribute('aria-pressed', String(view.yMode === 'symlog'))
 	}
 
 	if (document.readyState === 'loading') {

@@ -370,3 +370,88 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 	.body { grid-template-columns: minmax(0, 1fr) 300px; }
 	.readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* ---- 第二行工具条：视图 / 触发 / 最大化 ---- */
+.bar .group { min-height: 26px; }
+.bar input[type='text'] { width: 84px; font-family: var(--font-mono); }
+.bar select { height: var(--ctl-h); }
+
+.scope-wrap {
+	display: flex;
+	flex-direction: column;
+}
+
+#wave {
+	flex: 1;
+	min-height: 0;
+	outline: none;
+}
+
+#wave:focus-visible {
+	box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.minimap-wrap {
+	height: 56px;
+	border-top: 1px solid var(--border-light);
+	background: var(--bg-surface);
+}
+
+#minimap {
+	display: block;
+	width: 100%;
+	height: 100%;
+}
+
+/* ---- 游标读数条 ---- */
+.cursors {
+	display: grid;
+	grid-template-columns: repeat(6, minmax(0, 1fr));
+	gap: 1px;
+	background: var(--border-light);
+	border-top: 1px solid var(--border-color);
+}
+
+.cur-block {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+	padding: var(--sp-2) var(--sp-3);
+	background: var(--bg-surface);
+}
+
+.cur-block .k {
+	color: var(--text-muted);
+	font-size: var(--fs-micro);
+}
+
+.cur-block .v {
+	font-family: var(--font-mono);
+	font-size: var(--fs-small);
+	font-variant-numeric: tabular-nums;
+}
+
+/* ---- 分析面板 ---- */
+.peaks {
+	margin: var(--sp-2) 0 0;
+	padding-left: var(--sp-4);
+	color: var(--text-secondary);
+	font-family: var(--font-mono);
+	font-size: var(--fs-micro);
+	line-height: 1.6;
+}
+
+.peaks li[data-top='1'] { color: var(--text-primary); }
+
+.hint[data-warn='1'] { color: var(--warning); }
+
+.meta[data-warn='1'] { color: var(--warning); }
+
+/* 最大化：隐藏侧栏，波形占满。用 grid 列数变化而非 transform */
+body[data-max='1'] .body { grid-template-columns: minmax(0, 1fr); }
+body[data-max='1'] .side { display: none; }
+body[data-max='1'] { padding: var(--sp-2); }
+
+@media (max-width: 1080px) {
+	.cursors { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

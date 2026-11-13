@@ -29,6 +29,20 @@ verifies both, and loads the plugin inside a sandboxed, opaque-origin iframe.
 - **Waveform + long-run statistics.** Hot samples stay in a ring of chunks; older chunks are
   deflate-compressed into an in-memory cold store. Both budgets are configurable, and the cold
   cap drops the oldest blocks (reported as gaps) instead of failing.
+- **Scope interaction.** Wheel zooms X at the pointer (shift or the axis area zooms Y), drag pans,
+  shift/alt-drag draws a box that zooms into it, double-click or `0` resets, the overview strip
+  seeks, and two cursors read out Δt (wall time and gap-summed time), mean, min/max, charge and
+  energy — never integrating across a gap. Arrow keys pan, `+`/`-` zoom X, `↑`/`↓` zoom Y,
+  `[`/`]` drop cursors, `\` clears them, `F` maximizes and `Esc` leaves.
+- **Y axis modes.** Linear, log (1 nA floor, adapted to the window) and symlog (1 µA linear
+  threshold), with the min/max envelope and the mean ±1σ band toggled independently.
+- **Triggers.** A display trigger (edge, level, pre-trigger position) pins the waveform so
+  periodic signals stand still; a capture trigger arms the start edge and can stop the capture
+  on a later edge.
+- **Analysis panels.** Level/period/duty readouts, FFT peaks, battery life estimate and a cycle
+  overlay drawn in the waveform corner, all computed from the current range (cursors or window).
+- **Stall watchdog.** More than ~2.5 s without samples logs a warning, marks a gap and does not
+  reconnect on its own.
 - **Source voltage and DUT power.** `REGULATOR_SET` / `DEVICE_RUNNING_SET` with the vendor's
   safety rules: a failed voltage write never powers the DUT on, and a failed write marks the
   power state `unknown` (the protocol has no read-back command).
@@ -64,6 +78,11 @@ verifies both, and loads the plugin inside a sandboxed, opaque-origin iframe.
   reports that as a gap. Both cases show up in the gap counter, never as smooth fake data.
 - **No calibration UI, no MCP, no BLE / classic-Bluetooth transports**, no multi-device
   simultaneous capture (one claim at a time).
+- **Waveform fidelity at a glance.** Very long sessions are drawn from per-pixel min/max buckets;
+  zoom in to get the individual samples back (cold blocks are read on demand, which is why the
+  per-frame hydrate budget exists).
+- **"Maximize" never touches the host.** The plugin first asks for the Fullscreen API; when the
+  sandbox refuses it, the same button just hides the sidebar inside the plugin view.
 
 ## Development
 
