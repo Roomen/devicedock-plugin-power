@@ -84,10 +84,12 @@ function makeHarness(opts) {
 		retainedValue: null,
 		total() { return wave.totalValue == null ? wave.pushed : wave.totalValue },
 		retained() { return wave.retainedValue == null ? wave.pushed : wave.retainedValue },
-		stats() { return Object.assign({ n: 0, avgI: 0, avgP: 0, minI: 0, maxI: 0, dur: 0, gaps: 0 }, wave.scriptedStats || {}) },
-		gaps() { return state.gaps },
+		stats() { return Object.assign({ n: 0, avgI: 0, avgP: 0, minI: 0, maxI: 0, dur: 0, gaps: wave.gapIdx.length, dropped: 0, volts: 0 }, wave.scriptedStats || {}) },
+		gaps() { return wave.gapIdx },
+		gapIdx: [],
+		droppedSamples() { return 0 },
 		storageStop() { return false },
-		noteGap() {},
+		noteGap(idx) { wave.gapIdx.push(idx) },
 	}
 
 	const control = Control.createControl({
@@ -484,6 +486,33 @@ test('保存设置后 Start 必须真的下发 START（旧 sampling 状态不会
 	const r = await h.control.startSampling()
 	assert.equal(r.ok, true)
 	assert.deepEqual(h.state.writes.map((w) => w.bytes[0]), [0x07, 0x06])
+})
+
+test('导入会话：按导入的周期与逐行电压灌入，缺口标记落位，统计按段积分', async () => {
+	const h = await connected()
+	const I = require('../js/power-import.js')
+	const csv = [
+		'index,time_s,current_uA,power_uW,voltage_mV',
+		'0,0,1000,3300,3300',
+		'1,0.001,1000,3300,3300',
+		'2,0.002,1000,3300,3300',
+		'# gap import 3..3',
+		'3,0.003,0,0,3300',
+		'4,0.004,0,0,3300',
+	].join('\n')
+	const parsed = I.parseCsv(csv)
+	assert.equal(parsed.ok, true)
+	const res = await h.control.importSeries(parsed)
+	assert.equal(res.ok, true)
+	assert.equal(res.samples, 5)
+	assert.equal(res.gaps, 1)
+	assert.ok(Math.abs(h.control.getSamplePeriodSec() - 0.001) < 1e-12, '周期来自导入的时间列')
+	assert.equal(h.wave.pushed, 5)
+	assert.equal(h.wave.gaps().length, 1, '缺口标记必须落进波形：' + JSON.stringify(h.wave.gaps()))
+	const s = h.control.captureSummary()
+	assert.equal(s.gaps, 1, '摘要里的缺口来自统计')
+	// 导入不写设备
+	assert.equal(h.state.writes.length, 0)
 })
 
 test('电压在采样中改变：摘要标出这一点', async () => {

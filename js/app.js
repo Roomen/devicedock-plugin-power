@@ -13,6 +13,7 @@
 	const Claim = window.PowerClaim
 	const ControlMod = window.PowerControl
 	const ExportMod = window.PowerExport
+	const ImportMod = window.PowerImport
 
 	const $ = function (id) { return document.getElementById(id) }
 	const MIB = 1024 * 1024
@@ -1269,6 +1270,74 @@
 		hint.textContent = 'Saved ' + r.name + (r.bytes ? ' (' + fmtBytes(r.bytes) + ')' : '')
 	}
 
+	// ---------- CSV 导入（本地文件，不发网络请求） ----------
+	async function importCsvFile() {
+		const input = $('import-file')
+		const hint = $('import-hint')
+		const file = input && input.files && input.files[0]
+		if (!file) {
+			hint.textContent = 'Choose a CSV file first.'
+			hint.dataset.warn = '1'
+			return
+		}
+		try {
+			const text = await readFileText(file)
+			const parsed = ImportMod.parseCsv(text)
+			const sum = ImportMod.summarize(parsed)
+			if (!parsed.ok) {
+				hint.textContent = sum.text
+				hint.dataset.warn = '1'
+				log('CSV 导入失败：' + parsed.reason, 'error')
+				return
+			}
+			if (control.isSampling()) await control.stopCapture()
+			const res = await control.importSeries(parsed)
+			if (!res || !res.ok) {
+				hint.textContent = 'Import failed: ' + ((res && res.message) || 'unknown')
+				hint.dataset.warn = '1'
+				return
+			}
+			// 导入的会话从零开始：视图、游标、触发、分析全都重置
+			if (laneTrack) laneTrack.reset()
+			view.live = true
+			view.xOffset = 0
+			view.xZoom = 1
+			view.cursorA = null
+			view.cursorB = null
+			View.resetScopeTrigger(trig)
+			trigScanFrom = null
+			analysis.pack = null
+			analysis.key = ''
+			edgeCache = { key: '', edges: null }
+			viewStatsCache = null
+			hint.textContent = sum.text
+			hint.dataset.warn = sum.warn ? '1' : '0'
+			hostLog('imported ' + res.samples + ' samples from ' + file.name)
+			renderSessionPanel()
+			updateStoragePanel()
+			updateGapChip()
+			scheduleDraw()
+		} catch (e) {
+			hint.textContent = 'Import failed: ' + (e && e.message ? e.message : e)
+			hint.dataset.warn = '1'
+			log('CSV 导入异常：' + (e && e.message ? e.message : e), 'error')
+		}
+	}
+
+	/** 读本地文件：优先 FileReader（sandbox 里 file.text() 不一定有），失败退回 text() */
+	function readFileText(file) {
+		if (typeof FileReader === 'function') {
+			return new Promise(function (resolve, reject) {
+				const fr = new FileReader()
+				fr.onload = function () { resolve(String(fr.result == null ? '' : fr.result)) }
+				fr.onerror = function () { reject(fr.error || new Error('read failed')) }
+				fr.readAsText(file)
+			})
+		}
+		if (typeof file.text === 'function') return file.text()
+		return Promise.reject(new Error('当前环境无法读取本地文件'))
+	}
+
 	// ---------- 交互 ----------
 	function canvasPoint(ev) {
 		const cv = $('wave')
@@ -1685,6 +1754,8 @@
 		$('btn-export-view').addEventListener('click', function () { doExport('view') })
 		$('btn-export-all').addEventListener('click', function () { doExport('all') })
 		$('btn-export-summary').addEventListener('click', function () { doExport('summary') })
+		$('import-file').addEventListener('change', function () { importCsvFile() })
+		$('btn-import').addEventListener('click', function () { importCsvFile() })
 
 		// Y 轴模式
 		$('btn-ylin').addEventListener('click', function () { setYMode('linear') })

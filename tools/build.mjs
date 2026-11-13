@@ -27,6 +27,7 @@ const FILES = [
 	'js/power-claim.js',
 	'js/power-control.js',
 	'js/power-export.js',
+	'js/power-import.js',
 	'sdk/devicedock-plugin.js',
 ]
 

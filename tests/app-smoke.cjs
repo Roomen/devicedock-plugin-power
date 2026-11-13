@@ -201,7 +201,7 @@ const root = path.join(__dirname, '..')
 const files = [
 	'js/power-protocol.js', 'js/power-view.js', 'js/power-lane.js', 'js/power-analysis.js',
 	'js/power-store.js', 'js/power-wave.js', 'js/power-panels.js', 'js/power-claim.js',
-	'js/power-control.js', 'js/power-export.js',
+	'js/power-control.js', 'js/power-export.js', 'js/power-import.js',
 ]
 
 function makeEnv(state) {
@@ -624,6 +624,31 @@ const fireKey = (win, key, props) => {
 		await tick(150)
 		click(document, 'btn-connect')
 		await tick(150)
+	}
+
+	// ---- CSV 导入：本地文件解析后替换会话 ----
+	{
+		const csv = [
+			'index,time_s,current_uA,power_uW,voltage_mV',
+			'0,0,1000,3300,3300',
+			'1,0.001,1000,3300,3300',
+			'# gap import 2..2',
+			'2,0.002,0,0,3300',
+		].join('\n')
+		const file = { name: 'capture.csv', text: async () => csv }
+		// 假 DOM 的 file input：直接挂一个 files 列表
+		document.getElementById('import-file').files = [file]
+		click(document, 'btn-import')
+		await tick(300)
+		assert.match(text(document, 'import-hint'), /3 rows/, '导入提示：' + text(document, 'import-hint'))
+		assert.ok(Number(text(document, 'ro-samples').replace(/[^0-9]/g, '')) >= 3, '导入的样点进了会话')
+		assert.notEqual(text(document, 'chip-gaps'), 'gaps: 0', '导入文件里的缺口标记要生效：' + text(document, 'chip-gaps'))
+		assert.ok(state.hostLogs.some((l) => /imported 3 samples/.test(l)), '导入写宿主日志：' + JSON.stringify(state.hostLogs.slice(-3)))
+		// 没有选文件时给出提示，不抛错
+		document.getElementById('import-file').files = []
+		click(document, 'btn-import')
+		await tick(40)
+		assert.match(text(document, 'import-hint'), /Choose a CSV file/)
 	}
 
 	// ---- 冷区上限 ----

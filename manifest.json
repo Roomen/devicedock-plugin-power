@@ -14,10 +14,10 @@
 		"log"
 	],
 	"integrity": {
-		"index.html": "sha256-5428f505a4c207c4d38ea6632dde36b12bb273a906c4441899b389a0e85af0c1",
+		"index.html": "sha256-a3afc1951e19ed3ac7aaf154bffec7fb6b196562cfc10b9309bee60a4e2adabd",
 		"css/app.css": "sha256-2407f4971365e34e2d1c8c1fff62bccdb173aa21ea6b7360016df61a2f7f5784",
 		"icon.svg": "sha256-0e7895208f7c430de80e831eb62c74f2bfadadac59454c4a65159aa699da79b1",
-		"js/app.js": "sha256-9cc0f33a98295ddc4e450c720ad27c1aba73a88b05035ebc2640b85af0a82135",
+		"js/app.js": "sha256-419d36947be3f5f070baed3031e8c5860568d95d85ff25fe361941416af53ef1",
 		"js/power-protocol.js": "sha256-e5582ae7f66eafd5ef76080a6f21516c4ede121e459c2df3cfb00275626998d3",
 		"js/power-view.js": "sha256-906b08c73b706b7d23ac7e1507538ce3c08b27baf8773f6993fa6882e8a75818",
 		"js/power-panels.js": "sha256-a3277584f33e485a0a2a702b16e83a58056ed566e9eef6e73361b8f83d53384b",
@@ -26,8 +26,9 @@
 		"js/power-store.js": "sha256-5e54f221f59fb0cbd06a9c5eda10a6744ba2f900cb5731637afdc5f78d4ded65",
 		"js/power-wave.js": "sha256-73b7b7780994f00166ecce68ecbd9cb5e7573e9d16b3b9e97dc2db95a0141282",
 		"js/power-claim.js": "sha256-e2efd5fb35a1ff3f363e6527e8d300c071f6ea3033ff3e3cc125c7d71ca018ae",
-		"js/power-control.js": "sha256-1501d91fdb66fa78deceb6f5264f5b520fe5a6161bf2112c1fa079192f93be02",
+		"js/power-control.js": "sha256-62a7e52dd75360d74faaf794b8afaba4cb6288d28f7f845d9513505c0e646522",
 		"js/power-export.js": "sha256-b2dac4a9b6e244e3602d9371ce4bbe7d01e5955fa20001c8ea61fb1ca5e7056b",
+		"js/power-import.js": "sha256-ea09707a62b91c4e49c88aa52fa7264bca07d155a0de667fa675e56f281e3691",
 		"sdk/devicedock-plugin.js": "sha256-bdea80b8bb1e2d4567dbe7453264234653277fbd44d7162139d4a4bed75915ae"
 	},
 	"homepage": "https://github.com/Roomen/devicedock-plugin-power",

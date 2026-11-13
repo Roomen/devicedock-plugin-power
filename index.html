@@ -291,6 +291,14 @@
 					</div>
 					<p class="hint" id="export-hint">Exports go through the host file saver. Anything past 8 MiB is refused with the exact size, never truncated.</p>
 				</div>
+				<div class="panel-section">
+					<div class="actions">
+						<label for="import-file">Import CSV</label>
+						<input type="file" id="import-file" accept=".csv,text/csv" aria-label="Import a CSV capture">
+						<button type="button" id="btn-import">Load into session</button>
+					</div>
+					<p class="hint" id="import-hint">Replaces the current session with the file. Parsed locally; gap markers become gaps, per-row voltage is kept as history.</p>
+				</div>
 			</section>
 
 			<section class="panel" style="flex:1;min-height:0">
@@ -314,6 +322,7 @@
 	<script src="js/power-claim.js"></script>
 	<script src="js/power-control.js"></script>
 	<script src="js/power-export.js"></script>
+	<script src="js/power-import.js"></script>
 	<script src="js/app.js"></script>
 </body>
 </html>
