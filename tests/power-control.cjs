@@ -515,6 +515,29 @@ test('导入会话：按导入的周期与逐行电压灌入，缺口标记落�
 	assert.equal(h.state.writes.length, 0)
 })
 
+test('长期模式：时长只累计有效间隔、缺口有计数、能量按摄入时的电压', async () => {
+	const h = await connected()
+	h.control.setRecordMode('long')
+	h.control.setVoltageSource(3300)
+	h.control.ingest(0, 1000)
+	h.control.ingest(1000, 1000) // 1 s 间隔
+	h.control.noteGap({ reason: 'offset_gap' })
+	h.control.ingest(5000, 1000) // 缺口之后的第一个点：不计入时长
+	h.control.ingest(6000, 1000) // 再 1 s
+	const s = h.control.captureSummary()
+	assert.equal(s.mode, 'long')
+	assert.equal(s.durationSec, 2, '只累计段内有效间隔，缺口那段不算：' + s.durationSec)
+	assert.equal(s.gaps, 1, '长期模式也要报缺口数')
+	// 能量 = Σ i·V·dt，电压按摄入时刻：3.3 V × 1000 µA × 2 s = 6600 µW·s
+	assert.ok(Math.abs(s.chargeUC - 2000) < 1e-9, '电量 = 1000 µA × 2 s：' + s.chargeUC)
+	assert.ok(Math.abs(h.control.overallStats().energyUWh - 6600 / 3600) < 1e-9,
+		'能量按历史电压积分：' + h.control.overallStats().energyUWh)
+	// 改当前源电压不能改写历史能量
+	h.control.setVoltageSource(1800)
+	assert.ok(Math.abs(h.control.overallStats().energyUWh - 6600 / 3600) < 1e-9, '改电压不改历史能量')
+	assert.ok(Math.abs(h.control.overallStats().volts - 3.3) < 1e-9, '有效电压仍是 3.3 V：' + h.control.overallStats().volts)
+})
+
 test('电压在采样中改变：摘要标出这一点', async () => {
 	const h = await connected()
 	await h.control.startSampling()

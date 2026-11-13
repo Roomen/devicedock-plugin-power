@@ -82,6 +82,8 @@
 		let firstStoredMs = 0
 		let sessionT0Ms = 0
 		let lastTMs = 0
+		// t=0 是合法时间戳：用显式布尔判断「有没有上一个样点」，不要靠真假值
+		let lastTMsValid = false
 		let gapPending = false
 		let metaCollecting = false
 		let metaBuf = ''
@@ -200,6 +202,7 @@
 				}
 			}
 			lastTMs = 0
+			lastTMsValid = false
 			onChange()
 			return { at: idx, info: info || null }
 		}
@@ -309,10 +312,12 @@
 			}
 			const tSec = (tMs - sessionT0Ms) / 1000
 			const prev = lastTMs
-			let dt = 0
-			if (prev && !gapPending) dt = Math.max(0, (tMs - prev) / 1000)
+			// 缺口之后的第一个样点没有「上一个」：dt = 0，时间轴在这里断开
+			const hasPrev = lastTMsValid && !gapPending
+			const dt = hasPrev ? Math.max(0, (tMs - prev) / 1000) : 0
 			gapPending = false
 			lastTMs = tMs
+			lastTMsValid = true
 
 			if (recordMode === 'long') {
 				if (!longStats.t0) longStats.t0 = tSec
@@ -472,6 +477,7 @@
 			firstStoredMs = 0
 			sessionT0Ms = 0
 			lastTMs = 0
+			lastTMsValid = false
 			gapPending = false
 			gapCount = 0
 			resetLongStats()
@@ -795,6 +801,7 @@
 				acq.preMax = -Infinity
 			}
 			lastTMs = 0
+			lastTMsValid = false
 			gapPending = false
 			if (wasSampling) log('会话已终止（' + reason + '），供电状态置为未知', 'warn')
 			onChange()
@@ -807,6 +814,7 @@
 			stopScheduled = false
 			power = { on: null, source: 'unknown' }
 			lastTMs = 0
+			lastTMsValid = false
 			gapPending = false
 			if (acq) {
 				acq.startState = 0
