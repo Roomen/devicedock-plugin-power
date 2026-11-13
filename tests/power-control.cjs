@@ -103,6 +103,7 @@ function makeHarness(opts) {
 		options: { rxDrainMs: 0 },
 		log: (msg, level) => state.logs.push({ msg: msg, level: level || '' }),
 		onChange: () => { state.changes++ },
+		onSamplingEnd: (info) => { state.ends = (state.ends || []).concat([info]) },
 	})
 
 	return { link, control, wave, state }
@@ -391,6 +392,30 @@ test('采样沿停止：命中停沿后自动停采（异步发 STOP，不在入
 	await new Promise(function (r) { setTimeout(r, 20) })
 	assert.equal(h.control.isSampling(), false, '停沿后应停止采样')
 	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), '发了 AVERAGE_STOP')
+})
+
+test('自动停采：停止沿命中后走与手动停相同的会话结束回调（reason=acq_stop），手动停为 manual', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300)
+	for (let i = 0; i < 40 && h.control.isSampling(); i++) await wait(5)
+	await wait(20)
+	assert.equal(h.control.isSampling(), false)
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }], '自动停采通知了会话结束（界面据此停看门狗、释放 busy）')
+	// 再开一次手动停：回调原因复位为 manual，不沿用上次的 acq_stop
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	await h.control.stopCapture()
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }, { reason: 'manual' }])
 })
 
 test('启动前 STOP 写失败：中止启动、不写 START，返回原因并记错误日志', async () => {

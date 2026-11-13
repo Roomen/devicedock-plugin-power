@@ -361,6 +361,14 @@
 			},
 			log: log,
 			onChange: function () { renderSessionPanel() },
+			// 任何途径结束采样（含停止沿自动停）都在这里收尾：停看门狗、释放更新屏障、清告警
+			onSamplingEnd: function (info) {
+				if (stall) stall.stop()
+				releaseBusy()
+				sampleAlert = null
+				updateSampleButton()
+				if (info && info.reason === 'acq_stop') hostLog('capture stopped by the capture stop edge')
+			},
 			onSampleStored: function (index, tMs) {
 				if (laneTrack) laneTrack.note(index, tMs)
 			},

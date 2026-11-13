@@ -728,6 +728,48 @@ const fireKey = (win, key, props) => {
 		await tick(150)
 	}
 
+	// ---- 阻塞 2：停止沿自动停采 → 与手动停同样收尾（停看门狗、释放 busy、不记缺口、不误报）----
+	{
+		const acqStop = document.getElementById('acq-stop')
+		const acqStartSel = document.getElementById('acq-start')
+		acqStartSel.value = 'off'
+		fire(acqStartSel, 'change', {})
+		click(document, 'btn-connect')
+		await tick(500)
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		// 手动电平落在两段之间（adc 1000 ≈ 47 mA、adc 12000 ≈ 561 mA）
+		const lvl = document.getElementById('trig-level')
+		const lvlBefore = lvl.value
+		lvl.value = '300000'
+		fire(lvl, 'change', {})
+		const releasedBefore = state.released.length
+		const gapsBefore = text(document, 'chip-gaps')
+		acqStop.value = 'rise'
+		fire(acqStop, 'change', {})
+		state.pushRxSamples(3000, 1000)
+		await tick(60)
+		state.pushRxSamples(3000, 12000)
+		await tick(300)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '停止沿命中后停采：' + text(document, 'chip-sampling'))
+		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		assert.equal(state.released.length, releasedBefore + 1, '自动停采也释放更新屏障')
+		assert.ok(state.hostLogs.some((l) => /stopped by the capture stop edge/.test(l)), '自动停采写宿主日志')
+		// 看门狗已停：超过中断阈值后既不报中断，也不新增缺口
+		await tick(3200)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '自动停采后看门狗不能再报故障：' + text(document, 'chip-sampling'))
+		assert.equal(text(document, 'chip-gaps'), gapsBefore, '自动停采后不能记缺口')
+		const sl = document.getElementById('status-line')
+		assert.ok(!/stalled|No response/.test(sl.textContent), '状态条不能误报：' + sl.textContent)
+		acqStop.value = 'off'
+		fire(acqStop, 'change', {})
+		lvl.value = lvlBefore
+		fire(lvl, 'change', {})
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
 	// ---- 失败必须可见：START 写失败 / 设备无应答都要写到状态条，不能静默回到 idle ----
 	{
 		click(document, 'btn-connect')

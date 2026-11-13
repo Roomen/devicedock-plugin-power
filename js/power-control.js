@@ -47,6 +47,9 @@
 		const log = typeof cfg.log === 'function' ? cfg.log : function () {}
 		const onChange = typeof cfg.onChange === 'function' ? cfg.onChange : function () {}
 		const onSampleStored = typeof cfg.onSampleStored === 'function' ? cfg.onSampleStored : function () {}
+		// 采样会话结束（任何途径：手动停、停止沿自动停、存储上限停）。界面在这里统一收尾
+		// （停看门狗、释放更新屏障、清告警），自动停采不能绕过这一步。
+		const onSamplingEnd = typeof cfg.onSamplingEnd === 'function' ? cfg.onSamplingEnd : function () {}
 		const clock = cfg.clock || {
 			setTimeout: function (fn, ms) { return setTimeout(fn, ms) },
 			clearTimeout: function (t) { clearTimeout(t) },
@@ -91,6 +94,8 @@
 		let metaCollecting = false
 		let metaBuf = ''
 		let probe = null
+		// 本次 stopSampling 的原因（停止沿自动停 / 手动），传给 onSamplingEnd
+		let stopReason = null
 		let opChain = Promise.resolve()
 		let opDepth = 0
 		// energyUAs: Σ i·dt（µA·s = µC）；energyUWs: Σ i·V(t)·dt（µW·s），电压按摄入时刻记，属历史口径
@@ -300,8 +305,9 @@
 			clock.setTimeout(function () {
 				stopScheduled = false
 				if (!sampling) return
-				// stopSampling 内部只发一条 STOP，失败会自己记日志
-				stopSampling().catch(function (e) {
+				// 自动停采也排进操作队列（与手动停同一条路径），会话结束回调统一收尾
+				stopReason = 'acq_stop'
+				runOp(function () { return stopSampling() }).catch(function (e) {
 					log(msg('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				})
 			}, 0)
@@ -623,6 +629,10 @@
 			}
 			sampling = false
 			onChange()
+			try {
+				onSamplingEnd({ reason: stopReason || 'manual' })
+			} catch (e) { /* 界面收尾出错不影响发 STOP */ }
+			stopReason = null
 			let stopW = { ok: true, stale: false }
 			try {
 				stopW = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
