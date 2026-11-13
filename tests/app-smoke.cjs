@@ -794,6 +794,23 @@ const fireKey = (win, key, props) => {
 		assert.equal(text(document, 'chip-gaps'), gapsBefore, '自动停采后不能记缺口')
 		const sl = document.getElementById('status-line')
 		assert.ok(!/stalled|No response/.test(sl.textContent), '状态条不能误报：' + sl.textContent)
+		// 停止沿命中但 STOP 写失败：失败原因上状态条（结果被检查，不只显示「命中停止沿」）
+		click(document, 'btn-sample')
+		await tick(200)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		const releasedMid = state.released.length
+		state.failOnByte = 0x07
+		state.failOnByteError = 'USB 写超时'
+		state.pushRxSamples(3000, 1000)
+		await tick(60)
+		state.pushRxSamples(3000, 12000)
+		await tick(300)
+		state.failOnByte = null
+		state.failOnByteError = null
+		assert.equal(text(document, 'chip-sampling'), 'idle')
+		assert.equal(state.released.length, releasedMid + 1)
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /^Capture stop edge hit, but stopping the capture failed/, '状态条：' + sl.textContent)
 		acqStop.value = 'off'
 		fire(acqStop, 'change', {})
 		lvl.value = lvlBefore

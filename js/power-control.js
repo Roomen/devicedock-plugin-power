@@ -102,12 +102,14 @@
 		const longStats = { n: 0, sumI: 0, minI: Infinity, maxI: -Infinity, energyUAs: 0, energyUWs: 0, durSec: 0, gaps: 0, t0: 0, tLast: 0 }
 
 		// ---- 串行队列：界面操作排队，后台（failFast）不排在界面操作后面 ----
+		// 停止类操作（o.stop：手动停、停止沿自动停）永不因忙 / 队列满被拒：拒掉就是采集停不下来。
+		// 上限只挡非停止操作；调用方必须检查返回的 ok，失败要显示出来。
 		function runOp(fn, o) {
 			o = o || {}
-			if (o.failFast && opDepth > 0) {
+			if (o.failFast && !o.stop && opDepth > 0) {
 				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_running'), ref: msg('ctl.busy_running') })
 			}
-			if (opDepth >= opts.maxQueueDepth) {
+			if (!o.stop && opDepth >= opts.maxQueueDepth) {
 				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_queue'), ref: msg('ctl.busy_queue') })
 			}
 			opDepth++
@@ -307,7 +309,12 @@
 				if (!sampling) return
 				// 自动停采也排进操作队列（与手动停同一条路径），会话结束回调统一收尾
 				stopReason = 'acq_stop'
-				runOp(function () { return stopSampling() }).catch(function (e) {
+				runOp(function () { return stopSampling() }, { stop: true }).then(function (r) {
+					// 结果必须看：停不下来或 STOP 没写出去都要上状态条，不能只留一条「命中停止沿」
+					if (!r || r.ok === false) {
+						log(msg('ctl.acq_stop_failed', { why: (r && (r.ref || r.message || r.code)) || msg('ui.unknown_reason') }), 'error')
+					}
+				}, function (e) {
 					log(msg('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				})
 			}, 0)
@@ -708,7 +715,7 @@
 				const g = await guardStart(guard)
 				if (g) return g
 				return await stopSampling(guard)
-			}, { failFast: !!guard })
+			}, { failFast: !!guard, stop: true })
 		}
 
 		function togglePower() {

@@ -446,6 +446,71 @@ test('启动前 STOP 写失败：中止启动、不写 START，返回原因并�
 	assert.ok(!h.state.logs.some((l) => l.level === 'success'), '没有后续「采样已开始」盖掉失败')
 })
 
+test('队列满：停止沿自动停采不被丢弃，非停止操作才被拒', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0) // 让 startCapture 的出队记账先结算，下面 8 个才是真正占满队列的操作
+	// 8 个慢操作（每个都真的写电压）把队列塞满（上限 8），第 9 个非停止操作被拒；
+	// 单次写入够慢，停止沿命中时队列仍是满的
+	h.state.writeDelay = 100
+	const pending = []
+	for (let i = 0; i < 8; i++) pending.push(h.control.setVoltage(2000 + i * 100))
+	const rejected = await h.control.setVoltage(3300)
+	assert.equal(rejected.code, 'power_busy', '队列满时非停止操作被拒')
+	h.state.writes.length = 0
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300) // 命中停止沿，此时队列仍是满的
+	await Promise.all(pending)
+	for (let i = 0; i < 60 && h.control.isSampling(); i++) await wait(10)
+	await wait(30)
+	assert.equal(h.control.isSampling(), false, '停止沿在队列满时也必须停下采集')
+	assert.ok(h.state.writes.some((w) => w.bytes[0] === 0x07), 'STOP 真的写出去了')
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }])
+	assert.ok(!h.state.logs.some((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed'), '没有停采失败')
+})
+
+test('队列满：手动停止同样不被拒', async () => {
+	const h = await connected()
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writeDelay = 100
+	const pending = []
+	for (let i = 0; i < 8; i++) pending.push(h.control.setVoltage(2000 + i * 100))
+	assert.equal((await h.control.setVoltage(3300)).code, 'power_busy')
+	const r = await h.control.stopCapture()
+	await Promise.all(pending)
+	assert.equal(r.ok, true, '手动停止排进满队列后照常执行：' + (r && r.code))
+	assert.equal(h.control.isSampling(), false)
+})
+
+test('自动停采的结果被检查：STOP 写失败时记错误（上状态条），不只留「命中停止沿」', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	h.state.writeMode = 'throw'
+	const feed = (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+	feed(100, 300)
+	feed(0, 300)
+	for (let i = 0; i < 40 && !h.state.logs.some((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed'); i++) await wait(5)
+	const fail = h.state.logs.find((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed')
+	assert.ok(fail, '停采失败要记日志')
+	assert.equal(fail.level, 'error', '错误级（会上状态条）')
+})
+
 test('长期模式：仍然维护折叠总览（minimap），但不进波形环', async () => {
 	const h = await connected()
 	h.control.setRecordMode('long')

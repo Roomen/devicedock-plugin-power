@@ -143,6 +143,11 @@
 	let lastTheme = null
 	const hintFns = {}
 
+	/** 控制层操作的失败原因：优先惰性消息（切语言可重绘），再退到文本 / 错误码 */
+	function opWhy(r) {
+		return (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason')
+	}
+
 	function reasonText(code) {
 		const key = 'ui.reason_' + code
 		return I18N.has(key) ? tr(key) : String(code)
@@ -542,7 +547,10 @@
 			if (link.isOpen()) {
 				closingByUs = true
 				try {
-					if (control.isSampling()) await control.stopCapture()
+					if (control.isSampling()) {
+						const sr = await control.stopCapture()
+						if (!sr || !sr.ok) log(M('app.disconnect_stop_failed', { why: opWhy(sr) }), 'error')
+					}
 					await link.close()
 				} finally {
 					closingByUs = false
@@ -567,13 +575,18 @@
 				log(M('app.claimed'), 'success')
 				hostLog('claimed ' + label + ' exclusively')
 				connectInit = (async function () {
+					// 两步都经操作队列：返回 {ok:false}（忙 / 队列满）时不能当成功用，要上状态条
 					const ok = await control.fetchModifiers()
-					if (ok) {
+					if (ok && typeof ok === 'object' && ok.ok === false) {
+						log(M('app.meta_skipped', { why: opWhy(ok) }), 'error')
+					} else if (ok) {
 						const mv = control.readVoltageMv()
 						if (mv != null) $('voltage').value = String(mv)
 					}
 					const probe = await control.probeDutPower()
-					if (probe) {
+					if (probe && probe.ok === false) {
+						log(M('app.probe_skipped', { why: opWhy(probe) }), 'error')
+					} else if (probe) {
 						control.markPowered(probe.on, 'probed')
 						log(M('app.probe_result', { state: M(probe.on ? 'app.probe_on' : 'app.probe_off'), median: probe.medianUA.toFixed(2), n: probe.n }))
 					}
@@ -671,7 +684,7 @@
 		sampleAlert = null
 		try {
 			const r = await control.stopCapture()
-			if (r && !r.ok) log(M('app.stop_result', { why: r.ref || r.message || r.code }), 'warn')
+			if (!r || !r.ok) log(M('app.stop_result', { why: opWhy(r) }), 'error')
 		} catch (e) {
 			log(M('app.stop_error', { err: (e && e.message ? e.message : e) }), 'error')
 		} finally {
@@ -1531,7 +1544,17 @@
 				log(M('app.import_failed', { why: reasonText(parsed.reason) }), 'error')
 				return
 			}
-			if (control.isSampling()) await control.stopCapture()
+			if (control.isSampling()) {
+				const sr = await control.stopCapture()
+				if ((!sr || !sr.ok) && control.isSampling()) {
+					const swhy = opWhy(sr)
+					setHintFn('import-hint', function () { return tr('app.import_stop_failed', { why: swhy }) })
+					hint.dataset.warn = '1'
+					log(M('app.import_stop_failed', { why: swhy }), 'error')
+					return
+				}
+				if (!sr || !sr.ok) log(M('app.stop_result', { why: opWhy(sr) }), 'error')
+			}
 			const res = await control.importSeries(parsed)
 			if (!res || !res.ok) {
 				// 装不下就如实说不完整（实际 N / 请求 M），不能报完整成功
