@@ -29,11 +29,15 @@
 		const out = {
 			ok: false,
 			rows: [],
+			// 每一段连续的样点（gap 标记、倒序时间、时间突变都会断开）
+			segments: [],
 			gaps: [],
 			samplePeriodSec: 0,
 			volts: null,
+			hasVoltage: false,
 			voltsMixed: false,
 			skipped: 0,
+			timeJumps: 0,
 			markers: 0,
 			reason: '',
 		}
@@ -44,24 +48,41 @@
 		const lines = text.split(/\r?\n/)
 		let header = null
 		let pendingGap = false
-		let firstTime = null
-		let lastTime = null
 		let dtSum = 0
 		let dtN = 0
+		// 只在**同一个连续段内**统计时间步长：跨 gap 的时间差不是采样周期
+		let segFirstTime = null
+		let segLastTime = null
+		let segDtSum = 0
+		let segDtN = 0
+		let segStart = 0
 		let voltNum = 0
 		let voltDen = 0
+		const closeSegment = function () {
+			const end = out.rows.length
+			if (end > segStart) out.segments.push({ start: segStart, end: end, dtSum: segDtSum, dtN: segDtN })
+			segStart = end
+			segFirstTime = null
+			segLastTime = null
+			segDtSum = 0
+			segDtN = 0
+		}
+		const markGap = function () {
+			// 缺口：下一个数据行起是新段，并记下缺口位置（行下标）
+			if (out.rows.length && out.gaps[out.gaps.length - 1] !== out.rows.length) out.gaps.push(out.rows.length)
+			pendingGap = true
+			closeSegment()
+		}
 		for (let i = 0; i < lines.length; i++) {
 			const raw = lines[i]
 			if (!raw || !raw.trim()) continue
 			const line = raw.trim()
 			if (line.charAt(0) === '#') {
-				// 缺口标记行：下一行数据开始是一个新段
 				out.markers++
-				if (/gap/i.test(line)) pendingGap = true
+				if (/gap/i.test(line)) markGap()
 				continue
 			}
 			if (!header && /[a-z_]/i.test(line)) {
-				// 表头：按名字定位列，认不出来就退回按位置
 				const cols = line.split(',').map(function (s) { return s.trim().toLowerCase() })
 				const find = function (names) {
 					for (let k = 0; k < names.length; k++) {
@@ -100,8 +121,6 @@
 				if (header.power >= 0) power = num(cells[header.power])
 				if (header.voltage >= 0) voltage = num(cells[header.voltage])
 			} else {
-				// 无表头：按位置猜。3 列以上视为 index,time,current[,power[,voltage]]；
-				// 2 列视为 time,current
 				const n = cells.length
 				if (n >= 3) {
 					index = num(cells[0])
@@ -124,40 +143,58 @@
 				out.reason = 'too_many_rows'
 				return out
 			}
+			// 时间列：倒序 / 不变 → 明确断开（不是同一段连续采样）
+			if (timeSec != null && segLastTime != null) {
+				const dt = timeSec - segLastTime
+				if (!(dt > 0)) {
+					out.timeJumps++
+					markGap()
+				} else if (segDtN > 0 && Math.abs(dt - segDtSum / segDtN) > Math.max(1e-12, (segDtSum / segDtN) * 0.5)) {
+					// 步长突变（>50%）：也当成一段结束，避免把间隙摊进采样周期
+					out.timeJumps++
+					markGap()
+				}
+			}
 			if (pendingGap) {
-				out.gaps.push(out.rows.length)
 				pendingGap = false
+				segStart = out.rows.length
 			}
 			if (index == null) index = out.rows.length
 			out.rows.push({ index: index, timeSec: timeSec, currentUA: current, powerUW: power, voltageMV: voltage })
 			if (voltage != null) {
+				out.hasVoltage = true
 				if (out.volts == null) out.volts = voltage
 				else if (Math.abs(out.volts - voltage) > 1) out.voltsMixed = true
 			}
-			// 混合电压时按电流加权（导出时 power = i × v，可用功率反推每行电压）
+			// 混合电压时按电流加权（power = i × v，可用功率反推每行电压）
 			if (power != null && current) {
-				voltNum += power * 1000 // µW / µA = V → ×1000 = mV
+				voltNum += power * 1000
 				voltDen += current
 			}
 			if (timeSec != null) {
-				if (firstTime == null) firstTime = timeSec
-				if (lastTime != null) {
-					const dt = timeSec - lastTime
-					if (dt > 0) { dtSum += dt; dtN++ }
+				if (segFirstTime == null) segFirstTime = timeSec
+				if (segLastTime != null) {
+					const dt = timeSec - segLastTime
+					if (dt > 0) {
+						segDtSum += dt
+						segDtN++
+						dtSum += dt
+						dtN++
+					}
 				}
-				lastTime = timeSec
+				segLastTime = timeSec
 			}
 		}
+		closeSegment()
 		if (!out.rows.length) {
 			out.reason = out.reason || 'no_rows'
 			return out
 		}
-		// 采样周期：取时间列的平均步长；没有时间列就按 1 kHz 估计（界面会标注）
+		// 采样周期：只取**段内**时间差的平均；没有时间列就由界面标注「按 1 kHz 估计」
 		out.samplePeriodSec = dtN > 0 ? dtSum / dtN : 0
 		out.estimatedPeriod = !(dtN > 0)
 		if (out.voltsMixed && voltDen > 0) out.volts = voltNum / voltDen
-		// 功率列可以用来校验电压（power ≈ i × v）：两者都缺时明确说能量不可用
-		out.powerUsable = out.volts != null && out.volts > 0
+		out.powerUsable = out.hasVoltage && out.volts != null && out.volts > 0
 		out.ok = true
 		return out
 	}

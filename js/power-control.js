@@ -833,40 +833,77 @@
 		 * 缺口标记按行位置插进波形（不跨缺口积分）。不写设备、不改源电压设置。
 		 * @param {object} parsed power-import.parseCsv 的返回值
 		 */
-		async function importSeries(parsed) {
+		/**
+		 * 把一份导入的样点灌进波形（CSV 导入）。
+		 *
+		 * 规则：
+		 *  - 不碰设备控制状态（源电压设置保持不变）：导入文件里的电压只写进**波形历史**，
+		 *    每个样点带着它自己那行的电压；
+		 *  - 文件没有电压列 → 样点电压记为未知，能量不可用（绝不拿当前设置顶替）；
+		 *  - 分批写入并让出线程，等归档队列推进；仍然装不下就如实返回「不完整（实际 N/请求 M）」，
+		 *    不报完整成功。
+		 * @param {object} parsed power-import.parseCsv 的返回值
+		 * @param {object} [o] { batchSize, yieldMs }
+		 */
+		async function importSeries(parsed, o) {
+			o = o || {}
 			if (!parsed || !parsed.ok || !parsed.rows || !parsed.rows.length) {
 				return { ok: false, code: 'empty', message: '没有可导入的样点' }
 			}
 			if (sampling) await stopSampling()
 			clearSessionState()
 			recordMode = 'wave'
-			if (parsed.samplePeriodSec > 0) samplePeriodSec = parsed.samplePeriodSec
-			else samplePeriodSec = 0.001
+			samplePeriodSec = parsed.samplePeriodSec > 0 ? parsed.samplePeriodSec : 0.001
+			const estimated = !!parsed.estimatedPeriod
 			const gapRows = {}
 			for (let i = 0; i < parsed.gaps.length; i++) gapRows[parsed.gaps[i]] = true
-			let importedVoltage = parsed.volts != null ? Math.round(parsed.volts) : null
+			const batchSize = o.batchSize > 0 ? o.batchSize : 2048
+			const yieldMs = o.yieldMs > 0 ? o.yieldMs : 0
+			const requested = parsed.rows.length
 			let stored = 0
+			let gapsApplied = 0
 			const perMs = samplePeriodSec * 1000
+			let storageStopped = false
 			for (let i = 0; i < parsed.rows.length; i++) {
-				// 缺口标记落在「该行之前」：先记断点，再压入这一行
 				if (gapRows[i]) {
 					noteGap({ reason: 'import_gap', at: wave && wave.total ? wave.total() : i })
+					gapsApplied++
 				}
 				const row = parsed.rows[i]
-				// 逐行电压（历史口径）：只有导入文件里带电压时才覆盖
-				if (row.voltageMV != null && isFinite(row.voltageMV)) voltageMv = Math.round(row.voltageMV)
-				if (!wave || !wave.push(row.currentUA)) continue
+				// 电压只进波形历史（未知就是 null，绝不继承界面上的设备设置）
+				const volts = row.voltageMV != null && isFinite(row.voltageMV) ? row.voltageMV / 1000 : null
+				if (!wave || !wave.push(row.currentUA, volts)) {
+					storageStopped = true
+					break
+				}
 				stored++
 				try {
 					onSampleStored(wave.total() - 1, i * perMs)
 				} catch (e) { /* 时间锚点不影响数据 */ }
+				// 分批让出：否则归档队列没有机会推进，小容量存储会半途停采
+				if ((i + 1) % batchSize === 0) {
+					await new Promise(function (r) { clock.setTimeout(r, yieldMs) })
+					if (wave && typeof wave.waitIdle === 'function') await wave.waitIdle(200)
+				}
 			}
-			if (importedVoltage != null) voltageMv = importedVoltage
-			voltageChanges = parsed.voltsMixed ? 1 : 0
-			log('已导入 ' + stored + ' 个样点（' + (samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : '周期未知') +
-				(parsed.gaps.length ? ' · ' + parsed.gaps.length + ' 处缺口' : '') + '）', 'success')
 			onChange()
-			return { ok: true, samples: stored, gaps: parsed.gaps.length, samplePeriodSec: samplePeriodSec }
+			if (storageStopped || stored < requested) {
+				log('CSV 导入不完整：只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）', 'warn')
+				return {
+					ok: false, code: 'incomplete',
+					stored: stored, requested: requested, gaps: gapsApplied,
+					message: '只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）',
+				}
+			}
+			log('已导入 ' + stored + ' 个样点（' + (samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : '周期未知') +
+				(estimated ? ' · 周期按默认值估计' : '') +
+				(gapsApplied ? ' · ' + gapsApplied + ' 处缺口' : '') +
+				(parsed.hasVoltage ? '' : ' · 文件无电压，能量不可用'), 'success')
+			return {
+				ok: true, samples: stored, requested: requested, gaps: gapsApplied,
+				samplePeriodSec: samplePeriodSec, estimatedPeriod: estimated,
+				hasVoltage: !!parsed.hasVoltage, voltsMixed: !!parsed.voltsMixed,
+			}
 		}
 
 		function acqState() {

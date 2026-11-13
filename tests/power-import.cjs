@@ -105,5 +105,52 @@ const I = require('../js/power-import.js')
 		assert.equal(p.reason, 'too_many_rows')
 	}
 
+	// ---- N3：缺口重置时间基线，周期只按段内时间差 ----
+	{
+		const csv = [
+			'index,time_s,current_uA',
+			'0,0,1000',
+			'1,0.001,1000',
+			'# gap overflow 2..2',
+			'2,1,1000',
+			'3,1.001,1000',
+			'4,1.002,1000',
+		].join('\n')
+		const p = I.parseCsv(csv)
+		assert.equal(p.ok, true)
+		assert.equal(p.rows.length, 5)
+		assert.ok(Math.abs(p.samplePeriodSec - 0.001) < 1e-12, '周期必须是段内的 1 ms，不能把缺口摊进去：' + p.samplePeriodSec)
+		assert.equal(p.gaps.length, 1, '缺口标记要留一条：' + JSON.stringify(p.gaps))
+		assert.equal(p.segments.length, 2, '缺口把导入拆成两段：' + JSON.stringify(p.segments.map((s) => [s.start, s.end])))
+		assert.equal(p.segments[0].dtN, 1)
+		assert.equal(p.segments[1].dtN, 2)
+	}
+
+	// ---- N3：倒序 / 不变时间明确断开，不参与周期统计 ----
+	{
+		const p = I.parseCsv('index,time_s,current_uA\n0,0,1\n1,0.001,1\n2,0.0005,1\n3,0.0015,1\n')
+		assert.equal(p.ok, true)
+		assert.ok(p.timeJumps >= 1, '倒序时间必须被识别：' + p.timeJumps)
+		assert.ok(p.segments.length >= 2, '断成多段：' + p.segments.length)
+		assert.ok(Math.abs(p.samplePeriodSec - 0.001) < 1e-12, '周期只用有效的那一段：' + p.samplePeriodSec)
+	}
+
+	// ---- N3：步长突变同样断开，避免把间隙摊进周期 ----
+	{
+		const p = I.parseCsv('index,time_s,current_uA\n0,0,1\n1,0.001,1\n2,0.002,1\n3,1.002,1\n4,1.003,1\n')
+		assert.ok(p.timeJumps >= 1, '步长突变要断开：' + p.timeJumps)
+		assert.ok(Math.abs(p.samplePeriodSec - 0.001) < 1e-12, '周期仍是 1 ms：' + p.samplePeriodSec)
+	}
+
+	// ---- N4：没有电压列 → hasVoltage=false（能量不可用），不能继承当前设置 ----
+	{
+		const p = I.parseCsv('index,time_s,current_uA\n0,0,1000\n1,1,1000\n')
+		assert.equal(p.hasVoltage, false)
+		assert.equal(p.powerUsable, false)
+		assert.equal(p.volts, null)
+		assert.match(I.summarize(p).text, /no voltage/)
+		assert.match(I.summarize(p).text, /energy unavailable/)
+	}
+
 	console.log('power-import: ok')
 })()

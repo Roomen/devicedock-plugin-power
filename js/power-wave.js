@@ -397,6 +397,24 @@
 			return summary
 		}
 
+		/**
+		 * 等归档队列推进到空闲（导入 / 大批量写入时按批调用）。
+		 * 只等「队列排空 + 没有正在写的块」，不等待下一次归档（那要等热区顶满）。
+		 * @param {number} [maxMs] 最多等多久（默认 200 ms）
+		 */
+		function waitIdle(maxMs) {
+			const budget = maxMs > 0 ? maxMs : 200
+			const deadline = Date.now() + budget
+			return new Promise(function (resolve) {
+				const step = function () {
+					if (!archiveRunning && !archiveQueue.length) return resolve(true)
+					if (Date.now() >= deadline) return resolve(false)
+					setTimeout(step, 0)
+				}
+				step()
+			})
+		}
+
 		/** 当前会话序号：调用方可据此判断一次异步分析是否还有效 */
 		function epoch() {
 			return waveEpoch
@@ -1140,6 +1158,7 @@
 			iAtExact: iAtExact,
 			walkExact: walkExact,
 			epoch: epoch,
+			waitIdle: waitIdle,
 			hydrateChunk: hydrateChunk,
 			droppedRanges: droppedRanges,
 			chunkVolts: chunkVolts,

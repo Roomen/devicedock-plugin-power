@@ -1318,8 +1318,23 @@
 			if (control.isSampling()) await control.stopCapture()
 			const res = await control.importSeries(parsed)
 			if (!res || !res.ok) {
-				hint.textContent = 'Import failed: ' + ((res && res.message) || 'unknown')
+				// 装不下就如实说不完整（实际 N / 请求 M），不能报完整成功
+				const why = (res && res.message) ? res.message : 'unknown'
+				hint.textContent = 'Import incomplete: ' + why
 				hint.dataset.warn = '1'
+				log('CSV 导入不完整：' + why, 'warn')
+				hostLog('csv import incomplete: ' + why)
+				if (res && res.stored) {
+					// 已经写进去的部分照样可以看，只是要标清楚是不完整的导入
+					view.live = true
+					view.xOffset = 0
+					view.cursorA = null
+					view.cursorB = null
+					renderSessionPanel()
+					updateStoragePanel()
+					updateGapChip()
+					scheduleDraw()
+				}
 				return
 			}
 			// 导入的会话从零开始：视图、游标、触发、分析全都重置
@@ -1335,8 +1350,17 @@
 			analysis.key = ''
 			edgeCache = { key: '', edges: null }
 			viewStatsCache = null
-			hint.textContent = sum.text
-			hint.dataset.warn = sum.warn ? '1' : '0'
+			// 提示按**实际结果**拼，不用解析出的行数冒充导入成功
+			const bits = [res.samples + ' / ' + res.requested + ' rows imported']
+			bits.push(res.samplePeriodSec > 0 ? Math.round(1 / res.samplePeriodSec) + ' Hz' : 'no time column')
+			if (res.estimatedPeriod) bits.push('period estimated')
+			if (res.gaps) bits.push(res.gaps + ' gap(s)')
+			if (parsed.skipped) bits.push(parsed.skipped + ' row(s) skipped')
+			if (res.voltsMixed) bits.push('mixed voltage (per sample)')
+			if (!res.hasVoltage) bits.push('no voltage → energy unavailable')
+			hint.textContent = bits.join(' · ')
+			hint.dataset.warn = (!res.hasVoltage || res.estimatedPeriod) ? '1' : '0'
+			void sum
 			hostLog('imported ' + res.samples + ' samples from ' + file.name)
 			renderSessionPanel()
 			updateStoragePanel()

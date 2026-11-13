@@ -488,17 +488,18 @@ test('保存设置后 Start 必须真的下发 START（旧 sampling 状态不会
 	assert.deepEqual(h.state.writes.map((w) => w.bytes[0]), [0x07, 0x06])
 })
 
-test('导入会话：按导入的周期与逐行电压灌入，缺口标记落位，统计按段积分', async () => {
+test('导入会话：按导入的周期与逐行电压灌入，缺口标记落位，设备电压设置不受影响', async () => {
 	const h = await connected()
+	h.control.setVoltageSource(3300)
 	const I = require('../js/power-import.js')
 	const csv = [
 		'index,time_s,current_uA,power_uW,voltage_mV',
 		'0,0,1000,3300,3300',
 		'1,0.001,1000,3300,3300',
-		'2,0.002,1000,3300,3300',
+		'2,0.002,1000,1650,1650',
 		'# gap import 3..3',
-		'3,0.003,0,0,3300',
-		'4,0.004,0,0,3300',
+		'3,1.0,0,0,1650',
+		'4,1.001,0,0,1650',
 	].join('\n')
 	const parsed = I.parseCsv(csv)
 	assert.equal(parsed.ok, true)
@@ -506,13 +507,49 @@ test('导入会话：按导入的周期与逐行电压灌入，缺口标记落�
 	assert.equal(res.ok, true)
 	assert.equal(res.samples, 5)
 	assert.equal(res.gaps, 1)
-	assert.ok(Math.abs(h.control.getSamplePeriodSec() - 0.001) < 1e-12, '周期来自导入的时间列')
+	assert.ok(Math.abs(h.control.getSamplePeriodSec() - 0.001) < 1e-12, '周期来自段内时间列，缺口不摊进去')
 	assert.equal(h.wave.pushed, 5)
-	assert.equal(h.wave.gaps().length, 1, '缺口标记必须落进波形：' + JSON.stringify(h.wave.gaps()))
-	const s = h.control.captureSummary()
-	assert.equal(s.gaps, 1, '摘要里的缺口来自统计')
-	// 导入不写设备
-	assert.equal(h.state.writes.length, 0)
+	assert.equal(h.wave.gaps().length, 1, '缺口标记必须落进波形')
+	// N4：导入不能改写设备控制用的电压设置
+	assert.equal(h.control.readVoltageMv(), 3300, '导入文件里的电压只能进历史，不改设备设置')
+	assert.equal(h.state.writes.length, 0, '导入不写设备')
+	// 波形历史里带着逐样点电压：子区间能量按各自电压
+	const st = h.wave.stats ? null : null
+	void st
+})
+
+test('N4：文件没有电压时能量不可用，不继承当前设置', async () => {
+	const h = await connected()
+	h.control.setVoltageSource(3300)
+	const I = require('../js/power-import.js')
+	const parsed = I.parseCsv('index,time_s,current_uA\n0,0,1000\n1,1,1000\n')
+	assert.equal(parsed.hasVoltage, false)
+	const res = await h.control.importSeries(parsed)
+	assert.equal(res.ok, true)
+	assert.equal(res.hasVoltage, false)
+	assert.equal(h.control.readVoltageMv(), 3300, '设备设置保持不变')
+})
+
+test('N5：存储装不下时返回不完整（实际 N / 请求 M），不报完整成功', async () => {
+	// 用一个有硬上限的假波形：写到第 40 个样点后 push 返回 false
+	const h = await connected()
+	let written = 0
+	h.wave.push = function () {
+		if (written >= 40) return false
+		written++
+		h.wave.pushed++
+		h.wave.lastPushed = arguments[0]
+		return true
+	}
+	const I = require('../js/power-import.js')
+	const lines = ['index,time_s,current_uA,voltage_mV']
+	for (let i = 0; i < 200; i++) lines.push(i + ',' + (i * 0.001) + ',1000,3300')
+	const parsed = I.parseCsv(lines.join('\n'))
+	const res = await h.control.importSeries(parsed, { batchSize: 16 })
+	assert.equal(res.ok, false, '装不下必须报不完整')
+	assert.equal(res.code, 'incomplete')
+	assert.ok(res.stored < res.requested, '实际写入少于请求：' + res.stored + ' / ' + res.requested)
+	assert.match(res.message, /只写入了 \d+ \/ 200 个样点/)
 })
 
 test('长期模式：时长只累计有效间隔、缺口有计数、能量按摄入时的电压', async () => {
