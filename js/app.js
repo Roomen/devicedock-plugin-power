@@ -308,7 +308,7 @@
 			metaBudgetBytes: settings.ramMiB * MIB + 32 * MIB,
 			voltage: function () {
 				const st = control ? control.state() : null
-				return st && st.voltageMv != null ? st.voltageMv / 1000 : 0
+				return st && st.voltageMv != null ? st.voltageMv / 1000 : null
 			},
 			samplePeriod: function () { return control ? control.getSamplePeriodSec() : 0 },
 			log: log,
@@ -389,7 +389,7 @@
 				releaseBusy()
 				sampleAlert = null
 				updateSampleButton()
-				if (info && info.reason === 'acq_stop') hostLog('capture stopped by the capture stop edge')
+				if (info && info.reason === 'acq_stop') hostLog('capture stop edge hit; local acquisition ended, device STOP requested')
 			},
 			onSampleStored: function (index, tMs) {
 				if (laneTrack) laneTrack.note(index, tMs)
@@ -708,17 +708,19 @@
 
 	async function stopCapture(reason) {
 		sampleAlert = null
+		let stopConfirmed = false
 		try {
 			const r = await control.stopCapture()
-			if (!r || !r.ok) log(M('app.stop_result', { why: opWhy(r) }), 'error')
+			stopConfirmed = !!(r && r.ok)
+			if (!stopConfirmed) log(M('app.stop_result', { why: opWhy(r) }), 'error')
 		} catch (e) {
 			log(M('app.stop_error', { err: (e && e.message ? e.message : e) }), 'error')
 		} finally {
 			releaseBusy()
 			if (stall) stall.stop()
-			if (reason === 'storage') log(M('app.stopped_storage'), 'warn')
+			if (reason === 'storage') log(M(stopConfirmed ? 'app.stopped_storage' : 'app.storage_stop_unconfirmed'), 'warn')
 			const s = control.captureSummary()
-			hostLog('capture stopped: ' + fmtCount(s.totalSamples) + ' samples, ' + s.gaps + ' gap(s)')
+			hostLog((stopConfirmed ? 'capture stopped: ' : 'capture stop unconfirmed: ') + fmtCount(s.totalSamples) + ' samples, ' + s.gaps + ' gap(s)')
 			renderSessionPanel()
 			updateSampleButton()
 			scheduleDraw()
@@ -731,6 +733,11 @@
 		btn.textContent = tr(sampling ? 'ui.btn_stop' : 'ui.btn_start')
 		btn.dataset.primary = sampling ? '0' : '1'
 		const chip = $('chip-sampling')
+		if (control && control.isStartUnknown() && !sampling) {
+			chip.dataset.state = 'warn'
+			chip.textContent = tr('ui.alert_start_unknown')
+			return
+		}
 		if (sampleAlert) {
 			chip.dataset.state = sampleAlert.state
 			chip.textContent = tr(sampleAlert.key)
@@ -1305,7 +1312,7 @@
 			setText('win-mean', fmt.fmtCurrent(win.avgI))
 			setText('win-range', fmt.fmtCurrent(win.minI) + ' / ' + fmt.fmtCurrent(win.maxI))
 			setText('ro-current', fmt.fmtCurrent(win.avgI))
-			setText('ro-power', fmt.fmtPower(win.avgP))
+			setText('ro-power', win.avgP == null ? tr('ui.na_no_voltage') : fmt.fmtPower(win.avgP))
 			setText('ro-samples', fmtCount(summary.retainedSamples))
 			const span = range.count > 1 ? (range.count - 1) * control.getSamplePeriodSec() : 0
 			setText('scope-meta', tr('ui.scope_meta', { n: fmtCount(range.count), dur: fmt.fmtDuration(span), state: tr(view.live ? 'ui.live' : 'ui.paused') }))
@@ -2032,6 +2039,7 @@
 				log(M('app.voltage_failed', { why: opWhy(r) }), 'error')
 			}
 			renderSessionPanel()
+			renderDiagnostics()
 		})
 		$('btn-power').addEventListener('click', async function () {
 			const want = control.state().powered.state !== 'on'

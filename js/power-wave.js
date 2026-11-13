@@ -1068,7 +1068,7 @@
 			const per = samplePeriod()
 			const r = integrateRange(start, end, { samplePeriodSec: per })
 			const avgI = r.n ? r.sumI / r.n : 0
-			const avgP = r.n ? r.sumP / r.n : 0
+			const avgP = r.voltsUnknown ? null : (r.n ? r.sumP / r.n : 0)
 			return enrichStats({
 				n: r.n,
 				avgI: avgI,

@@ -306,6 +306,11 @@ function makeEnv(state, opts) {
 	for (const rel of files) {
 		vm.runInContext(fs.readFileSync(path.join(root, rel), 'utf8'), sandbox, { filename: rel })
 	}
+	const makeWave = win.PowerWave.createWave
+	win.PowerWave.createWave = function (cfg) {
+		state.triggerStorageStop = cfg.onStorageStop
+		return makeWave(cfg)
+	}
 	const sdk = makeFakeSdk(state)
 	sandbox.window.DeviceDockPlugin = sdk
 	sandbox.DeviceDockPlugin = sdk
@@ -424,6 +429,39 @@ const fireKey = (win, key, props) => {
 	await tick(520)
 	const kept = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
 	assert.ok(kept > 0, '样点进波形：' + ['st-samples', 'ro-samples', 'scope-meta'].map((id) => id + '=' + text(document, id)).join(' '))
+
+	// 电压超时的未知时段必须穿过 app → wave → 统计/CSV，迟到确认只影响后续样点。
+	state.deferred = []
+	state.defer = (b) => b[0] === 0x0d
+	document.getElementById('voltage').value = '2500'
+	click(document, 'btn-apply-voltage')
+	await tick(1500)
+	state.pushRxSamples(3000, 1000)
+	await tick(150)
+	click(document, 'btn-export-all')
+	await tick(150)
+	const pendingRows = state.files.pop().text.split('\n').filter((r) => /^\d+,/.test(r)).map((r) => r.split(','))
+	assert.ok(pendingRows.some((r) => r[4] === '1800'), '写入前保留已确认电压')
+	assert.ok(pendingRows.slice(-5).every((r) => r[3] === '' && r[4] === ''), '未超时时 pending 样点的功率和电压均未知')
+	await tick(1350)
+	state.pushRxSamples(3000, 1000)
+	await tick(200)
+	state.deferred[0].resolve()
+	await tick(100)
+	state.defer = null
+	state.pushRxSamples(3000, 1000)
+	await tick(250)
+	click(document, 'btn-export-all')
+	await tick(200)
+	const csvRows = state.files.pop().text.split('\n').filter((r) => /^\d+,/.test(r)).map((r) => r.split(','))
+	assert.ok(csvRows.some((r) => r[3] === '' && r[4] === ''), '未知时段功率和电压列为空')
+	assert.ok(csvRows.some((r) => r[4] === '1800'), '超时前电压保留')
+	assert.ok(csvRows.some((r) => r[4] === '2500'), '迟到确认后的电压恢复')
+	assert.equal(text(document, 'st-energy'), 'n/a', '未知电压时能量不可用')
+	click(document, 'btn-export-summary')
+	await tick(100)
+	const voltageSummary = JSON.parse(state.files.pop().text)
+	assert.ok(JSON.stringify(voltageSummary).includes('"voltsUnknown":true'))
 
 	// ---- 语言切换（旧 SDK 路径：on('app.locale')）：采集中就地刷新，采集状态不丢 ----
 	{
@@ -807,7 +845,7 @@ const fireKey = (win, key, props) => {
 		assert.equal(text(document, 'chip-sampling'), 'idle', '停止沿命中后停采：' + text(document, 'chip-sampling'))
 		assert.equal(text(document, 'btn-sample'), 'Start capture')
 		assert.equal(state.released.length, releasedBefore + 1, '自动停采也释放更新屏障')
-		assert.ok(state.hostLogs.some((l) => /stopped by the capture stop edge/.test(l)), '自动停采写宿主日志')
+		assert.ok(state.hostLogs.some((l) => /capture stop edge hit; local acquisition ended, device STOP requested/.test(l)), '自动停采写宿主日志')
 		// 看门狗已停：超过中断阈值后既不报中断，也不新增缺口
 		await tick(3200)
 		assert.equal(text(document, 'chip-sampling'), 'idle', '自动停采后看门狗不能再报故障：' + text(document, 'chip-sampling'))
@@ -819,6 +857,7 @@ const fireKey = (win, key, props) => {
 		await tick(200)
 		assert.equal(text(document, 'chip-sampling'), 'capturing')
 		const releasedMid = state.released.length
+		const edgeHostStart = state.hostLogs.length
 		state.failOnByte = 0x07
 		state.failOnByteError = 'USB 写超时'
 		state.pushRxSamples(3000, 1000)
@@ -827,14 +866,35 @@ const fireKey = (win, key, props) => {
 		await tick(300)
 		state.failOnByte = null
 		state.failOnByteError = null
-		assert.equal(text(document, 'chip-sampling'), 'idle')
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.equal(document.getElementById('btn-sample').disabled, true)
 		assert.equal(state.released.length, releasedMid + 1)
+		assert.ok(!state.hostLogs.slice(edgeHostStart).some((l) => /capture stopped by the capture stop edge/.test(l)), 'STOP 失败时不能声称设备已停')
 		assert.equal(sl.dataset.level, 'error')
 		assert.match(sl.textContent, /^Capture stop edge hit, but stopping the capture failed/, '状态条：' + sl.textContent)
 		acqStop.value = 'off'
 		fire(acqStop, 'change', {})
 		lvl.value = lvlBefore
 		fire(lvl, 'change', {})
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
+	// 存储上限触发本地收尾，STOP 失败时不能声称设备已停止。
+	{
+		click(document, 'btn-connect')
+		await tick(500)
+		click(document, 'btn-sample')
+		await tick(200)
+		const hostStart = state.hostLogs.length
+		state.failOnByte = 0x07
+		state.triggerStorageStop('synthetic storage limit')
+		await tick(200)
+		state.failOnByte = null
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.match(text(document, 'status-line'), /Local capture ended at the storage limit; device STOP was not confirmed/, '记录本地采集结束和设备状态未知')
+		assert.ok(!state.hostLogs.slice(hostStart).some((l) => /capture stopped:/.test(l)), '不声称 STOP 已确认')
+		assert.ok(state.hostLogs.slice(hostStart).some((l) => /capture stop unconfirmed/.test(l)))
 		click(document, 'btn-connect')
 		await tick(150)
 	}
@@ -851,8 +911,8 @@ const fireKey = (win, key, props) => {
 		click(document, 'btn-sample')
 		await tick(200)
 		assert.ok(!state.writes.some((w) => w[0] === 0x06), 'STOP 写失败后不能继续 START')
-		assert.equal(text(document, 'chip-sampling'), 'start failed', '开始失败不能显示成 idle：' + text(document, 'chip-sampling'))
-		assert.equal(document.getElementById('chip-sampling').dataset.state, 'error')
+		assert.equal(text(document, 'chip-sampling'), 'start unknown')
+		assert.equal(document.getElementById('chip-sampling').dataset.state, 'warn')
 		const sl = document.getElementById('status-line')
 		assert.equal(sl.hidden, false, '状态条要显示出来')
 		assert.equal(sl.dataset.level, 'error')
@@ -861,6 +921,10 @@ const fireKey = (win, key, props) => {
 		assert.match(sl.textContent, /STOP before START could not be written/, '失败不会被后续成功日志覆盖：' + sl.textContent)
 		assert.equal(text(document, 'btn-sample'), 'Start capture')
 		state.failOnByte = null
+		click(document, 'btn-connect')
+		await tick(150)
+		click(document, 'btn-connect')
+		await tick(500)
 		// 1b) START 本身写失败：同样可见
 		state.failOnByte = 0x06
 		click(document, 'btn-sample')
@@ -908,7 +972,7 @@ const fireKey = (win, key, props) => {
 		await tick(200)
 		// 3) 宿主卡住不确认写入：按超时失败结束，超时原因留在状态条（中英都整句可重绘）
 		state.hangOnByte = 0x0d
-		document.getElementById('voltage').value = '2500'
+		document.getElementById('voltage').value = '2400'
 		click(document, 'btn-apply-voltage')
 		await tick(3300)
 		state.hangOnByte = null
@@ -920,9 +984,12 @@ const fireKey = (win, key, props) => {
 		assert.match(sl.textContent, /^设定电压失败：.*3000 ms 内未确认 \[timeout\]/, '状态条切到中文：' + sl.textContent)
 		state.emit('app.locale', { locale: 'en' })
 		await tick(20)
+		// 电压超时后状态未知，重新确认电压再启动采集。
+		click(document, 'btn-apply-voltage')
+		await tick(200)
 		// 4) START 写入超时：结果未知（宿主仍可能写出），不能显示成确定的未采样 / 启动失败
 		state.deferred = []
-		state.defer = function (b) { return b[0] === 0x06 }
+		state.defer = function (b) { return b[0] === 0x06 || (b[0] === 0x07 && state.writes.some((w) => w[0] === 0x06)) }
 		state.writes.length = 0
 		click(document, 'btn-sample')
 		await tick(3300)
@@ -937,13 +1004,16 @@ const fireKey = (win, key, props) => {
 		await tick(100)
 		assert.equal(state.writes.filter((w) => w[0] === 0x06).length, 1, '没有再发 START')
 		assert.equal(text(document, 'chip-sampling'), 'start unknown')
-		// START 在宿主侧迟到兑现 → 补的 STOP 已确认 → 收尾：放开 Start，说明设备已停
-		state.deferred[0].resolve()
+		// 最新 STOP 先确认：即使旧 START 未确认，也应恢复为已停止。
+		state.deferred[1].resolve()
 		await tick(60)
 		state.defer = null
 		assert.equal(text(document, 'chip-sampling'), 'idle')
 		assert.equal(document.getElementById('btn-sample').disabled, false, '收尾后放开 Start')
-		assert.match(sl.textContent, /^The timed-out START reached the device and the following STOP was confirmed/, '状态条：' + sl.textContent)
+		assert.match(sl.textContent, /^The timed-out START is still unconfirmed, but the following STOP was confirmed/, '状态条：' + sl.textContent)
+		state.deferred[0].resolve()
+		await tick(20)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '旧 START 回执不能覆盖 STOP')
 		click(document, 'btn-diag')
 		click(document, 'btn-connect')
 		await tick(150)
