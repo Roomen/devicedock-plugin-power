@@ -728,6 +728,38 @@ const fireKey = (win, key, props) => {
 		await tick(150)
 	}
 
+	// ---- 阻塞 1：Connect 后立刻点 Start（落在读参数 / 供电探测窗口内）----
+	// 探测的 START/STOP 必须全部在用户 START 之前，否则探测的 STOP 会掐断刚开始的采集（之后只剩「无应答」）
+	{
+		const acqStart = document.getElementById('acq-start')
+		const acqStop = document.getElementById('acq-stop')
+		acqStart.value = 'off'
+		fire(acqStart, 'change', {})
+		acqStop.value = 'off'
+		fire(acqStop, 'change', {})
+		state.writes.length = 0
+		click(document, 'btn-connect')
+		await tick(30)
+		assert.equal(text(document, 'btn-connect'), 'Disconnect')
+		assert.equal(document.getElementById('btn-sample').disabled, true, '连接初始化（读参数 / 供电探测）完成前 Start 不可点')
+		// 即使点击绕过了禁用态（快捷键、竞态），开始采集也必须排在初始化之后
+		fire(document.getElementById('btn-sample'), 'click', { detail: 1 })
+		await tick(700)
+		assert.equal(document.getElementById('btn-sample').disabled, false, '初始化结束后放开 Start')
+		const ops = state.writes.map((w) => w[0]).filter((b) => b === 0x06 || b === 0x07)
+		assert.deepEqual(ops, [0x06, 0x07, 0x07, 0x06], '探测 START/STOP → 采集 STOP/START，START 之后不能再有 STOP：' + ops.join(','))
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		const before = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		state.pushRxSamples(3000, 1000)
+		await tick(450)
+		const after = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		assert.ok(after > before, '采集真的收到数据：' + before + ' → ' + after)
+		click(document, 'btn-sample')
+		await tick(150)
+		click(document, 'btn-connect')
+		await tick(150)
+	}
+
 	// ---- 阻塞 2：停止沿自动停采 → 与手动停同样收尾（停看门狗、释放 busy、不记缺口、不误报）----
 	{
 		const acqStop = document.getElementById('acq-stop')

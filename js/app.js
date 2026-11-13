@@ -62,6 +62,8 @@
 	let sampleAlert = null
 	// 最近一次列口结果（已按 BLU 筛选）；hidden 是被筛掉的口数（空态提示用）
 	let lastPorts = { ports: [], hidden: 0 }
+	// 连接后的初始化（读设备参数 + 供电探测）进行中：完成前 Start 不可用
+	let connectInit = null
 
 	// ---- 视图与显示状态（会话级，不落盘的部分只影响本次看波形） ----
 	const view = { xZoom: 1, xOffset: 0, live: true, yMode: 'linear', yZoom: 1, yPan: 0, cursorA: null, cursorB: null }
@@ -502,7 +504,8 @@
 		}
 		setText('session-meta', tr(open ? 'ui.session_connected' : 'ui.session_disconnected'))
 		$('btn-power').disabled = !open
-		$('btn-sample').disabled = !open
+		// 初始化（读参数 + 探测）完成前不放开 Start：探测的 STOP 不能落在用户 START 之后
+		$('btn-sample').disabled = !open || !!connectInit
 		$('btn-apply-voltage').disabled = !open
 	}
 
@@ -563,15 +566,23 @@
 				const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : key
 				log(M('app.claimed'), 'success')
 				hostLog('claimed ' + label + ' exclusively')
-				const ok = await control.fetchModifiers()
-				if (ok) {
-					const mv = control.readVoltageMv()
-					if (mv != null) $('voltage').value = String(mv)
-				}
-				const probe = await control.probeDutPower()
-				if (probe) {
-					control.markPowered(probe.on, 'probed')
-					log(M('app.probe_result', { state: M(probe.on ? 'app.probe_on' : 'app.probe_off'), median: probe.medianUA.toFixed(2), n: probe.n }))
+				connectInit = (async function () {
+					const ok = await control.fetchModifiers()
+					if (ok) {
+						const mv = control.readVoltageMv()
+						if (mv != null) $('voltage').value = String(mv)
+					}
+					const probe = await control.probeDutPower()
+					if (probe) {
+						control.markPowered(probe.on, 'probed')
+						log(M('app.probe_result', { state: M(probe.on ? 'app.probe_on' : 'app.probe_off'), median: probe.medianUA.toFixed(2), n: probe.n }))
+					}
+				})()
+				renderConnState()
+				try {
+					await connectInit
+				} finally {
+					connectInit = null
 				}
 			}
 		} catch (e) {
@@ -608,6 +619,11 @@
 		if (!link.isOpen()) {
 			log(M('app.start_not_connected'), 'error')
 			return
+		}
+		// 连接初始化还没完：等它结束再开始（按钮已禁用，这里兜底；控制层的操作队列也保证不交错）
+		if (connectInit) {
+			try { await connectInit } catch (e) { /* 初始化失败已记日志 */ }
+			if (!link.isOpen()) return
 		}
 		let failed = ''
 		sampleAlert = null

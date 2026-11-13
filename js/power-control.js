@@ -1053,10 +1053,12 @@
 			doPowerOn: doPowerOn,
 			doPowerOff: doPowerOff,
 			applyVoltageMv: applyVoltageMv,
-			fetchModifiers: fetchModifiers,
+			// 连接初始化（读参数、供电探测）与采集共用一条操作队列：
+			// 探测的 START/STOP 绝不会与用户的 START 交错（否则探测的 STOP 会掐断刚开始的采集）
+			fetchModifiers: function () { return runOp(fetchModifiers) },
 			appendMetadataText: appendMetadataText,
 			isMetaCollecting: function () { return metaCollecting },
-			probeDutPower: probeDutPower,
+			probeDutPower: function () { return runOp(probeDutPower) },
 			// 采样
 			startSampling: startSampling,
 			stopSampling: stopSampling,

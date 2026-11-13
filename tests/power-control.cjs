@@ -418,6 +418,19 @@ test('自动停采：停止沿命中后走与手动停相同的会话结束回�
 	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }, { reason: 'manual' }])
 })
 
+test('连接初始化与采集同队列：探测进行中点开始，探测的 STOP 不会落在采集的 START 之后', async () => {
+	const h = await connected()
+	const probe = h.control.probeDutPower()
+	const start = h.control.startCapture()
+	await probe
+	const r = await start
+	assert.equal(r.ok, true, JSON.stringify(r && r.code))
+	const ops = h.state.writes.map((w) => w.bytes[0]).filter((b) => b === 0x06 || b === 0x07)
+	// 探测 START/STOP → 采集前置 STOP → 采集 START，最后一个命令必须是 START
+	assert.deepEqual(ops, [0x06, 0x07, 0x07, 0x06], '写入顺序：' + ops.map((b) => b.toString(16)).join(','))
+	assert.equal(h.control.isSampling(), true)
+})
+
 test('启动前 STOP 写失败：中止启动、不写 START，返回原因并记错误日志', async () => {
 	const h = await connected()
 	h.state.writeFailAt = 1
