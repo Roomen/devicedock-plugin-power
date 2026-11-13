@@ -76,8 +76,11 @@ function makeHarness(opts) {
 		scriptedStats: null,
 		// lastPushed 让用例能断言「实际入库的电流值」，而不只是条数
 		push(v) { wave.pushed++; wave.lastPushed = v; return true },
+		// 会话序号：reset 推进（导入绑定 epoch 的测试要用）
+		_epoch: 0,
+		epoch() { return wave._epoch },
 		lastPushed: null,
-		reset() { wave.pushed = 0 },
+		reset() { wave.pushed = 0; wave.lastPushed = null; wave.gapIdx = []; wave._epoch++ },
 
 		// total / retained 可以分别设定：模拟「旧样点被淘汰」
 		totalValue: null,
@@ -550,6 +553,28 @@ test('N5：存储装不下时返回不完整（实际 N / 请求 M），不报�
 	assert.equal(res.code, 'incomplete')
 	assert.ok(res.stored < res.requested, '实际写入少于请求：' + res.stored + ' / ' + res.requested)
 	assert.match(res.message, /只写入了 \d+ \/ 200 个样点/)
+})
+
+test('N9：导入期间会话变化 → 取消并报告，绝不把旧导入写进新会话', async () => {
+	const h = await connected()
+	const I = require('../js/power-import.js')
+	const lines = ['index,time_s,current_uA,voltage_mV']
+	for (let i = 0; i < 64; i++) lines.push(i + ',' + (i * 0.001) + ',100,3300')
+	const parsed = I.parseCsv(lines.join('\n'))
+	// batchSize=2：第 2 个样点之后会 await，我们在那时清空会话并写入新数据
+	const pending = h.control.importSeries(parsed, { batchSize: 2 })
+	await new Promise(function (r) { setTimeout(r, 0) })
+	h.wave.reset()
+	h.wave.push(900)
+	h.wave.push(900)
+	const res = await pending
+	assert.equal(res.ok, false, '会话变化必须取消导入')
+	assert.equal(res.code, 'session_changed')
+	assert.equal(res.cancelled, true)
+	assert.ok(res.stored < res.requested, '只写入了开头的一部分：' + res.stored + ' / ' + res.requested)
+	assert.match(res.message, /会话已变化/)
+	// 新会话的数据没有被旧导入污染
+	assert.equal(h.wave.total(), 2, '新会话只剩我们自己写的两点：' + h.wave.total())
 })
 
 test('长期模式：时长只累计有效间隔、缺口有计数、能量按摄入时的电压', async () => {

@@ -193,6 +193,34 @@ const LIMIT = E.MAX_EXPORT_BYTES
 		assert.equal(plan.reason, 'too_large')
 	}
 
+	// ---- N11：未知电压导出 → 导入往返仍是 null（不能变成确定的 0 V） ----
+	{
+		const I = require('../js/power-import.js')
+		const store = { init: async () => {}, getDiskUsed: () => 0, writeChunk: async () => ({ byteSize: 0 }), readChunk: async () => null, removeChunk: async () => {}, clearSession: async () => {} }
+		const w = Wave.createWave({ store: store, chunkSize: 1024, ramCapSamples: 1024, voltage: () => 3.3, samplePeriod: () => 1 })
+		w.push(1000, null)
+		w.push(1200, null)
+		w.push(1400, null)
+		const exp = await E.buildCsv(w, 0, 3, { samplePeriodSec: 1 })
+		assert.equal(exp.ok, true)
+		assert.equal(exp.unknownVolts, 3, '导出要记下多少样点电压未知')
+		// 电压列与功率列都是空的
+		const rows = exp.text.split('\n').filter((l) => /^\d+,/.test(l))
+		assert.equal(rows[0], '0,0,1000,,')
+		// 往返：导入后电压仍是 null（不是 0），能量不可用
+		const back = I.parseCsv(exp.text)
+		assert.equal(back.ok, true)
+		assert.equal(back.rows.length, 3)
+		assert.equal(back.rows[0].voltageMV, null, '空电压单元格必须是 null：' + back.rows[0].voltageMV)
+		assert.equal(back.hasVoltage, false, '整列都空 → 没有电压')
+		assert.equal(back.powerUsable, false)
+		const w2 = Wave.createWave({ store: store, chunkSize: 1024, ramCapSamples: 1024, voltage: () => 3.3, samplePeriod: () => 1 })
+		for (const row of back.rows) w2.push(row.currentUA, row.voltageMV == null ? null : row.voltageMV / 1000)
+		const st = w2.calcStats(0, 3)
+		assert.equal(st.voltsUnknown, true, '往返后电压仍未知')
+		assert.equal(st.energyUWh, null, '往返后能量仍不可用（不能变 0）')
+	}
+
 	// ---- 导出服务：超限时既不调 saveFile 也不写文件 ----
 	{
 		let saved = 0

@@ -854,6 +854,9 @@
 			clearSessionState()
 			recordMode = 'wave'
 			samplePeriodSec = parsed.samplePeriodSec > 0 ? parsed.samplePeriodSec : 0.001
+			// 绑定本次导入所属的会话：期间被清空 / 重新采集 / 再次导入就立即取消（N9）
+			const epochOf = function () { return wave && typeof wave.epoch === 'function' ? wave.epoch() : 0 }
+			const importEpoch = epochOf()
 			const estimated = !!parsed.estimatedPeriod
 			const gapRows = {}
 			for (let i = 0; i < parsed.gaps.length; i++) gapRows[parsed.gaps[i]] = true
@@ -884,6 +887,15 @@
 				if ((i + 1) % batchSize === 0) {
 					await new Promise(function (r) { clock.setTimeout(r, yieldMs) })
 					if (wave && typeof wave.waitIdle === 'function') await wave.waitIdle(200)
+					// 每次 await 之后校验会话：变了就停止，绝不把旧导入写进新会话
+					if (epochOf() !== importEpoch) {
+						log('CSV 导入已取消：会话在导入期间发生变化（清空 / 重新采集 / 再次导入）', 'warn')
+						return {
+							ok: false, code: 'session_changed', cancelled: true,
+							stored: stored, requested: requested, gaps: gapsApplied,
+							message: '导入期间会话已变化，已取消（已写入 ' + stored + ' / ' + requested + '）',
+						}
+					}
 				}
 			}
 			onChange()

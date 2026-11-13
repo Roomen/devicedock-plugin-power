@@ -507,5 +507,30 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		assert.equal(st.volts, 0)
 	}
 
+	{
+		// N10：电压边界超过上限后，后续样点电压未知（不再沿用最后一个记录值）
+		const { T } = load(makeStore(), { cap: CHUNK })
+		const env = T.env
+		env.samplePeriodSec = 1
+		// 每点都换电压：300 点 → 远超 VOLT_SEG_MAX(256) 条边界
+		for (let i = 0; i < 300; i++) {
+			env.voltageV = (i % 2 === 0) ? 3.3 : 1.8
+			T.ringPush(1000)
+		}
+		const st = T.calcStats(0, 300)
+		assert.equal(st.voltsUnknown, true, '边界超限后必须标电压未知')
+		assert.equal(st.energyUWh, null, '电压未知 → 能量不可用（不能给一个确定的错值）')
+		// 边界之前的样点仍然是准的：取前 10 个点（交替 3.3/1.8）→ 能量可算
+		const head = T.wave.integrateRange(0, 10, { samplePeriodSec: 1 })
+		assert.equal(head.voltsUnknown, false, '边界以内的子区间电压已知')
+		// 5 个 3.3 V 间隔 + 4 个 1.8 V 间隔（左端点）
+		const expect = (1000 * 3.3 * 5 + 1000 * 1.8 * 4) / 3600
+		assert.ok(Math.abs(head.energyUW_s / 3600 - expect) < 1e-9, '边界内能量按逐点电压：' + (head.energyUW_s / 3600))
+		// 第 256 个点之后：电压未知，按左端点约定不再累加能量
+		const tail = T.wave.integrateRange(280, 300, { samplePeriodSec: 1 })
+		assert.equal(tail.voltsUnknown, true, '超限区间必须未知')
+		assert.equal(tail.energyUW_s, 0, '未知电压不产生能量')
+	}
+
 	console.log('power-wave-store: ok')
 })().catch(function (e) { console.error(e); process.exit(1) })

@@ -766,8 +766,10 @@
 			const last = segs.length ? segs[segs.length - 1] : null
 			if (last && last.mv === mv) return
 			if (segs.length >= VOLT_SEG_MAX) {
-				// 极端情况下（每点都变电压）不再细分：保留已记录的边界并标混合
+				// 边界数到顶：此后的电压**未知**（null），绝不沿用最后一个记录的电压
 				ch.voltsMixed = true
+				ch.voltsUnknown = true
+				if (!ch.voltSegOverflow) ch.voltSegOverflow = off
 				return
 			}
 			segs.push({ off: off, mv: mv })
@@ -795,6 +797,13 @@
 				out.push({ lo: curLo, hi: s.off, mv: curMv })
 				curLo = s.off
 				curMv = s.mv
+			}
+			// 超出边界上限之后的部分电压未知（不能沿用最后一个记录值）
+			if (ch.voltSegOverflow != null && ch.voltSegOverflow < hi) {
+				const cut = Math.max(curLo, ch.voltSegOverflow)
+				if (cut > curLo) out.push({ lo: curLo, hi: cut, mv: curMv })
+				out.push({ lo: cut, hi: hi, mv: null })
+				return out.filter(function (r) { return r.hi > r.lo })
 			}
 			out.push({ lo: curLo, hi: hi, mv: curMv })
 			return out

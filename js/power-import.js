@@ -12,7 +12,10 @@
 	const MAX_ROWS = 2000000
 
 	function num(v) {
-		const n = Number(String(v).trim())
+		// 空单元格（未知电压 / 未知功率）必须是 null，不能被 Number('') 变成 0
+		const s = String(v == null ? '' : v).trim()
+		if (!s) return null
+		const n = Number(s)
 		return isFinite(n) ? n : null
 	}
 
