@@ -70,12 +70,15 @@ body {
 	font-family: var(--font-sans);
 	font-size: var(--fs-body);
 	line-height: 1.45;
-	overflow: hidden;
+	/* 宿主 iframe 再小也不裁内容：工具条按内容撑开(下面 .head/.bar 不收缩)，
+	   剩下的高度不够时整页滚动，而不是把第二行工具条切掉 */
+	overflow: auto;
 }
 
 /* ---- 标题行 ---- */
 .head {
 	display: flex;
+	flex: 0 0 auto;
 	align-items: baseline;
 	justify-content: space-between;
 	gap: var(--sp-3);
@@ -119,6 +122,7 @@ body {
 /* ---- 工具条 ---- */
 .bar {
 	display: flex;
+	flex: 0 0 auto;
 	flex-wrap: wrap;
 	align-items: center;
 	gap: var(--sp-2);
@@ -203,9 +207,11 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 .seg button[aria-pressed='true'] { background: var(--accent-light); }
 
 /* ---- 主体 ---- */
+/* 主区吃掉工具条以外的全部高度；240px 是两栏都还排得下的下限(左侧面板的标题行、读数条、
+   游标条，加上波形的 72px)，比这更矮的 iframe 由 body 滚动补偿 */
 .body {
-	flex: 1;
-	min-height: 0;
+	flex: 1 1 auto;
+	min-height: 240px;
 	display: grid;
 	grid-template-columns: minmax(0, 1fr) 340px;
 	gap: var(--sp-3);
@@ -306,6 +312,12 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 	overflow-y: auto;
 }
 
+/* 侧栏面板按内容定高、不参与压缩：.panel 上的 min-height: 0 会让内容比盒子高的面板
+   被压扁，里面的行溢出后压在下一块面板上；放不下时交给 .side 滚动 */
+.side > .panel {
+	flex: 0 0 auto;
+}
+
 .side .panel-section {
 	padding: var(--sp-3);
 	border-top: 1px solid var(--border-light);
@@ -368,7 +380,13 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 
 @media (max-width: 1080px) {
 	.body { grid-template-columns: minmax(0, 1fr) 300px; }
+}
+
+/* 读数条与游标条的折行阈值按两栏之后的左侧面板宽度定(iframe 宽 820 时左侧约 470px)：
+   沿用 1080 会在中等窗口下就折成两行，先把波形区挤成 0 高 */
+@media (max-width: 820px) {
 	.readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	.cursors { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 /* ---- 第二行工具条：视图 / 触发 / 最大化 ---- */
@@ -379,6 +397,9 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 .scope-wrap {
 	display: flex;
 	flex-direction: column;
+	/* 波形区伸展占剩余高度；72px 是 .body 的最小高度(240px)扣掉标题行、读数条和游标条后
+	   还能给波形的下限：矮窗口下总览条收到 32px，波形本身仍剩 40px，不会塌成 0 */
+	min-height: 72px;
 }
 
 #wave {
@@ -395,6 +416,11 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 	height: 56px;
 	border-top: 1px solid var(--border-light);
 	background: var(--bg-surface);
+}
+
+/* 矮窗口(宿主里插件视图只占日志区那一块)：总览条收窄，把高度让给波形本身 */
+@media (max-height: 700px) {
+	.minimap-wrap { height: 32px; }
 }
 
 #minimap {
@@ -451,7 +477,3 @@ button[data-primary='1'][aria-pressed='true'] { color: #ffffff; }
 body[data-max='1'] .body { grid-template-columns: minmax(0, 1fr); }
 body[data-max='1'] .side { display: none; }
 body[data-max='1'] { padding: var(--sp-2); }
-
-@media (max-width: 1080px) {
-	.cursors { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
