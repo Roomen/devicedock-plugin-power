@@ -88,7 +88,8 @@
 		let probe = null
 		let opChain = Promise.resolve()
 		let opDepth = 0
-		const longStats = { n: 0, sumI: 0, minI: Infinity, maxI: -Infinity, energyUAs: 0, t0: 0, tLast: 0 }
+		// energyUAs: Σ i·dt（µA·s = µC）；energyUWs: Σ i·V(t)·dt（µW·s），电压按摄入时刻记，属历史口径
+		const longStats = { n: 0, sumI: 0, minI: Infinity, maxI: -Infinity, energyUAs: 0, energyUWs: 0, durSec: 0, gaps: 0, t0: 0, tLast: 0 }
 
 		// ---- 串行队列：界面操作排队，后台（failFast）不排在界面操作后面 ----
 		function runOp(fn, o) {
@@ -169,6 +170,9 @@
 			longStats.minI = Infinity
 			longStats.maxI = -Infinity
 			longStats.energyUAs = 0
+			longStats.energyUWs = 0
+			longStats.durSec = 0
+			longStats.gaps = 0
 			longStats.t0 = 0
 			longStats.tLast = 0
 		}
@@ -185,6 +189,7 @@
 			if (wave && typeof wave.noteGap === 'function') wave.noteGap(idx)
 			gapPending = true
 			gapCount++
+			if (recordMode === 'long') longStats.gaps++
 			rateAdj.reset()
 			if (acq) {
 				acq.startState = 0
@@ -317,6 +322,9 @@
 				if (iUA < longStats.minI) longStats.minI = iUA
 				if (iUA > longStats.maxI) longStats.maxI = iUA
 				longStats.energyUAs += iUA * dt
+				longStats.energyUWs += iUA * (voltageMv != null ? voltageMv / 1000 : 0) * dt
+				// 时长只累计**有效**的段内间隔：缺口处 dt = 0，不能算进时长
+				longStats.durSec += dt
 				// 长期模式不进波形环，但仍然维护一条折叠总览（min/max 分桶），供 minimap 用
 				folding.addData(iUA, tSec)
 				return true
@@ -679,31 +687,37 @@
 		function overallStats() {
 			if (recordMode === 'long') {
 				const n = longStats.n
-				const dur = Math.max(0, longStats.tLast - longStats.t0)
+				// 时长是累加的「有效间隔」，缺口那段不进来
+				const dur = longStats.durSec
 				const avgI = n ? longStats.sumI / n : 0
-				const v = voltageMv != null ? voltageMv / 1000 : 0
-				const st = {
+				const avgP = dur > 0 ? longStats.energyUWs / dur : 0
+				return {
 					n: n,
 					avgI: avgI,
-					avgP: avgI * v,
+					avgP: avgP,
 					minI: isFinite(longStats.minI) ? longStats.minI : 0,
 					maxI: isFinite(longStats.maxI) ? longStats.maxI : 0,
 					dur: dur,
-					gaps: 0,
+					chargeUC: longStats.energyUAs,
+					chargeUAh: longStats.energyUAs / 3600,
+					// 能量按摄入时刻的电压积分（历史口径），等价于 Σ P·dt
+					energyUWh: longStats.energyUWs / 3600,
+					volts: longStats.energyUAs > 0 ? longStats.energyUWs / longStats.energyUAs : (voltageMv != null ? voltageMv / 1000 : 0),
+					segments: longStats.gaps + 1,
+					gaps: longStats.gaps,
+					dropped: 0,
 				}
-				st.chargeUC = n ? longStats.energyUAs : 0
-				st.chargeUAh = st.chargeUC / 3600
-				st.energyUWh = n ? avgI * v * dur / 3600 : 0
-				return st
 			}
 			if (!wave) return emptyStats()
-			return wave.stats(0, wave.retained())
+			// 全局下标范围：淘汰最早块之后不能用「保留数量」当结束下标
+			return wave.stats(0, wave.total())
 		}
 
 		/** 摘要：单位、口径与数据来源都写清楚 */
 		function captureSummary() {
 			const st = overallStats()
 			const total = recordMode === 'long' ? longStats.n : (wave ? wave.total() : 0)
+			// 保留量 = 总点数 - 已淘汰点数（保留量是**数量**，不能当全局结束下标用）
 			const retained = recordMode === 'long' ? longStats.n : (wave ? wave.retained() : 0)
 			const sampleHz = targetRateHz > 0 ? targetRateHz : deviceStreamHz
 			const period = getSamplePeriodSec()
@@ -717,7 +731,9 @@
 				// 波形模式超出预算后旧样点被淘汰 / 缺口，统计只覆盖仍保留且连续的样点
 				span: evicted ? 'retained' : 'full_session',
 				durationSec: st.dur,
-				gaps: recordMode === 'long' ? 0 : (wave && wave.gaps ? wave.gaps().length : 0),
+				gaps: recordMode === 'long' ? longStats.gaps : (st.gaps || 0),
+				droppedSamples: recordMode === 'long' ? 0 : (wave && typeof wave.droppedSamples === 'function' ? wave.droppedSamples() : 0),
+				volts: st.volts || 0,
 				sampleRateHz: sampleHz,
 				samplePeriodSec: period,
 				voltageMvNow: voltageMv,

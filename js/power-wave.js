@@ -88,15 +88,21 @@
 		}
 
 		function emptyStats() {
-			return { n: 0, avgI: 0, avgP: 0, minI: 0, maxI: 0, chargeUC: 0, chargeUAh: 0, energyUWh: 0, dur: 0, gaps: 0 }
+			return {
+				n: 0, avgI: 0, avgP: 0, minI: 0, maxI: 0,
+				chargeUC: 0, chargeUAh: 0, energyUWh: 0, dur: 0,
+				volts: 0, segments: 0, gaps: 0, dropped: 0,
+			}
 		}
 
+		/** 只补缺省字段：分段积分出来的电量/能量已经是对的，不能被 avg×dur 覆盖 */
 		function enrichStats(st) {
-			if (!st || !st.n) return emptyStats()
-			st.chargeUC = st.avgI * st.dur
-			st.chargeUAh = st.chargeUC / 3600
-			st.energyUWh = st.avgP * st.dur / 3600
-			return st
+			if (!st) return emptyStats()
+			const out = Object.assign(emptyStats(), st)
+			if (!isFinite(out.chargeUC)) out.chargeUC = out.n ? out.avgI * out.dur : 0
+			if (!isFinite(out.chargeUAh)) out.chargeUAh = out.chargeUC / 3600
+			if (!isFinite(out.energyUWh)) out.energyUWh = out.n ? out.avgP * out.dur / 3600 : 0
+			return out
 		}
 
 		function allocHotBuf() {
@@ -128,6 +134,9 @@
 				state: 'hot',
 				diskBytes: 0,
 				env: null,
+				// 块被写入时的源电压（V）：统计/导出都用它换算历史功率，改了设置也不改写
+				voltsUsed: null,
+				voltsMixed: false,
 			}
 		}
 
@@ -439,6 +448,8 @@
 			ch.buf[off] = curUA
 			ch.n++
 			const vset = voltage()
+			if (ch.voltsUsed == null) ch.voltsUsed = vset
+			else if (Math.abs(ch.voltsUsed - vset) > 1e-9) ch.voltsMixed = true
 			ch.sumI += curUA
 			ch.sumSqI += curUA * curUA
 			ch.sumP += curUA * vset
@@ -505,21 +516,59 @@
 			return gapList.slice()
 		}
 
-		/** [start,end) 内按缺口切开的连续段，[lo,hi) 半开区间 */
-		function segments(start, end) {
+		/** 被淘汰（dropped）块的区间，[lo,hi) 半开，按 base 升序 */
+		function droppedRanges() {
 			const out = []
-			let lo = Math.max(0, start)
-			const stop = Math.min(totalCount, end)
-			if (stop <= lo) return out
-			for (let i = 0; i < gapList.length; i++) {
-				const g = gapList[i]
-				if (g <= lo) continue
-				if (g >= stop) break
-				out.push([lo, g])
-				lo = g
+			for (let i = 0; i < waveChunks.length; i++) {
+				const ch = waveChunks[i]
+				if (ch.state !== 'dropped' || !ch.n) continue
+				const last = out[out.length - 1]
+				if (last && last[1] === ch.base) last[1] = ch.base + ch.n
+				else out.push([ch.base, ch.base + ch.n])
 			}
-			out.push([lo, stop])
 			return out
+		}
+
+		/**
+		 * [start,end) 内按**缺口与被淘汰块**切开的连续段，[lo,hi) 半开区间。
+		 * 统计、分析、导出都只在这条边界内配对：断点两侧永远不在同一段里。
+		 */
+		function segments(start, end) {
+			const lo0 = Math.max(0, start)
+			const stop = Math.min(totalCount, end)
+			if (stop <= lo0) return []
+			// 1) 先减掉被淘汰（dropped）的区间：那些样点已经不存在，不能算时长也不能积分
+			let allowed = [[lo0, stop]]
+			const dr = droppedRanges()
+			for (let i = 0; i < dr.length; i++) {
+				const a = dr[i][0]
+				const b = dr[i][1]
+				if (b <= lo0 || a >= stop) continue
+				const next = []
+				for (let k = 0; k < allowed.length; k++) {
+					const segA = allowed[k][0]
+					const segB = allowed[k][1]
+					if (b <= segA || a >= segB) { next.push([segA, segB]); continue }
+					if (a > segA) next.push([segA, a])
+					if (b < segB) next.push([b, segB])
+				}
+				allowed = next
+			}
+			// 2) 再用缺口点把剩下的区间切开（缺口是零宽断点）
+			const out = []
+			for (let k = 0; k < allowed.length; k++) {
+				let lo = allowed[k][0]
+				const hi = allowed[k][1]
+				for (let i = 0; i < gapList.length; i++) {
+					const g = gapList[i]
+					if (g <= lo) continue
+					if (g >= hi) break
+					out.push([lo, g])
+					lo = g
+				}
+				out.push([lo, hi])
+			}
+			return out.filter(function (seg) { return seg[1] > seg[0] })
 		}
 
 		function gapsIn(start, end) {
@@ -531,6 +580,12 @@
 				if (g > lo && g < hi) n++
 			}
 			return n
+		}
+
+		/** 块的有效电压（V）：sumP/sumI 是采样当时的加权平均，改了源电压也不会被改写 */
+		function chunkVolts(ch) {
+			if (ch.sumI > 0 && isFinite(ch.sumP)) return ch.sumP / ch.sumI
+			return ch.voltsUsed != null ? ch.voltsUsed : voltage()
 		}
 
 		function addChunkStatRange(ch, lo, hi, acc) {
@@ -545,10 +600,12 @@
 				return
 			}
 			const buf = getChunkBuf(ch)
-			const vset = voltage()
+			// 部分区间也要用这一块**历史**电压，不能拿界面当前设置去改写历史能量
+			const vset = chunkVolts(ch)
 			if (buf) {
 				for (let i = lo; i < hi; i++) {
 					const v = buf[i]
+					if (!isFinite(v)) continue
 					acc.sumI += v
 					acc.sumP += v * vset
 					if (v < acc.minI) acc.minI = v
@@ -557,15 +614,9 @@
 				}
 				return
 			}
-			// 冷块未回读：按块级统计近似（完整块精确）
+			// 冷块未回读：按块级统计近似（整块区间精确，部分区间按比例，电压仍取历史值）
 			requestHydrate(ch)
-			if (ch.n > 0 && hi - lo === ch.n) {
-				acc.sumI += ch.sumI
-				acc.sumP += ch.sumP
-				if (ch.minI < acc.minI) acc.minI = ch.minI
-				if (ch.maxI > acc.maxI) acc.maxI = ch.maxI
-				acc.n += ch.n
-			} else if (ch.n > 0) {
+			if (ch.n > 0) {
 				const ratio = (hi - lo) / ch.n
 				acc.sumI += ch.sumI * ratio
 				acc.sumP += ch.sumP * ratio
@@ -575,43 +626,102 @@
 			}
 		}
 
-		function calcStats(start, end) {
-			if (totalCount < 1 || end <= start) return emptyStats()
-			start = Math.max(0, start)
-			end = Math.min(totalCount, end)
-			if (end <= start) return emptyStats()
-			const acc = { n: 0, sumI: 0, sumP: 0, minI: Infinity, maxI: -Infinity }
-			const i0 = chunkIndexAt(start)
+		/** 把 [start,end) 内某个连续段（不含 dropped 块，由 segments 保证）累加进 acc */
+		function accumulateSegment(a, b, acc) {
+			if (b <= a) return
+			const i0 = chunkIndexAt(a)
 			let base = waveChunks[i0] ? waveChunks[i0].base : 0
 			for (let i = i0; i < waveChunks.length; i++) {
 				const ch = waveChunks[i]
 				const ch0 = base
 				const ch1 = base + ch.n
-				const lo = Math.max(start, ch0)
-				const hi = Math.min(end, ch1)
+				const lo = Math.max(a, ch0)
+				const hi = Math.min(b, ch1)
 				if (hi > lo) addChunkStatRange(ch, lo - ch0, hi - ch0, acc)
 				base = ch1
-				if (base >= end) break
+				if (base >= b) break
 			}
-			// 缺口把时间轴切开：每段只算段内相邻样点对，绝不跨缺口
-			const segs = segments(start, end)
-			let steps = 0
-			for (let i = 0; i < segs.length; i++) {
-				const len = segs[i][1] - segs[i][0]
-				if (len > 1) steps += len - 1
+		}
+
+		/** 区间内被淘汰（dropped）的样点数 */
+		function droppedIn(start, end) {
+			let n = 0
+			for (let i = 0; i < waveChunks.length; i++) {
+				const ch = waveChunks[i]
+				if (ch.state !== 'dropped') continue
+				const lo = Math.max(start, ch.base)
+				const hi = Math.min(end, ch.base + ch.n)
+				if (hi > lo) n += hi - lo
 			}
+			return n
+		}
+
+		/**
+		 * 区间统计：**按连续段分别积分**再合并。
+		 *
+		 * 缺口与被淘汰的块把时间轴切开，每段各自累加电流、功率与时间，绝不跨段配对：
+		 *  - 时长 = 各段内的相邻样点对数 × 采样周期（dropped 段不贡献时长）；
+		 *  - 电量 / 能量 = Σ 段内均值 × 段时长（不是全区间均值 × 总时长）。
+		 * 这样孤立的单个高电流点不会凭空产生能量，缺口两侧也不会互相影响。
+		 */
+		function calcStats(start, end) {
+			if (totalCount < 1 || end <= start) return emptyStats()
+			start = Math.max(0, start)
+			end = Math.min(totalCount, end)
+			if (end <= start) return emptyStats()
 			const per = samplePeriod()
-			const dur = steps * per
-			const avgI = acc.n ? acc.sumI / acc.n : 0
-			const avgP = acc.n ? acc.sumP / acc.n : 0
+			const segs = segments(start, end)
+			let n = 0
+			let sumI = 0
+			let sumP = 0
+			let minI = Infinity
+			let maxI = -Infinity
+			let dur = 0
+			let charge = 0
+			let energy = 0
+			let voltNum = 0
+			let voltDen = 0
+			for (let s = 0; s < segs.length; s++) {
+				const a = segs[s][0]
+				const b = segs[s][1]
+				const acc = { n: 0, sumI: 0, sumP: 0, minI: Infinity, maxI: -Infinity }
+				accumulateSegment(a, b, acc)
+				if (acc.n) {
+					sumI += acc.sumI
+					sumP += acc.sumP
+					n += acc.n
+					if (acc.minI < minI) minI = acc.minI
+					if (acc.maxI > maxI) maxI = acc.maxI
+					voltNum += acc.sumP
+					voltDen += acc.sumI
+				}
+				const steps = Math.max(0, b - a - 1)
+				const segDur = steps * per
+				dur += segDur
+				if (acc.n) {
+					const meanI = acc.sumI / acc.n
+					const meanP = acc.sumP / acc.n
+					charge += meanI * segDur
+					energy += meanP * segDur / 3600
+				}
+			}
+			const avgI = n ? sumI / n : 0
+			const avgP = n ? sumP / n : 0
 			return enrichStats({
-				n: acc.n,
+				n: n,
 				avgI: avgI,
 				avgP: avgP,
-				minI: isFinite(acc.minI) ? acc.minI : 0,
-				maxI: isFinite(acc.maxI) ? acc.maxI : 0,
+				minI: isFinite(minI) ? minI : 0,
+				maxI: isFinite(maxI) ? maxI : 0,
 				dur: dur,
+				chargeUC: charge,
+				chargeUAh: charge / 3600,
+				energyUWh: energy,
+				// 这段历史数据的有效电压（按电流加权）；与界面当前设置无关
+				volts: voltDen > 0 ? voltNum / voltDen : 0,
+				segments: segs.length,
 				gaps: gapsIn(start, end),
+				dropped: droppedIn(start, end),
 			})
 		}
 

@@ -9,8 +9,13 @@ const Wave = require('../js/power-wave.js')
 
 const CHUNK = 65536
 
-function makeStore() {
+function makeStore(opts) {
+	opts = opts || {}
+	// cap: 冷区原始当量上限（字节）。超过时像内存存储那样按最早写入淘汰并回报。
+	const cap = opts.cap > 0 ? opts.cap : 0
+	const order = []
 	const disk = new Map()
+	let evictFn = null
 	const st = {
 		reads: 0,
 		gate: null,
@@ -20,16 +25,31 @@ function makeStore() {
 		events: [],
 		init: async () => {},
 		getBackend: () => 'memory',
+		onEvict: (fn) => { evictFn = fn },
 		getDiskUsed: () => { let n = 0; disk.forEach(function (v) { n += v.length * 4 }); return n },
 		writeChunk: async (id, s) => {
 			st.events.push('write:' + id)
 			if (st.gate) await st.gate
+			const evicted = []
+			if (cap > 0) {
+				let used = st.getDiskUsed()
+				while (order.length && used + s.length * 4 > cap) {
+					const old = order.shift()
+					const v = disk.get(old)
+					if (!v) continue
+					disk.delete(old)
+					used -= v.length * 4
+					evicted.push({ id: old, rawBytes: v.length * 4 })
+				}
+			}
 			disk.set(id, new Float32Array(s))
-			return { byteSize: s.length * 4 }
+			order.push(id)
+			if (evicted.length && evictFn) evictFn(evicted)
+			return { byteSize: s.length * 4, rawBytes: s.length * 4, evicted: evicted }
 		},
 		readChunk: async (id) => { st.reads++; const buf = disk.get(id); if (st.readGate) await st.readGate; return buf },
 		removeChunk: async (id) => { disk.delete(id) },
-		clearSession: async () => { st.events.push('clear'); if (st.clearGate) await st.clearGate; disk.clear() },
+		clearSession: async () => { st.events.push('clear'); if (st.clearGate) await st.clearGate; disk.clear(); order.length = 0 },
 	}
 	return st
 }
@@ -308,6 +328,77 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		const fresh = T.calcStats(0, 2)
 		assert.equal(fresh.gaps, 0)
 		assert.equal(fresh.dur, 1)
+	}
+
+	{
+		// 缺口切段后：单个孤立高电流点不该凭空产生电量 / 能量
+		const { T } = load(makeStore(), { cap: CHUNK })
+		const env = T.env
+		env.samplePeriodSec = 1
+		T.ringPush(1000)          // 段 1：[0,1)，只有一个点 → 没有有效间隔
+		T.noteGap(1)
+		T.ringPush(0)             // 段 2：[1,3)，三点 0 µA
+		T.ringPush(0)
+		T.ringPush(0)
+		const st = T.calcStats(0, T.state().totalCount)
+		assert.equal(st.n, 4)
+		assert.equal(st.dur, 2, '段 1 没有间隔，段 2 有两个：' + st.dur)
+		assert.ok(Math.abs(st.chargeUC - 0) < 1e-12, '孤立点不产生电量：' + st.chargeUC)
+		assert.ok(Math.abs(st.energyUWh - 0) < 1e-12, '孤立点不产生能量：' + st.energyUWh)
+		// 同样的数据如果**没有**缺口：段内 3 个间隔，均值 250 µA → 电量 750
+		const { T: T2 } = load(makeStore(), { cap: CHUNK })
+		T2.env.samplePeriodSec = 1
+		T2.ringPush(1000)
+		T2.ringPush(0)
+		T2.ringPush(0)
+		T2.ringPush(0)
+		const st2 = T2.calcStats(0, 4)
+		assert.equal(st2.dur, 3)
+		assert.ok(Math.abs(st2.chargeUC - 250 * 3) < 1e-9, '连续段内才按均值积分：' + st2.chargeUC)
+	}
+
+	{
+		// 被淘汰（dropped）的块不贡献时长，也不参与能量；retained 只是数量
+		// 冷区上限只够 2 块：写第 3 块时最早那块被淘汰
+		const store = makeStore({ cap: CHUNK * 4 * 2 })
+		const { T } = load(store, { cap: CHUNK })
+		T.env.samplePeriodSec = 1
+		for (let c = 0; c < 6; c++) {
+			for (let i = 0; i < CHUNK; i++) T.ringPush(100)
+			await settle()
+		}
+		const st0 = T.state()
+		assert.ok(st0.droppedSamples > 0, '应有块被淘汰：' + JSON.stringify(st0))
+		const st = T.calcStats(0, st0.totalCount)
+		assert.equal(st.n, st0.totalCount - st0.droppedSamples, '统计只覆盖还在的样点')
+		assert.ok(st.dropped >= st0.droppedSamples, '统计里也要报出淘汰的点数')
+		// 时长 = 只剩的连续段的间隔数（严格小于「总点数 - 1」）
+		assert.ok(st.dur <= (st0.totalCount - st0.droppedSamples - 1) * 1 + 1e-9,
+			'淘汰的样点不能贡献时长：dur=' + st.dur + ' total=' + st0.totalCount + ' dropped=' + st0.droppedSamples)
+		assert.ok(st.dur < (st0.totalCount - 1), '时长必须小于整段时间轴')
+		// retained 是数量而不是下标：用错会漏掉最新数据
+		assert.equal(T.state().totalCount - T.state().droppedSamples, st0.totalCount - st0.droppedSamples)
+		const latest = T.calcStats(st0.totalCount - 10, st0.totalCount)
+		assert.ok(latest.n > 0, '最新样点仍然在统计范围里（不能把 retained 当结束下标）')
+	}
+
+	{
+		// 电压是历史口径：块内改了源电压，统计按当时的电压加权，不跟当前设置
+		const store = makeStore()
+		const { T } = load(store, { cap: CHUNK * 2 })
+		const env = T.env
+		env.samplePeriodSec = 1
+		env.voltageV = 3.3
+		for (let i = 0; i < 4; i++) T.ringPush(1000)
+		env.voltageV = 1.65
+		for (let i = 0; i < 4; i++) T.ringPush(1000)
+		const st = T.calcStats(0, 8)
+		// 有效电压 = 加权平均 = (4·3.3 + 4·1.65)/8 = 2.475 V
+		assert.ok(Math.abs(st.volts - 2.475) < 1e-9, '有效电压应按历史加权：' + st.volts)
+		const before = st.energyUWh
+		env.voltageV = 5
+		const st2 = T.calcStats(0, 8)
+		assert.ok(Math.abs(st2.energyUWh - before) < 1e-12, '改当前电压不能改写历史能量')
 	}
 
 	console.log('power-wave-store: ok')

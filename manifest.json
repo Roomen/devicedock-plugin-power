@@ -24,9 +24,9 @@
 		"js/power-lane.js": "sha256-2f51dbafbdf592b2fae03066f439e91ba9d1df3f8c0700fced6b0d6d9f72db4a",
 		"js/power-analysis.js": "sha256-7316ff239b6dd6dea2319f56dc0235d2aa75a1247716449c4be91ee448587622",
 		"js/power-store.js": "sha256-5e54f221f59fb0cbd06a9c5eda10a6744ba2f900cb5731637afdc5f78d4ded65",
-		"js/power-wave.js": "sha256-f7a445f3b028a36e233b44579e9a268fe4b5ef3098c513b380bd5a3ff3249f59",
+		"js/power-wave.js": "sha256-6de8879ebb6aa3a26409e64f01c5a9091e85769b5c2dfca15a47de412cabe675",
 		"js/power-claim.js": "sha256-c5f67ddc25a9a0b1f8fd8b16ed3549d1f0ac965ea1c4de66d0d4e8ac056bc50c",
-		"js/power-control.js": "sha256-b2a8812a857ef1c320d3043cc9ecb07e26b5cdfcb15b49885de4f45ba5b4f098",
+		"js/power-control.js": "sha256-ee71957f28f7d0316afd86cda315df36c41916a3026660308b4252c2421e3278",
 		"js/power-export.js": "sha256-6251cf4e8a711e87623fb61ef4410a2c36639bac8ca1c77918d39d803cccf7e2",
 		"sdk/devicedock-plugin.js": "sha256-bdea80b8bb1e2d4567dbe7453264234653277fbd44d7162139d4a4bed75915ae"
 	},
