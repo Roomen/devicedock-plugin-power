@@ -25,7 +25,7 @@
 		"js/power-analysis.js": "sha256-7316ff239b6dd6dea2319f56dc0235d2aa75a1247716449c4be91ee448587622",
 		"js/power-store.js": "sha256-5e54f221f59fb0cbd06a9c5eda10a6744ba2f900cb5731637afdc5f78d4ded65",
 		"js/power-wave.js": "sha256-73b7b7780994f00166ecce68ecbd9cb5e7573e9d16b3b9e97dc2db95a0141282",
-		"js/power-claim.js": "sha256-e2efd5fb35a1ff3f363e6527e8d300c071f6ea3033ff3e3cc125c7d71ca018ae",
+		"js/power-claim.js": "sha256-c2b3e53870ed636e3cb94de014cbe84cc7780125a7ba0f281171cb95a067fa39",
 		"js/power-control.js": "sha256-f0031907397cff490152854fc286f1a0a2816f3da1e592935a14feffeac0dd0c",
 		"js/power-export.js": "sha256-b2dac4a9b6e244e3602d9371ce4bbe7d01e5955fa20001c8ea61fb1ca5e7056b",
 		"js/power-import.js": "sha256-ea09707a62b91c4e49c88aa52fa7264bca07d155a0de667fa675e56f281e3691",

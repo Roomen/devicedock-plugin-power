@@ -276,33 +276,35 @@
 			if (pendingCount <= MAX_PENDING) return
 			let droppedSamples = 0
 			let droppedBytes = 0
-			let firstSampleIdx = -1
-			while (pending.length && pendingCount > MAX_PENDING) {
-				if (firstSampleIdx < 0) {
-					for (let i = 0; i < pending.length; i++) {
-						if (pending[i].kind === 'samples') { firstSampleIdx = i; break }
-					}
-					if (firstSampleIdx < 0) break
+			// 每轮都**重新定位**最老的样点项：队列里断点与样点交错，
+			// 删掉一项之后下标会整体前移，缓存上一轮的下标就会把断点当成样点读（N1）。
+			while (pendingCount > MAX_PENDING) {
+				let idx = -1
+				for (let i = 0; i < pending.length; i++) {
+					if (pending[i].kind === 'samples') { idx = i; break }
 				}
-				const job = pending[firstSampleIdx]
+				if (idx < 0) break
+				const job = pending[idx]
 				const rest = job.samples.length - job.from
 				droppedSamples += rest
 				pendingCount -= rest
 				droppedBytes += (job.meta && job.meta.bytes) || 0
-				pending.splice(firstSampleIdx, 1)
-				if (firstSampleIdx === 0 || pending[0].kind !== 'samples') firstSampleIdx = 0
+				pending.splice(idx, 1)
 			}
 			if (!droppedSamples) return
 			stats.backlogDropped += droppedSamples
-			// 断点插到「被丢数据原本所在」的位置（上面已把最老的样点段从队头拿掉）
+			// 淘汰完再插断点：插在「剩下的最老样点之前」，与紧邻的断点合并成一条丢弃报告
 			const head = { kind: 'break', info: { reason: 'plugin_backlog', at: now(), gen: streamGen, missedSamples: droppedSamples, bytes: droppedBytes } }
-			if (pending.length && pending[0].kind === 'break') {
-				pending[0].info = Object.assign({}, pending[0].info, {
-					missedSamples: (pending[0].info.missedSamples || 0) + droppedSamples,
-					bytes: (pending[0].info.bytes || 0) + droppedBytes,
+			let insertAt = 0
+			while (insertAt < pending.length && pending[insertAt].kind === 'break') insertAt++
+			const prev = insertAt > 0 ? pending[insertAt - 1] : null
+			if (prev && prev.kind === 'break') {
+				prev.info = Object.assign({}, prev.info, {
+					missedSamples: (prev.info.missedSamples || 0) + droppedSamples,
+					bytes: (prev.info.bytes || 0) + droppedBytes,
 				})
 			} else {
-				pending.unshift(head)
+				pending.splice(insertAt, 0, head)
 			}
 			stats.gaps++
 			stats.lastGap = head.info

@@ -380,7 +380,45 @@ async function closeCase() {
 	assert.deepEqual(released, ['cY'], '没有声明时 close 不重复释放')
 }
 
-openFailureCase().then(closeCase).then(function () {
+// ---- N1：队列里断点与样点交错时，淘汰多项也不能把断点当样点（会抛错并留下超限队列） ----
+function trimWithInterleavedBreaks() {
+	const drains = []
+	const events = []
+	const link = Claim.createClaimLink({
+		host: {},
+		// 上限 4 点：三批各 4 点，中间用 offset 跳号造出两条断点 → 队列为 S,B,S,B,S
+		maxPendingSamples: 4,
+		scheduleDrain: function (fn) { drains.push(fn) },
+		onSamples: function (s) { events.push({ kind: 'samples', n: s.length }) },
+		onGap: function (g) { events.push({ kind: 'gap', reason: g.reason, missed: g.missedSamples }) },
+	})
+	let offset = 0
+	const b1 = wordsToBytes(samples(4, 1000))
+	link.handleRx({ claimId: 'c1', gen: 1, seq: 1, offset: offset, at: 1, bytes: b1 })
+	offset += b1.length + 32 // 跳号 = 断点
+	const b2 = wordsToBytes(samples(4, 1000))
+	link.handleRx({ claimId: 'c1', gen: 1, seq: 2, offset: offset, at: 2, bytes: b2 })
+	offset += b2.length + 8
+	const b3 = wordsToBytes(samples(4, 1000))
+	link.handleRx({ claimId: 'c1', gen: 1, seq: 3, offset: offset, at: 3, bytes: b3 })
+	// 到这里不能抛错（旧实现会把断点当样点读），队列也不能仍然超限
+	assert.ok(link.pendingSamples() <= 4, '淘汰后队列不能仍然超限：' + link.pendingSamples())
+	assert.equal(link.stats().backlogDropped, 8, '应淘汰最老的两项共 8 点：' + link.stats().backlogDropped)
+	// 排空：丢弃报告要带 8 点，并且落在被淘汰数据原本的位置（队首断点里合并）
+	while (drains.length) drains.shift()()
+	const gaps = events.filter((e) => e.kind === 'gap')
+	assert.ok(gaps.length >= 1, '丢弃必须有报告：' + JSON.stringify(events))
+	const missedTotal = gaps.reduce((s, g) => s + (g.missed || 0), 0)
+	assert.ok(missedTotal >= 8, '丢弃必须全部报告出来（含断点自己的丢点）：' + JSON.stringify(gaps))
+	// 每批淘汰都并入紧邻的断点，所以不会出现孤零零的 plugin_backlog 条目
+	assert.ok(gaps.every((g) => g.missed > 0), '每条断点都要带丢弃计数：' + JSON.stringify(gaps))
+	const iBacklog = events.findIndex((e) => e.kind === 'gap' && (e.missed || 0) > 0)
+	const iSamples = events.findIndex((e) => e.kind === 'samples')
+	assert.ok(iSamples > iBacklog, '剩下的样点要在断点之后交付：' + JSON.stringify(events))
+	assert.equal(events.filter((e) => e.kind === 'samples').reduce((s, e) => s + e.n, 0), 4, '只剩最后一批 4 点：' + JSON.stringify(events))
+}
+
+openFailureCase().then(closeCase).then(trimWithInterleavedBreaks).then(function () {
 	console.log('power-claim: ok')
 }).catch(function (e) {
 	console.error(e)
