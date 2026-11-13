@@ -476,6 +476,27 @@ async function writeContractCase() {
 	assert.equal(link.stats().bytes, 3)
 }
 
+// ---- BLU 筛选：只认设备名（别名 / 产品名）含 BLU，不区分大小写；portName 不参与 ----
+{
+	assert.equal(Claim.isAnalyzerPort({ productName: 'BLU Power Analyzer' }), true)
+	assert.equal(Claim.isAnalyzerPort({ productName: 'blu' }), true, '小写')
+	assert.equal(Claim.isAnalyzerPort({ alias: 'Bench-Blu-2', productName: 'USB Serial' }), true, '别名命中')
+	assert.equal(Claim.isAnalyzerPort({ productName: 'CP2102', portName: 'cu.BLU-fake' }), false, 'portName 不算设备名')
+	assert.equal(Claim.isAnalyzerPort({ productName: 'CH340' }), false)
+	assert.equal(Claim.isAnalyzerPort(null), false)
+	const many = Claim.filterAnalyzerPorts([
+		{ key: 'a', productName: 'BLU' },
+		{ key: 'b', productName: 'CH340' },
+		{ key: 'c', alias: 'blu#2' },
+		{ key: 'd', productName: 'FTDI' },
+	])
+	assert.deepEqual(many.ports.map((p) => p.key), ['a', 'c'], '多口时保序只留 BLU')
+	assert.equal(many.hidden, 2)
+	const none = Claim.filterAnalyzerPorts([{ key: 'x', productName: 'CH340' }])
+	assert.deepEqual(none, { ports: [], hidden: 1 }, '无匹配时返回空，不退回全部口')
+	assert.deepEqual(Claim.filterAnalyzerPorts(undefined), { ports: [], hidden: 0 })
+}
+
 openFailureCase().then(closeCase).then(trimWithInterleavedBreaks).then(writeContractCase).then(function () {
 	console.log('power-claim: ok')
 }).catch(function (e) {

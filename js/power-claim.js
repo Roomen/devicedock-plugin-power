@@ -643,7 +643,28 @@
 		}
 	}
 
-	const api = { createClaimLink: createClaimLink, toBytes: toBytes }
+	// 唯一支持的设备：宿主给出的设备名（别名 / 产品名）里含 BLU（不区分大小写）。
+	// 只看名字字段，不看 portName（cu.usbmodem… / COMx 与设备类型无关）。
+	const ANALYZER_NAME = /blu/i
+	const ANALYZER_NAME_FIELDS = ['alias', 'productName', 'name']
+
+	function isAnalyzerPort(p) {
+		if (!p || typeof p !== 'object') return false
+		for (let i = 0; i < ANALYZER_NAME_FIELDS.length; i++) {
+			const v = p[ANALYZER_NAME_FIELDS[i]]
+			if (typeof v === 'string' && ANALYZER_NAME.test(v)) return true
+		}
+		return false
+	}
+
+	/** @returns {{ ports: Array, hidden: number }} 只留 BLU 口；hidden 是被筛掉的口数（空态提示用） */
+	function filterAnalyzerPorts(list) {
+		const all = Array.isArray(list) ? list : []
+		const ports = all.filter(isAnalyzerPort)
+		return { ports: ports, hidden: all.length - ports.length }
+	}
+
+	const api = { createClaimLink: createClaimLink, toBytes: toBytes, isAnalyzerPort: isAnalyzerPort, filterAnalyzerPorts: filterAnalyzerPorts }
 	global.PowerClaim = api
 	if (typeof module !== 'undefined' && module.exports) module.exports = api
 })(typeof window !== 'undefined' ? window : globalThis)

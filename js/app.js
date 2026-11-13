@@ -56,6 +56,8 @@
 	// 采样 chip 的告警（开始失败 / 无应答 / 解析失败 / 中断）。界面每 400 ms 重绘一次，
 	// 告警必须记在状态里，否则重绘会立刻把它刷回 capturing / idle。
 	let sampleAlert = null
+	// 被 BLU 筛选隐藏的口数（空态提示用）
+	let portsHidden = 0
 
 	// ---- 视图与显示状态（会话级，不落盘的部分只影响本次看波形） ----
 	const view = { xZoom: 1, xOffset: 0, live: true, yMode: 'linear', yZoom: 1, yPan: 0, cursorA: null, cursorB: null }
@@ -351,13 +353,16 @@
 	async function refreshPorts() {
 		const sel = $('port')
 		try {
-			const ports = await link.listPorts()
+			// 只列 BLU 设备：这是唯一能连接的设备类型，没有匹配时给明确空态，绝不退回列全部口
+			const found = Claim.filterAnalyzerPorts(await link.listPorts())
+			const ports = found.ports
+			portsHidden = found.hidden
 			const current = sel.value
 			sel.textContent = ''
 			if (!ports.length) {
 				const opt = document.createElement('option')
 				opt.value = ''
-				opt.textContent = 'no ports'
+				opt.textContent = 'No BLU device found' + (portsHidden ? ' (' + portsHidden + ' other port(s) hidden)' : '') + ' — plug it in and press Refresh'
 				sel.appendChild(opt)
 				sel.disabled = true
 				setText('chip-port', 'port: none')

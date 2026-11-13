@@ -291,8 +291,11 @@ const fireKey = (win, key, props) => {
 		rxSeq: 0,
 		gen: 1,
 		ports: [
-			{ key: 'p1', portName: 'COM7', productName: 'Power Monitor', serialNumber: 'SN-42' },
-			{ key: 'p2', portName: 'COM8', productName: 'Other', busy: 'channel A' },
+			{ key: 'p1', portName: 'COM7', productName: 'BLU Power Monitor', serialNumber: 'SN-42' },
+			// 非 BLU 设备：必须被筛掉
+			{ key: 'p0', portName: 'COM3', productName: 'CP2102 USB to UART' },
+			// 别名里带小写 blu 也算
+			{ key: 'p2', portName: 'COM8', productName: 'Other', alias: 'my-blu', busy: 'channel A' },
 		],
 		rxHandler: null,
 		gapHandler: null,
@@ -317,8 +320,9 @@ const fireKey = (win, key, props) => {
 	await tick(60)
 
 	// ---- 启动 ----
-	assert.equal(document.getElementById('port').options.length, 2)
-	assert.match(document.getElementById('port').options[0].textContent, /Power Monitor/)
+	assert.equal(document.getElementById('port').options.length, 2, '只列 BLU 设备（非 BLU 的 CP2102 不出现）')
+	assert.match(document.getElementById('port').options[0].textContent, /BLU Power Monitor/)
+	assert.ok(!document.getElementById('port').options.some((o) => /CP2102/.test(o.textContent)), '非 BLU 口不能出现')
 	assert.match(document.getElementById('port').options[1].textContent, /busy: channel A/)
 	assert.equal(text(document, 'chip-sampling'), 'idle')
 	assert.equal(text(document, 'chip-theme'), 'theme: dark')
@@ -329,7 +333,7 @@ const fireKey = (win, key, props) => {
 	click(document, 'btn-connect')
 	await tick(500)
 	assert.deepEqual(state.acquires[0], ['p1', 'exclusive'], '必须走 claim.acquire(mode=exclusive)')
-	assert.equal(text(document, 'chip-port').indexOf('port: Power Monitor'), 0)
+	assert.equal(text(document, 'chip-port').indexOf('port: BLU Power Monitor'), 0)
 	assert.equal(text(document, 'btn-connect'), 'Disconnect')
 	assert.ok(state.writes.some((w) => w[0] === 0x19), '打开后读设备参数（0x19）')
 	assert.equal(document.getElementById('voltage').value, '3300', 'metadata 里的 VDD 回填到输入框')
@@ -677,6 +681,24 @@ const fireKey = (win, key, props) => {
 		click(document, 'btn-diag')
 		click(document, 'btn-connect')
 		await tick(150)
+	}
+
+	// ---- BLU 筛选空态：没有 BLU 口时给明确提示，不退回列全部口 ----
+	{
+		const saved = state.ports
+		state.ports = [{ key: 'q1', portName: 'COM9', productName: 'CH340' }, { key: 'q2', portName: 'COM10', productName: 'FTDI' }]
+		click(document, 'btn-refresh')
+		await tick(40)
+		const sel = document.getElementById('port')
+		assert.equal(sel.options.length, 1, '空态只有一条提示')
+		assert.equal(sel.options[0].value, '')
+		assert.match(sel.options[0].textContent, /No BLU device found.*2/, '空态写明未发现 BLU 并说明隐藏了几个口：' + sel.options[0].textContent)
+		assert.equal(sel.disabled, true)
+		state.ports = saved
+		click(document, 'btn-refresh')
+		await tick(40)
+		assert.equal(sel.options.length, 2)
+		assert.equal(sel.disabled, false)
 	}
 
 	// ---- CSV 导入：本地文件解析后替换会话 ----
