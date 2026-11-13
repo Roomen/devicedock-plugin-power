@@ -820,135 +820,199 @@
 		}
 
 		/**
-		 * 把 [a,b) 拆成「电压子区间」并逐段累加。
-		 * 返回的每项：{ lo, hi, sumI, sumP, n, mv, unknown, approximate }
-		 *  - 有真实样点时按块内电压边界拆开（每个样点用它**当时**的电压算功率）；
-		 *  - 冷块未回读只能按比例近似（标 approximate）；
-		 *  - 电压未知的样点 sumP 不累加，unknown=true。
+		 * **唯一的积分实现**：按「每个有效相邻样点间隔」左端点累加。
+		 *
+		 * 约定：样点 i 管 [t_i, t_{i+1}) 这段间隔，所以区间 [a,b) 的积分只覆盖
+		 * i ∈ [a, b-1)，且 i 与 i+1 必须同属一个连续段（缺口 / 淘汰 / 读不到都不算间隔）。
+		 * 结果与块大小、块边界无关：整块走块级和（sumI / sumP），跨块的边界间隔
+		 * 由「左端点所在块」负责，部分块用逐点值。
+		 *
+		 * n / sumI / minI / maxI 覆盖区间内的**全部样点**（[a,b)），
+		 * intervals / chargeUC / energyUW_s 只覆盖左端点（[a,b-1)）。
+		 *
+		 * @param {number} start 含
+		 * @param {number} end 不含
+		 * @param {object} [o] { samplePeriodSec }
 		 */
-		function collectRuns(a, b) {
-			const out = []
-			if (b <= a) return out
-			const i0 = chunkIndexAt(a)
-			let base = waveChunks[i0] ? waveChunks[i0].base : 0
-			for (let i = i0; i < waveChunks.length; i++) {
-				const ch = waveChunks[i]
-				const ch0 = base
-				const ch1 = base + ch.n
-				const lo = Math.max(a, ch0)
-				const hi = Math.min(b, ch1)
-				base = ch1
-				if (hi > lo && ch.state !== 'dropped') {
-					const buf = getChunkBuf(ch)
-					if (buf) {
-						const runs = chunkVoltRuns(ch, lo - ch0, hi - ch0)
-						for (let r = 0; r < runs.length; r++) {
-							const run = runs[r]
-							const vset = run.mv == null ? null : run.mv / 1000
-							const acc = { lo: ch0 + run.lo, hi: ch0 + run.hi, sumI: 0, sumP: 0, n: 0, minI: Infinity, maxI: -Infinity, mv: run.mv, unknown: vset == null, approximate: false }
-							for (let k = run.lo; k < run.hi; k++) {
-								const v = buf[k]
-								if (!isFinite(v)) continue
-								acc.sumI += v
-								if (vset != null) acc.sumP += v * vset
-								if (v < acc.minI) acc.minI = v
-								if (v > acc.maxI) acc.maxI = v
-								acc.n++
-							}
-							if (acc.hi > acc.lo) out.push(acc)
-						}
-					} else {
-						requestHydrate(ch)
-						const mv = ch.voltsUnknown ? null : (ch.sumI > 0 ? Math.round(ch.sumP / ch.sumI * 1000) : null)
-						const ratio = (hi - lo) / Math.max(1, ch.n)
-						out.push({
-							lo: lo, hi: hi,
-							sumI: ch.sumI * ratio, sumP: ch.sumP * ratio, n: hi - lo,
-							minI: ch.minI, maxI: ch.maxI,
-							mv: mv, unknown: mv == null, approximate: true,
-						})
-					}
-				}
-				if (base >= b) break
+		function integrateRange(start, end, o) {
+			o = o || {}
+			const per = o.samplePeriodSec > 0 ? o.samplePeriodSec : samplePeriod()
+			const out = {
+				n: 0, sumI: 0, sumP: 0, minI: Infinity, maxI: -Infinity,
+				intervals: 0, chargeUC: 0, energyUW_s: 0,
+				volts: 0, voltsUnknown: false, approximate: false,
+				segments: 0, gaps: 0, dropped: 0, durSec: 0,
 			}
+			if (totalCount < 1 || end <= start) return out
+			start = Math.max(0, start)
+			end = Math.min(totalCount, end)
+			if (end <= start) return out
+			const segs = segments(start, end)
+			out.segments = segs.length
+			out.gaps = gapsIn(start, end)
+			out.dropped = droppedIn(start, end)
+			let voltNum = 0
+			let voltDen = 0
+			for (let s = 0; s < segs.length; s++) {
+				const a = segs[s][0]
+				const b = segs[s][1]
+				// 左端点范围 [a, b-1)
+				const eHiGlobal = b - 1
+				let i0 = chunkIndexAt(a)
+				let base = waveChunks[i0] ? waveChunks[i0].base : 0
+				for (let i = i0; i < waveChunks.length; i++) {
+					const ch = waveChunks[i]
+					const ch0 = base
+					const ch1 = base + ch.n
+					base = ch1
+					const lo = Math.max(a, ch0)
+					const hi = Math.min(b, ch1)
+					if (hi > lo && ch.state !== 'dropped') {
+						const localLo = lo - ch0
+						const localHi = hi - ch0
+						// 本块内属于「左端点」的部分
+						const eHi = Math.min(localHi, eHiGlobal - ch0)
+						const buf = getChunkBuf(ch)
+						if (buf) {
+							const runs = chunkVoltRuns(ch, localLo, localHi)
+							for (let r = 0; r < runs.length; r++) {
+								const run = runs[r]
+								const vset = run.mv == null ? null : run.mv / 1000
+								if (vset == null) out.voltsUnknown = true
+								for (let k = run.lo; k < run.hi; k++) {
+									const v = buf[k]
+									if (!isFinite(v)) continue
+									out.n++
+									out.sumI += v
+									if (v < out.minI) out.minI = v
+									if (v > out.maxI) out.maxI = v
+									if (vset != null) { voltNum += v * vset; voltDen += v }
+									if (k < eHi) {
+										out.intervals++
+										out.chargeUC += v * per
+										if (vset != null) out.energyUW_s += v * vset * per
+									}
+								}
+							}
+						} else if (localLo === 0 && localHi === ch.n) {
+							// 整块：块级和精确
+							if (ch.voltsUnknown) out.voltsUnknown = true
+							out.n += ch.n
+							out.sumI += ch.sumI
+							if (ch.minI < out.minI) out.minI = ch.minI
+							if (ch.maxI > out.maxI) out.maxI = ch.maxI
+							if (!ch.voltsUnknown) { voltNum += ch.sumP; voltDen += ch.sumI }
+							// 左端点数 = 本块内属于 [a,b-1) 的样点数
+							const cntE = Math.max(0, eHi)
+							if (cntE >= ch.n) {
+								out.intervals += ch.n
+								out.chargeUC += ch.sumI * per
+								if (!ch.voltsUnknown) out.energyUW_s += ch.sumP * per
+							} else {
+								// 段尾那块：最后一个样点不构成间隔，用块级值减去它
+								const lastI = ch.lastI
+								out.intervals += ch.n - 1
+								out.chargeUC += (ch.sumI - lastI) * per
+								if (!ch.voltsUnknown) {
+									const runs = chunkVoltRuns(ch, ch.n - 1, ch.n)
+									const mv = runs.length ? runs[0].mv : null
+									const lastP = mv == null ? 0 : lastI * (mv / 1000)
+									out.energyUW_s += (ch.sumP - lastP) * per
+								}
+							}
+						} else {
+							// 部分块且未回读：按比例近似（显示用）
+							requestHydrate(ch)
+							out.approximate = true
+							if (ch.voltsUnknown) out.voltsUnknown = true
+							const cnt = localHi - localLo
+							const ratio = ch.n > 0 ? cnt / ch.n : 0
+							out.n += cnt
+							out.sumI += ch.sumI * ratio
+							out.sumP += ch.sumP * ratio
+							if (ch.minI < out.minI) out.minI = ch.minI
+							if (ch.maxI > out.maxI) out.maxI = ch.maxI
+							if (!ch.voltsUnknown) { voltNum += ch.sumP * ratio; voltDen += ch.sumI * ratio }
+							const cntE = Math.max(0, eHi - localLo)
+							out.intervals += cntE
+							out.chargeUC += ch.sumI * ratio * per
+							if (!ch.voltsUnknown) out.energyUW_s += ch.sumP * ratio * per
+						}
+					}
+					if (base >= b) break
+				}
+			}
+			out.durSec = out.intervals * per
+			out.volts = voltDen > 0 ? voltNum / voltDen : 0
+			if (!isFinite(out.minI)) out.minI = 0
+			if (!isFinite(out.maxI)) out.maxI = 0
 			return out
 		}
 
 		/**
-		 * 区间统计：**按连续段 × 电压子区间分别积分**再合并。
-		 *
-		 * 缺口与被淘汰的块把时间轴切开，每段各自累加；段内再按电压边界切开，
-		 * 每个子区间用自己的电压积分（左端点约定：第 i 个样点管 t_i→t_{i+1} 那一段）。
-		 *  - 时长 = 各段内的相邻样点对数 × 采样周期（dropped 段不贡献时长）；
-		 *  - 电量 / 能量 = Σ 子区间均值 × 子区间时长。
+		 * 把区间内所有冷块读进内存（分析 / 游标 / 导出用）。
+		 * 绑定会话 epoch：期间会话变化立即返回 { ok:false }。
+		 * @returns {Promise<{ ok:boolean, aborted:boolean, missing:number, dropped:number, gaps:number }>}
 		 */
-		function calcStats(start, end) {
-			if (totalCount < 1 || end <= start) return emptyStats()
-			start = Math.max(0, start)
-			end = Math.min(totalCount, end)
-			if (end <= start) return emptyStats()
-			const per = samplePeriod()
-			const segs = segments(start, end)
-			let n = 0
-			let sumI = 0
-			let sumP = 0
-			let minI = Infinity
-			let maxI = -Infinity
-			let dur = 0
-			let charge = 0
-			let energy = 0
-			let voltNum = 0
-			let voltDen = 0
-			let voltsUnknown = false
-			let approximate = false
+		async function hydrateRange(start, end) {
+			const a0 = Math.max(0, Math.min(totalCount, start | 0))
+			const b0 = Math.max(a0, Math.min(totalCount, end | 0))
+			const res = { ok: true, aborted: false, missing: 0, dropped: 0, gaps: 0 }
+			if (b0 <= a0) return res
+			const epoch = waveEpoch
+			const segs = segments(a0, b0)
+			res.gaps = gapsIn(a0, b0)
+			res.dropped = droppedIn(a0, b0)
 			for (let s = 0; s < segs.length; s++) {
-				const a = segs[s][0]
-				const b = segs[s][1]
-				const runs = collectRuns(a, b)
-				const steps = Math.max(0, b - a - 1)
-				const segDur = steps * per
-				dur += segDur
-				for (let r = 0; r < runs.length; r++) {
-					const run = runs[r]
-					if (run.unknown) voltsUnknown = true
-					if (run.approximate) approximate = true
-					if (!run.n) continue
-					sumI += run.sumI
-					sumP += run.sumP
-					n += run.n
-					if (run.minI < minI) minI = run.minI
-					if (run.maxI > maxI) maxI = run.maxI
-					voltNum += run.sumP
-					voltDen += run.sumI
-					// 左端点约定：区间内每个样点管到下一个样点；整段最后一个样点没有下一段
-					const isLastRunOfSegment = r === runs.length - 1
-					const span = Math.max(0, run.hi - run.lo - (isLastRunOfSegment ? 1 : 0))
-					const runDur = span * per
-					const meanI = run.sumI / run.n
-					const meanP = run.sumP / run.n
-					charge += meanI * runDur
-					energy += meanP * runDur / 3600
+				let i0 = chunkIndexAt(segs[s][0])
+				let base = waveChunks[i0] ? waveChunks[i0].base : 0
+				for (let i = i0; i < waveChunks.length; i++) {
+					const ch = waveChunks[i]
+					const ch0 = base
+					const ch1 = base + ch.n
+					base = ch1
+					const lo = Math.max(segs[s][0], ch0)
+					const hi = Math.min(segs[s][1], ch1)
+					if (hi > lo) {
+						const buf = await hydrateChunk(ch)
+						if (epoch !== waveEpoch) {
+							res.aborted = true
+							res.ok = false
+							return res
+						}
+						if (!buf) res.missing += hi - lo
+					}
+					if (base >= segs[s][1]) break
 				}
 			}
-			const avgI = n ? sumI / n : 0
-			const avgP = n ? sumP / n : 0
+			res.ok = res.missing === 0
+			return res
+		}
+
+		/** 区间统计（显示 / 摘要用）：直接委托给唯一的积分实现 */
+		function calcStats(start, end, o) {
+			o = o || {}
+			const per = samplePeriod()
+			const r = integrateRange(start, end, { samplePeriodSec: per })
+			const avgI = r.n ? r.sumI / r.n : 0
+			const avgP = r.n ? r.sumP / r.n : 0
 			return enrichStats({
-				n: n,
+				n: r.n,
 				avgI: avgI,
 				avgP: avgP,
-				minI: isFinite(minI) ? minI : 0,
-				maxI: isFinite(maxI) ? maxI : 0,
-				dur: dur,
-				chargeUC: charge,
-				chargeUAh: charge / 3600,
-				// 电压未知 → 能量不可用（null），不编一个确定值
-				energyUWh: voltsUnknown ? null : energy,
-				energyApproximate: voltsUnknown ? false : approximate,
-				// 这段历史数据的有效电压（按电流加权）；与界面当前设置无关
-				volts: voltDen > 0 ? voltNum / voltDen : 0,
-				segments: segs.length,
-				gaps: gapsIn(start, end),
-				dropped: droppedIn(start, end),
+				minI: r.minI,
+				maxI: r.maxI,
+				dur: r.durSec,
+				chargeUC: r.chargeUC,
+				chargeUAh: r.chargeUC / 3600,
+				// 内部单位是 µW·s，对外 µWh 要除以 3600；电压未知时不可用
+				energyUWh: r.voltsUnknown ? null : r.energyUW_s / 3600,
+				energyApproximate: r.voltsUnknown ? false : r.approximate,
+				volts: r.volts,
+				voltsUnknown: r.voltsUnknown,
+				segments: r.segments,
+				gaps: r.gaps,
+				dropped: r.dropped,
 			})
 		}
 
@@ -1165,6 +1229,8 @@
 			ringIAt: ringIAt,
 			stats: calcStats,
 			calcStats: calcStats,
+			integrateRange: integrateRange,
+			hydrateRange: hydrateRange,
 			minPositiveIn: minPositiveIn,
 			bucketEntry: getBucketEntry,
 			getBucketEntry: getBucketEntry,

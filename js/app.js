@@ -1105,6 +1105,8 @@
 	}
 
 	// ---------- 游标读数 ----------
+	// 游标读数走精确路径（等冷块回读）：用序号丢弃过期结果
+	let cursorSeq = 0
 	function renderCursorPanel() {
 		const total = totalSamples()
 		const per = control ? control.getSamplePeriodSec() : 0
@@ -1118,15 +1120,32 @@
 			setText('cur-energy', '—')
 			return
 		}
-		const m = Panels.measureCursors(wave, sel.a, sel.b, { samplePeriodSec: per })
-		// 端点电流只用真值：冷块未回读 / 已淘汰就显示 "—"，不拿近似值冒充实测
-		setText('cur-a', sel.a + ' · ' + (m.iA == null ? '—' : fmt.fmtCurrent(m.iA)))
-		setText('cur-b', sel.b + ' · ' + (m.iB == null ? '—' : fmt.fmtCurrent(m.iB)))
-		setText('cur-dt', fmt.fmtDuration(m.wallSec) + ' / ' + fmt.fmtDuration(m.durSec) + (m.gaps ? ' · ' + m.gaps + ' gap' + (m.gaps > 1 ? 's' : '') : ''))
-		setText('cur-mean', fmt.fmtCurrent(m.avgI) + ' · ' + fmt.fmtCurrent(m.minI) + ' / ' + fmt.fmtCurrent(m.maxI))
-		setText('cur-charge', fmt.fmtCharge(m.chargeUC))
-		setText('cur-energy', fmt.fmtEnergy(m.energyUWh))
-		$('cur-dt').dataset.warn = m.gaps > 0 ? '1' : '0'
+		const seq = ++cursorSeq
+		Panels.measureCursorsExact(wave, sel.a, sel.b, { samplePeriodSec: per }).then(function (m) {
+			if (seq !== cursorSeq || !m || m.aborted) return
+			// 端点电流只用真值：冷块未回读 / 已淘汰就显示 "—"，不拿近似值冒充实测
+			setText('cur-a', sel.a + ' · ' + (m.iA == null ? '—' : fmt.fmtCurrent(m.iA)))
+			setText('cur-b', sel.b + ' · ' + (m.iB == null ? '—' : fmt.fmtCurrent(m.iB)))
+			if (!m.complete) {
+				// 回读不完整 / 有淘汰：不显示近似读数
+				const why = m.missing > 0 ? fmtCount(m.missing) + ' sample(s) unavailable'
+					: (m.dropped > 0 ? fmtCount(m.dropped) + ' sample(s) evicted' : 'range incomplete')
+				setText('cur-dt', '— (' + why + ')')
+				setText('cur-mean', '—')
+				setText('cur-charge', '—')
+				setText('cur-energy', '—')
+				$('cur-dt').dataset.warn = '1'
+				return
+			}
+			setText('cur-dt', fmt.fmtDuration(m.wallSec) + ' / ' + fmt.fmtDuration(m.durSec) + (m.gaps ? ' · ' + m.gaps + ' gap' + (m.gaps > 1 ? 's' : '') : ''))
+			setText('cur-mean', fmt.fmtCurrent(m.avgI) + ' · ' + fmt.fmtCurrent(m.minI) + ' / ' + fmt.fmtCurrent(m.maxI))
+			setText('cur-charge', fmt.fmtCharge(m.chargeUC))
+			setText('cur-energy', m.energyUWh == null ? 'n/a (no voltage)' : fmt.fmtEnergy(m.energyUWh))
+			$('cur-dt').dataset.warn = (m.gaps > 0 || m.voltsUnknown) ? '1' : '0'
+		}).catch(function (e) {
+			if (seq !== cursorSeq) return
+			log('游标读数失败：' + (e && e.message ? e.message : e), 'warn')
+		})
 	}
 
 	// ---------- 分析 ----------

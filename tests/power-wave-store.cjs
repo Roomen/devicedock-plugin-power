@@ -355,7 +355,8 @@ const settle = async () => { for (let k = 0; k < 5; k++) await tick() }
 		T2.ringPush(0)
 		const st2 = T2.calcStats(0, 4)
 		assert.equal(st2.dur, 3)
-		assert.ok(Math.abs(st2.chargeUC - 250 * 3) < 1e-9, '连续段内才按均值积分：' + st2.chargeUC)
+		// 左端点约定：li=0 的 1000 µA 管 1 s，后两个 0 不贡献 → 1000 µC（不是均值 250 × 3 = 750）
+		assert.ok(Math.abs(st2.chargeUC - 1000) < 1e-9, '按每个间隔的左端点积分：' + st2.chargeUC)
 	}
 
 	{
