@@ -350,6 +350,8 @@
 		'ctl.start_cancelled': '请求已取消，未开始采样',
 		'ctl.start_device_changed': '设备已变化，未开始采样',
 		'ctl.store_init_failed': '初始化波形存储失败：{err}',
+		'ctl.store_init_timeout': '波形存储初始化超时（{ms} ms），未开始采样',
+		'ctl.guard_timeout': '等待前置检查超时（{ms} ms），操作未执行',
 		'ctl.acq_armed': '采样沿启动已 Arm：等待 {edge} 后开始入库（电平 {level}）',
 		'ctl.level_auto': '自动',
 		'ctl.start_conn_changed': '开始采样过程中连接已变化，结果未知',
@@ -396,6 +398,8 @@
 		'clm.open_failed': '打开串口失败：{err}',
 		'clm.write_not_open': '写入失败（串口未打开）：{note}',
 		'clm.write_failed': '写入失败（{note}）：{err}',
+		'clm.write_timeout': '写入超时（{note}）：宿主 {ms} ms 内未确认',
+		'clm.timeout_short': '{ms} ms 内未确认',
 		'clm.write_stale': '写入完成时连接已变化：{note}',
 
 		// ---- power-wave ----
@@ -785,6 +789,8 @@
 		'ctl.start_cancelled': 'Request cancelled; capture not started',
 		'ctl.start_device_changed': 'The device changed; capture not started',
 		'ctl.store_init_failed': 'Initialising waveform storage failed: {err}',
+		'ctl.store_init_timeout': 'Waveform storage initialisation timed out ({ms} ms); capture not started',
+		'ctl.guard_timeout': 'Timed out waiting for the pre-check ({ms} ms); operation not run',
 		'ctl.acq_armed': 'Capture start edge armed: storing begins after {edge} (level {level})',
 		'ctl.level_auto': 'auto',
 		'ctl.start_conn_changed': 'The connection changed while starting the capture; result unknown',
@@ -830,6 +836,8 @@
 		'clm.open_failed': 'Opening the serial port failed: {err}',
 		'clm.write_not_open': 'Write failed (port not open): {note}',
 		'clm.write_failed': 'Write failed ({note}): {err}',
+		'clm.write_timeout': 'Write timed out ({note}): the host did not confirm within {ms} ms',
+		'clm.timeout_short': 'not confirmed within {ms} ms',
 		'clm.write_stale': 'The connection changed before the write finished: {note}',
 
 		'wav.alloc_failed': 'Out of memory allocating a waveform block: {err}',

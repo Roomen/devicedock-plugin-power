@@ -52,6 +52,8 @@ function makeHarness(opts) {
 				write: async (id, bytes) => {
 					state.writes.push({ id: id, bytes: Array.from(bytes) })
 					const n = state.writes.length
+					// 宿主永不确认这一条（卡死的写入）：靠链路的写入超时结束
+					if (state.hangOnByte != null && bytes[0] === state.hangOnByte) return new Promise(() => {})
 					if (state.writeDelay > 0) await wait(state.writeDelay)
 					if (state.writeFailAt && n >= state.writeFailAt) throw new Error('synthetic write failure')
 					if (state.writeMode === 'throw') throw new Error('synthetic write failure')
@@ -66,6 +68,7 @@ function makeHarness(opts) {
 		host: makeHost(),
 		baudRate: 115200,
 		scheduleDrain: (fn) => fn(),
+		writeTimeoutMs: opts.writeTimeoutMs,
 		onSamples: (list) => { state.samples += list.length },
 		onGap: (g) => state.gaps.push(g),
 		onLog: (msg, level) => state.logs.push({ msg: msg, level: level || '' }),
@@ -100,7 +103,7 @@ function makeHarness(opts) {
 		wave: wave,
 		store: state.store,
 		settings: { recordMode: opts.recordMode || 'wave', targetRateHz: 1000, voltageMv: 3300 },
-		options: { rxDrainMs: 0 },
+		options: Object.assign({ rxDrainMs: 0 }, opts.controlOptions || {}),
 		log: (msg, level) => state.logs.push({ msg: msg, level: level || '' }),
 		onChange: () => { state.changes++ },
 		onSamplingEnd: (info) => { state.ends = (state.ends || []).concat([info]) },
@@ -509,6 +512,140 @@ test('自动停采的结果被检查：STOP 写失败时记错误（上状态条
 	const fail = h.state.logs.find((l) => l.msg && l.msg.key === 'ctl.acq_stop_failed')
 	assert.ok(fail, '停采失败要记日志')
 	assert.equal(fail.level, 'error', '错误级（会上状态条）')
+})
+
+// 给可能卡死的等待加个上限：没修好时用例失败而不是整个进程挂住
+const HUNG = { hung: true }
+const within = (p, ms) => Promise.race([p, wait(ms).then(() => HUNG)])
+
+function feedOf(h) {
+	return (ua, raw) => {
+		const list = []
+		for (let i = 0; i < raw; i++) list.push({ iUA: ua, range: 3, logic: 0xff })
+		return h.control.pushSamples(list, 10, { from: 0, total: raw })
+	}
+}
+
+test('停止合并：前面的操作卡住时反复请求停止只占一个队列位，自动 + 手动是同一个停止', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writes.length = 0
+	// 一个慢操作挡在队列前面
+	h.state.writeDelay = 150
+	const slow = h.control.setVoltage(2000)
+	const feed = feedOf(h)
+	feed(100, 300)
+	feed(0, 300) // 命中停止沿
+	await wait(10) // 自动停止已排队（仍被慢操作挡着）
+	const manual = []
+	for (let i = 0; i < 50; i++) manual.push(h.control.stopCapture())
+	assert.ok(manual.every((p) => p === manual[0]), '手动停止都合并成同一个待执行的停止')
+	// 停止只占一个队列位：慢操作 1 + 停止 1，还能再排 6 个非停止操作，第 7 个才被拒
+	const extra = []
+	for (let i = 0; i < 6; i++) extra.push(h.control.setVoltage(2100 + i * 10))
+	assert.equal((await h.control.setVoltage(2500)).code, 'power_busy', '队列上限仍然生效')
+	const r = await manual[0]
+	await slow
+	await Promise.all(extra)
+	assert.equal(r.ok, true)
+	assert.equal(h.control.isSampling(), false)
+	assert.equal(h.state.writes.filter((w) => w.bytes[0] === 0x07).length, 1, '只发了一条 STOP')
+	assert.equal(h.state.logs.filter((l) => l.msg && l.msg.key === 'ctl.acq_stop_hit').length, 1)
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }], '手动停止并入了自动停止，只结束一次')
+	// 停止执行完才清：之后可以重新开始、再次停止
+	h.state.writeDelay = 0
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	const again = await h.control.stopCapture()
+	assert.equal(again.ok, true)
+	assert.equal(h.state.writes.filter((w) => w.bytes[0] === 0x07).length, 3, '新一轮的前置 STOP + 停止 STOP')
+	assert.deepEqual(h.state.ends, [{ reason: 'acq_stop' }, { reason: 'manual' }])
+})
+
+test('停止沿命中即数据截止：STOP 还在排队时，之后到达的样点不再入库', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	h.control.setTrigLevel(50)
+	h.control.setAcqTriggers('off', 'fall')
+	await h.control.startCapture()
+	await wait(0)
+	h.state.writeDelay = 150
+	const slow = h.control.setVoltage(2000)
+	const feed = feedOf(h)
+	feed(100, 300)
+	const beforeMixed = h.wave.pushed
+	// 同一批里命中点之后的样点也不入库：低段命中下降沿，后面的高段整段被截掉
+	const mixed = []
+	for (let i = 0; i < 300; i++) mixed.push({ iUA: 0, range: 3, logic: 0xff })
+	for (let i = 0; i < 300; i++) mixed.push({ iUA: 100, range: 3, logic: 0xff })
+	h.control.pushSamples(mixed, 10, { from: 0, total: mixed.length })
+	const atHit = h.wave.pushed
+	assert.ok(atHit - beforeMixed <= 3, '命中点之后同批的样点被截掉：本批入库 ' + (atHit - beforeMixed))
+	await wait(20)
+	assert.equal(h.control.isSampling(), true, 'STOP 还被挡在队列里')
+	for (let k = 0; k < 5; k++) { feed(100, 300); feed(0, 300) }
+	assert.equal(h.wave.pushed, atHit, '截止后到达的样点一个都不入库')
+	await slow
+	for (let i = 0; i < 40 && h.control.isSampling(); i++) await wait(10)
+	assert.equal(h.control.isSampling(), false)
+	assert.equal(h.wave.pushed, atHit)
+	// 下一轮开始时截止标志复位
+	h.state.writeDelay = 0
+	h.control.setAcqTriggers('off', 'off')
+	await h.control.startCapture()
+	const before = h.wave.pushed
+	feed(100, 300)
+	feed(100, 300)
+	assert.ok(h.wave.pushed > before, '新一轮照常入库')
+})
+
+test('写入超时：宿主不确认的写入按失败结束，原因带超时并记错误；排在后面的 STOP 照常执行', async () => {
+	const h = await connected({ writeTimeoutMs: 60 })
+	await h.control.startCapture()
+	await wait(0)
+	h.state.hangOnByte = 0x0d
+	const t0 = Date.now()
+	const v = h.control.setVoltage(2000)
+	const stop = h.control.stopCapture()
+	const vr = await within(v, 2000)
+	assert.notEqual(vr, HUNG, '卡死的写入必须在超时内结束')
+	assert.equal(vr.ok, false)
+	assert.equal(vr.code, 'voltage_write_failed')
+	assert.match(String(vr.cause), /60 ms/, '失败原因带超时：' + String(vr.cause))
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && l.msg && l.msg.key === 'clm.write_timeout'), '超时记错误日志（上状态条）')
+	const sr = await within(stop, 2000)
+	assert.notEqual(sr, HUNG, 'STOP 被卡死的写入挡住了')
+	assert.equal(sr.ok, true, 'STOP 没被卡死的写入挡住')
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(Date.now() - t0 < 1000, '在超时量级内完成：' + (Date.now() - t0) + ' ms')
+})
+
+test('存储初始化超时：中止启动、不发 START，返回原因并记错误', async () => {
+	const h = await connected({ controlOptions: { storeInitTimeoutMs: 50 } })
+	h.state.onStoreInit = () => new Promise(() => {})
+	const r = await within(h.control.startCapture(), 2000)
+	assert.notEqual(r, HUNG, '存储初始化卡住时启动必须在超时内结束')
+	assert.equal(r.ok, false)
+	assert.equal(r.code, 'store_init_timeout')
+	assert.equal(h.control.isSampling(), false)
+	assert.ok(!h.state.writes.some((w) => w.bytes[0] === 0x06), '没有 START')
+	assert.ok(h.state.logs.some((l) => l.level === 'error' && l.msg && l.msg.key === 'ctl.store_init_timeout'))
+	// 队列没被卡住：之后的操作照常执行
+	h.state.onStoreInit = null
+	assert.equal((await h.control.startCapture()).ok, true)
+})
+
+test('前置检查（guard.start）超时：操作不执行，返回 guard_timeout', async () => {
+	const h = await connected({ controlOptions: { guardTimeoutMs: 50 } })
+	const r = await within(h.control.setPower(true, { start: () => new Promise(() => {}) }), 2000)
+	assert.notEqual(r, HUNG, '前置检查卡住时必须在超时内结束')
+	assert.equal(r.code, 'guard_timeout')
+	assert.equal(h.state.writes.length, 0, '没有写任何命令')
+	assert.equal((await h.control.setPower(true)).ok, true, '队列没被卡住')
 })
 
 test('长期模式：仍然维护折叠总览（minimap），但不进波形环', async () => {

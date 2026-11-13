@@ -227,6 +227,8 @@ function makeFakeSdk(state) {
 					throw err
 				}
 				state.writes.push(Array.from(bytes))
+				// 宿主永不确认这一条写入（卡死）：插件靠写入超时结束它
+				if (state.hangOnByte != null && bytes[0] === state.hangOnByte) return new Promise(function () {})
 				if (bytes[0] === 0x19) state.pushRxText('R0=1031.64\r\nVDD=3300 mV\r\nEND\r\n')
 				if (bytes[0] === 0x06 && !state.silent) state.pushRxSamples(300, 1000)
 				return { bytes: bytes.length }
@@ -898,6 +900,20 @@ const fireKey = (win, key, props) => {
 		state.silent = false
 		click(document, 'btn-sample')
 		await tick(200)
+		// 3) 宿主卡住不确认写入：按超时失败结束，超时原因留在状态条（中英都整句可重绘）
+		state.hangOnByte = 0x0d
+		document.getElementById('voltage').value = '2500'
+		click(document, 'btn-apply-voltage')
+		await tick(3300)
+		state.hangOnByte = null
+		assert.equal(sl.dataset.level, 'error')
+		assert.match(sl.textContent, /^Setting the voltage failed: .*not confirmed within 3000 ms \[timeout\]/, '状态条写明超时：' + sl.textContent)
+		assert.match(text(document, 'diag-error'), /Write timed out .*3000 ms/, '诊断最近错误：' + text(document, 'diag-error'))
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.match(sl.textContent, /^设定电压失败：.*3000 ms 内未确认 \[timeout\]/, '状态条切到中文：' + sl.textContent)
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
 		click(document, 'btn-diag')
 		click(document, 'btn-connect')
 		await tick(150)

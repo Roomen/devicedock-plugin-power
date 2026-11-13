@@ -22,6 +22,10 @@
 		probeMs: 250,
 		dutOnThresholdUA: 0.5,
 		maxQueueDepth: 8,
+		// 队列里会 await 外部的步骤都要有上限，否则排在后面的 STOP 会被无限期挡住
+		// （串口写入的超时在 power-claim 的 writeTimeoutMs）
+		storeInitTimeoutMs: 5000,
+		guardTimeoutMs: 5000,
 	}
 
 	function emptyStats() {
@@ -78,7 +82,11 @@
 		// 采样沿触发（start / stop）与它需要的触发电平
 		let acq = VIEW ? VIEW.createAcqTrigger() : null
 		let trigLevelUA = null
+		// 停止请求：同一时刻最多一个待执行的停止（自动 + 手动合并），执行完（成功或失败）才清
 		let stopScheduled = false
+		let stopPending = null
+		// 停止沿命中后数据侧立即截止：之后到达的样点不再进本次采集（STOP 命令按队列再发）
+		let stopCut = false
 		// 缺口计数（长跑模式没有波形环，摘要里也得有数）
 		let gapCount = 0
 		// 长期模式的折叠总览（minimap）：长跑时不进波形环，只留 min/max 总览
@@ -118,9 +126,23 @@
 			return run
 		}
 
+		/** p 在 ms 内没结束就按 timeoutValue 结束（p 之后的拒绝被吞掉，不成未处理异常） */
+		function withTimeout(p, ms, timeoutValue) {
+			let timer = null
+			const inner = Promise.resolve(p)
+			inner.catch(function () {})
+			const limit = new Promise(function (resolve) { timer = clock.setTimeout(function () { resolve(timeoutValue) }, ms) })
+			const done = function () { if (timer != null && typeof clock.clearTimeout === 'function') clock.clearTimeout(timer) }
+			return Promise.race([inner, limit]).then(function (v) { done(); return v }, function (e) { done(); throw e })
+		}
+
 		function guardStart(guard) {
 			if (!guard || typeof guard.start !== 'function') return Promise.resolve(null)
-			return Promise.resolve(guard.start()).then(function (e) { return e || null })
+			const timedOut = { ok: false, code: 'guard_timeout', message: tr('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), ref: msg('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), executed: false }
+			return withTimeout(Promise.resolve().then(function () { return guard.start() }), opts.guardTimeoutMs, timedOut).then(function (e) {
+				if (e === timedOut) log(msg('ctl.guard_timeout', { ms: opts.guardTimeoutMs }), 'error')
+				return e || null
+			})
 		}
 		function guardStep(guard) {
 			if (!guard || typeof guard.step !== 'function') return null
@@ -235,7 +257,8 @@
 				return 0
 			}
 			// 未采样时段（探测结束后到 START 之间、STOP 后的残包）：字节已消费但不入库
-			if (!sampling) {
+			// 停止沿命中后到 STOP 真正执行前：同样不入库（数据侧已截止）
+			if (!sampling || stopCut) {
 				ignoredSamples += list.length
 				return 0
 			}
@@ -273,11 +296,15 @@
 						continue
 					}
 					if (ingest(outs[k].tMs, ua, s)) stored++
-					// 停沿：入库之后生效，STOP 排到回调外异步发
+					// 停沿：命中点入库后数据侧立即截止（本批剩余与之后的样点都不再入库），STOP 排到回调外异步发
 					if (acq && acq.stop !== 'off' && acq.storeEnabled && feedAcq(ua, 'stop')) {
 						requestStop(msg('ctl.acq_stop_hit'))
 						break
 					}
+				}
+				if (stopCut) {
+					ignoredSamples += list.length - i - 1
+					break
 				}
 			}
 			return stored
@@ -299,20 +326,48 @@
 			return VIEW.feedAcqEdge(acq, { iUA: ua, kind: kind, thr: trigLevel() })
 		}
 
-		/** 停采排到回调之外：绝不能在这条入库路径里 await */
+		/**
+		 * 排一个停止：已经有待执行的停止就复用它（自动 + 手动合并成同一个），不再入队。
+		 * stopScheduled 保持到这次停止真正执行完（成功或失败）才清。
+		 */
+		function queueStop(reason, guard) {
+			if (stopPending) return stopPending
+			stopScheduled = true
+			if (!stopReason) stopReason = reason
+			const run = runOp(async function () {
+				const g = await guardStart(guard)
+				if (g) return g
+				return await stopSampling(guard)
+			}, { stop: true })
+			const settle = function () {
+				if (stopPending === pending) {
+					stopPending = null
+					stopScheduled = false
+					stopReason = null
+				}
+			}
+			const pending = run.then(function (r) { settle(); return r }, function (e) { settle(); throw e })
+			stopPending = pending
+			return pending
+		}
+
+		/** 停沿命中：数据侧立即截止；STOP 排到回调之外发（绝不能在这条入库路径里 await） */
 		function requestStop(reason) {
+			stopCut = true
 			if (stopScheduled) return
 			stopScheduled = true
 			log(reason, 'warn')
 			clock.setTimeout(function () {
-				stopScheduled = false
-				if (!sampling) return
+				if (!sampling) {
+					if (!stopPending) stopScheduled = false
+					return
+				}
 				// 自动停采也排进操作队列（与手动停同一条路径），会话结束回调统一收尾
-				stopReason = 'acq_stop'
-				runOp(function () { return stopSampling() }, { stop: true }).then(function (r) {
+				queueStop('acq_stop').then(function (r) {
 					// 结果必须看：停不下来或 STOP 没写出去都要上状态条，不能只留一条「命中停止沿」
 					if (!r || r.ok === false) {
-						log(msg('ctl.acq_stop_failed', { why: (r && (r.ref || r.message || r.code)) || msg('ui.unknown_reason') }), 'error')
+						const why = (r && (r.ref || r.message || r.code)) || msg('ui.unknown_reason')
+						log(msg('ctl.acq_stop_failed', { why: r && r.cause ? I18N.join([why, r.cause]) : why }), 'error')
 					}
 				}, function (e) {
 					log(msg('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
@@ -365,7 +420,9 @@
 		function errText(w) {
 			const e = w && w.error
 			if (!e) return ''
-			return msg('ctl.err_detail', { msg: (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') })
+			// message 可能是惰性消息（例如写入超时）：拼接也保持惰性，切语言时整句重翻
+			const m = e.message ? e.message : String(e)
+			return msg('ctl.err_detail', { msg: e.code ? I18N.join([m, ' [' + e.code + ']']) : m })
 		}
 
 		function writeRaw(bytes, note) {
@@ -393,7 +450,7 @@
 			if (!w.ok) {
 				if (!w.stale) log(msg('ctl.voltage_write_failed_log'), 'error')
 				onChange()
-				return { ok: false, stale: !!w.stale }
+				return { ok: false, stale: !!w.stale, error: w.error }
 			}
 			if (voltageMv !== clamped && sampling) voltageChanges++
 			toggleVoltageSource(clamped)
@@ -413,7 +470,7 @@
 			if (!v.ok) {
 				if (v.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed_voltage'), ref: msg('ctl.power_on_conn_changed_voltage'), executed: 'unknown', powered: powerPayload() }
 				log(msg('ctl.power_on_aborted'), 'error')
-				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), ref: msg('ctl.power_on_voltage_failed'), voltageMv: voltageMv, powered: powerPayload() }
+				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), ref: msg('ctl.power_on_voltage_failed'), cause: errText(v), voltageMv: voltageMv, powered: powerPayload() }
 			}
 			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.power_on_cancelled'), ref: msg('ctl.power_on_cancelled'), executed: false, powered: powerPayload() }
 			if (!stillSameConn(gen)) {
@@ -426,7 +483,7 @@
 				// 同一连接写失败：不知道设备收没收到，标未知
 				markPowered(null, 'unknown')
 				log(msg('ctl.power_on_write_failed_log'), 'error')
-				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), ref: msg('ctl.power_on_write_failed'), executed: 'unknown', powered: powerPayload() }
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), ref: msg('ctl.power_on_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(true, 'commanded')
 			log(msg('ctl.power_on_done'), 'success')
@@ -442,7 +499,7 @@
 				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), ref: msg('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				markPowered(null, 'unknown')
 				log(msg('ctl.power_off_write_failed_log'), 'error')
-				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), ref: msg('ctl.power_off_write_failed'), executed: 'unknown', powered: powerPayload() }
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), ref: msg('ctl.power_off_write_failed'), cause: errText(w), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(false, 'commanded')
 			log(msg('ctl.power_off_done'))
@@ -562,8 +619,14 @@
 			// 先按标称速率起步，实测会在 pushSamples 里修正
 			deviceStreamHz = baseHz
 			if (recordMode === 'wave' && store) {
+				const initTimedOut = {}
 				try {
-					await store.init()
+					// 存储初始化有上限：卡住时中止启动并说明原因，不能把排在后面的 STOP 一起挡住
+					const ir = await withTimeout(store.init(), opts.storeInitTimeoutMs, initTimedOut)
+					if (ir === initTimedOut) {
+						log(msg('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), 'error')
+						return { ok: false, code: 'store_init_timeout', message: tr('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), ref: msg('ctl.store_init_timeout', { ms: opts.storeInitTimeoutMs }), executed: false }
+					}
 				} catch (e) {
 					log(msg('ctl.store_init_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				}
@@ -592,7 +655,8 @@
 				acq.preMax = -Infinity
 				if (acq.start !== 'off') log(msg('ctl.acq_armed', { edge: msg('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : msg('ctl.level_auto') }))
 			}
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
 			sampling = true
 			onChange()
 
@@ -645,7 +709,7 @@
 			try {
 				stopW = await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
 			} catch (e) {
-				stopW = { ok: false, stale: false }
+				stopW = { ok: false, stale: false, error: e }
 			}
 			link.resetParser(false)
 			const stopped = !!(wave && wave.storageStop && wave.storageStop())
@@ -654,7 +718,7 @@
 			onChange()
 			if (stopW.ok) return { ok: true, changed: true, sampling: false }
 			if (stopW.stale) return { ok: false, code: 'disconnected', message: tr('ctl.stop_conn_changed'), ref: msg('ctl.stop_conn_changed'), executed: 'unknown', sampling: false }
-			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), ref: msg('ctl.stop_write_failed'), sampling: false }
+			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), ref: msg('ctl.stop_write_failed'), cause: errText(stopW), sampling: false }
 		}
 
 		// ---- 对外（界面 / 测试）----
@@ -697,7 +761,7 @@
 				if (!stillSameConn(gen) || applied.stale) {
 					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), ref: msg('ctl.op_disconnected'), executed: 'unknown' }
 				}
-				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), ref: msg('ctl.voltage_not_applied'), voltageMv: voltageMv, requestedMv: requested }
+				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), ref: msg('ctl.voltage_not_applied'), cause: errText(applied), voltageMv: voltageMv, requestedMv: requested }
 				return { ok: true, requestedMv: requested, appliedMv: voltageMv, clamped: voltageMv !== requested }
 			}, { failFast: !!guard })
 		}
@@ -712,11 +776,8 @@
 		}
 
 		function stopCapture(guard) {
-			return runOp(async function () {
-				const g = await guardStart(guard)
-				if (g) return g
-				return await stopSampling(guard)
-			}, { failFast: !!guard, stop: true })
+			// 已有待执行的停止（例如停止沿刚命中）就合并成同一个，不再另排一个
+			return queueStop('manual', guard)
 		}
 
 		function togglePower() {
@@ -838,7 +899,8 @@
 			const wasSampling = sampling
 			const pendingSamples = link && typeof link.pendingSamples === 'function' ? link.pendingSamples() : 0
 			sampling = false
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
 			if (wasSampling) {
 				// 已收到的样点先尽量入库；剩下的如实标缺口
 				let flushed = { remaining: 0, remainingBytes: 0 }
@@ -869,7 +931,8 @@
 		/** 新建连接前调用：清掉上一次会话可能残留的采样 / 供电 / 触发状态 */
 		function prepareSession() {
 			sampling = false
-			stopScheduled = false
+			if (!stopPending) stopScheduled = false
+			stopCut = false
 			power = { on: null, source: 'unknown' }
 			lastTMs = 0
 			lastTMsValid = false

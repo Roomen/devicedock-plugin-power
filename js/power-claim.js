@@ -79,6 +79,10 @@
 		const scheduleDrain = typeof cfg.scheduleDrain === 'function'
 			? cfg.scheduleDrain
 			: function (fn) { return setTimeout(fn, 0) }
+		// 单次写入的上限：宿主迟迟不确认时按失败结束，排在后面的操作（尤其是 STOP）不会被无限期挡住
+		const WRITE_TIMEOUT_MS = cfg.writeTimeoutMs > 0 ? cfg.writeTimeoutMs : 3000
+		const setTimer = typeof cfg.setTimeout === 'function' ? cfg.setTimeout : function (fn, ms) { return setTimeout(fn, ms) }
+		const clearTimer = typeof cfg.clearTimeout === 'function' ? cfg.clearTimeout : function (t) { clearTimeout(t) }
 
 		let claimId = null
 		// 未 open 时以收到的第一条 claim.rx 的 claimId 为准（真机上 open 之后才有数据）
@@ -568,14 +572,31 @@
 			// Uint8Array 经 postMessage 结构化克隆后仍是 Uint8Array，会被整条拒成 bad_request。
 			const data = Array.from(toBytes(bytes))
 			stats.txWrites++
+			const TIMED_OUT = {}
+			let timer = null
 			try {
-				await host.claim.write(myId, data)
+				// 宿主的写入结果在超时之后才到也不能成未处理的拒绝
+				const hostWrite = Promise.resolve().then(function () { return host.claim.write(myId, data) })
+				hostWrite.catch(function () {})
+				const res = await Promise.race([
+					hostWrite,
+					new Promise(function (resolve) { timer = setTimer(function () { resolve(TIMED_OUT) }, WRITE_TIMEOUT_MS) }),
+				])
+				if (res === TIMED_OUT) {
+					stats.txFailures++
+					const m = msg('clm.write_timeout', { note: note || '—', ms: WRITE_TIMEOUT_MS })
+					noteError(m)
+					onLog(m, 'error')
+					return { ok: false, stale: false, timedOut: true, error: { message: msg('clm.timeout_short', { ms: WRITE_TIMEOUT_MS }), code: 'timeout' } }
+				}
 			} catch (e) {
 				const detail = (e && e.message ? e.message : String(e)) + (e && e.code ? ' [' + e.code + ']' : '')
 				stats.txFailures++
 				noteError(msg('clm.write_failed', { note: note || '—', err: detail }))
 				onLog(msg('clm.write_failed', { note: note || '—', err: detail }), 'error')
 				return { ok: false, stale: false, error: e }
+			} finally {
+				if (timer != null) clearTimer(timer)
 			}
 			stats.txBytes += data.length
 			stats.lastTxAt = now()

@@ -143,9 +143,10 @@
 	let lastTheme = null
 	const hintFns = {}
 
-	/** 控制层操作的失败原因：优先惰性消息（切语言可重绘），再退到文本 / 错误码 */
+	/** 控制层操作的失败原因：优先惰性消息（切语言可重绘），再退到文本 / 错误码；cause 是底层写入错误（例如超时） */
 	function opWhy(r) {
-		return (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason')
+		const why = (r && (r.ref || r.message || r.code)) || M('ui.unknown_reason')
+		return r && r.cause ? I18N.join([why, r.cause]) : why
 	}
 
 	/** 同 reasonText，但返回惰性消息：用作日志 / 状态条参数，切语言时跟着换 */
@@ -2009,14 +2010,14 @@
 				saveSettingsSoon()
 				log(M('app.voltage_applied', { mv: settings.voltageMv }), 'success')
 			} else {
-				log(M('app.voltage_failed', { why: (r && (r.ref || r.message)) || M('ui.unknown_reason') }), 'error')
+				log(M('app.voltage_failed', { why: opWhy(r) }), 'error')
 			}
 			renderSessionPanel()
 		})
 		$('btn-power').addEventListener('click', async function () {
 			const want = control.state().powered.state !== 'on'
 			const r = await control.setPower(want)
-			if (!r || !r.ok) log(M('app.power_failed', { why: (r && (r.ref || r.message)) || M('ui.unknown_reason') }), 'error')
+			if (!r || !r.ok) log(M('app.power_failed', { why: opWhy(r) }), 'error')
 			renderSessionPanel()
 		})
 		$('btn-mode-wave').addEventListener('click', function () { setMode('wave') })
