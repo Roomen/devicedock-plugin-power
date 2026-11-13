@@ -130,6 +130,7 @@ function makeFakeSdk(state) {
 			saveFile: async (opts) => { state.files.push(opts); return { name: opts.name } },
 			notify: async () => ({ ok: true }),
 		},
+		log: { write: async (text) => { state.hostLogs.push(text); return { ok: true } } },
 		device: { listPorts: async () => state.ports.slice() },
 		claim: {
 			acquire: async (portKey, mode) => {
@@ -237,6 +238,7 @@ const click = (doc, id) => doc.getElementById(id).click()
 		],
 		rxHandler: null,
 		gapHandler: null,
+		hostLogs: [],
 	}
 	// 宿主按 claim 合批：offset 是该 gen 字节流里的绝对偏移，seq 单调递增
 	state.pushRxBytes = function (bytes) {
@@ -339,6 +341,12 @@ const click = (doc, id) => doc.getElementById(id).click()
 	await tick(80)
 	assert.equal(text(document, 'btn-connect'), 'Connect')
 	assert.equal(document.getElementById('port').disabled, false)
+
+	// ---- 宿主日志（能力 log）：关键节点写进宿主日志 ----
+	assert.ok(state.hostLogs.some((l) => /claimed .* exclusively/.test(l)), '连接时写宿主日志：' + JSON.stringify(state.hostLogs))
+	assert.ok(state.hostLogs.some((l) => /capture started/.test(l)), '开始采样写宿主日志')
+	assert.ok(state.hostLogs.some((l) => /capture stopped/.test(l)), '停止采样写宿主日志')
+	assert.ok(state.hostLogs.some((l) => /dropped .* bytes/.test(l)), '宿主丢弃时写宿主日志')
 
 	// ---- 冷区上限：改设置并落盘 ----
 	document.getElementById('cap').value = '256'

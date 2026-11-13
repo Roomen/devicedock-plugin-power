@@ -90,6 +90,13 @@
 		if (el) el.textContent = text
 	}
 
+	// 宿主日志（能力 log）：只在关键节点写，别把插件自己的每一条都推给宿主
+	function hostLog(text) {
+		try {
+			sdk.log.write(text).catch(function () { /* 宿主日志不可用不影响功能 */ })
+		} catch (e) { /* 忽略 */ }
+	}
+
 	function log(message, level) {
 		const list = $('log')
 		if (!list) return
@@ -177,6 +184,7 @@
 				updateGapChip()
 				if (info.reason === 'overflow' || info.reason === 'closing') {
 					log('宿主丢弃了 ' + info.bytes + ' 字节（' + info.reason + '），已标记缺口', 'warn')
+					hostLog('host dropped ' + info.bytes + ' bytes (' + info.reason + '), marked as a gap')
 				}
 			},
 			onState: function () { renderConnState() },
@@ -296,6 +304,7 @@
 				await link.close()
 				releaseBusy()
 				log('串口已释放')
+				hostLog('released the analyzer port')
 			} else {
 				const key = $('port').value
 				if (!key) {
@@ -303,7 +312,10 @@
 					return
 				}
 				await link.open(key)
+				const sel = $('port')
+				const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : key
 				log('已独占占用串口（mode=exclusive）', 'success')
+				hostLog('claimed ' + label + ' exclusively')
 				// 先读设备修正参数（R/O/VDD），再探测 DUT 是否带电
 				const ok = await control.fetchModifiers()
 				if (ok) {
@@ -352,6 +364,10 @@
 		await acquireBusy()
 		try {
 			const r = await control.startCapture()
+			if (r && r.ok) {
+				const st = control.state()
+				hostLog('capture started at ' + fmtCount(st.targetRateHz) + ' Hz (' + (st.recordMode === 'wave' ? 'waveform' : 'long stats') + ')')
+			}
 			if (!r || !r.ok) {
 				log('开始采样失败：' + ((r && r.message) || '未知原因'), 'error')
 				releaseBusy()
@@ -375,6 +391,8 @@
 		} finally {
 			releaseBusy()
 			if (reason === 'storage') log('因存储上限已停止采样', 'warn')
+			const s = control.captureSummary()
+			hostLog('capture stopped: ' + fmtCount(s.totalSamples) + ' samples, ' + s.gaps + ' gap(s)')
 			renderSessionPanel()
 			updateSampleButton()
 			scheduleDraw()

@@ -67,6 +67,7 @@
 		let rawStreamCount = 0
 		let rawStreamFirstMs = 0
 		let peakRateHz = 0
+		let ignoredSamples = 0
 		let warmupLeft = 0
 		let acqStoreEnabled = true
 		let firstStoredMs = 0
@@ -187,6 +188,11 @@
 			// DUT 供电探测期间：样点只进探测缓冲，绝不碰主波形（否则波形开头会多出一段探测数据）
 			if (probe) {
 				for (let i = 0; i < list.length; i++) probe.vals.push(list[i].iUA)
+				return 0
+			}
+			// 未采样时段（探测结束后到 START 之间、STOP 后的残包）：字节已消费但不入库
+			if (!sampling) {
+				ignoredSamples += list.length
 				return 0
 			}
 			// 设备速率实测：第一批只记起点（它属于起点时刻），之后累计样点数除以经过时间
@@ -391,6 +397,7 @@
 			rawStreamCount = 0
 			rawStreamFirstMs = 0
 			peakRateHz = 0
+			ignoredSamples = 0
 		}
 
 		async function drainSampleRx(ms) {
@@ -651,6 +658,7 @@
 				recordMode: recordMode,
 				targetRateHz: targetRateHz,
 				deviceStreamHz: deviceStreamHz,
+				ignoredSamples: ignoredSamples,
 				samplePeriodSec: getSamplePeriodSec(),
 				voltageChangesDuringCapture: voltageChanges,
 				modifiersOk: modifiersOk,
