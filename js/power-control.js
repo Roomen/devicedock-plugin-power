@@ -11,6 +11,8 @@
 
 	const PROTO = global.PowerProtocol || (typeof require === 'function' ? require('./power-protocol.js') : null)
 	const VIEW = global.PowerView || (typeof require === 'function' ? require('./power-view.js') : null)
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const DEFAULTS = {
 		rxDrainMs: 50,
@@ -97,10 +99,10 @@
 		function runOp(fn, o) {
 			o = o || {}
 			if (o.failFast && opDepth > 0) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: '功耗仪正在执行另一项操作，请稍后重试' })
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_running') })
 			}
 			if (opDepth >= opts.maxQueueDepth) {
-				return Promise.resolve({ ok: false, code: 'power_busy', message: '功耗仪操作队列已满，请稍后重试' })
+				return Promise.resolve({ ok: false, code: 'power_busy', message: tr('ctl.busy_queue') })
 			}
 			opDepth++
 			const run = opChain.then(fn, fn)
@@ -258,14 +260,14 @@
 						if (feedAcq(ua, 'start')) {
 							acq.storeEnabled = true
 							acq.startLatched = true
-							log('已命中采样启动沿，开始入库', 'success')
+							log(tr('ctl.acq_start_hit'), 'success')
 						}
 						continue
 					}
 					if (ingest(outs[k].tMs, ua, s)) stored++
 					// 停沿：入库之后生效，STOP 排到回调外异步发
 					if (acq && acq.stop !== 'off' && acq.storeEnabled && feedAcq(ua, 'stop')) {
-						requestStop('已命中采样停止沿，停止采样')
+						requestStop(tr('ctl.acq_stop_hit'))
 						break
 					}
 				}
@@ -299,7 +301,7 @@
 				if (!sampling) return
 				// stopSampling 内部只发一条 STOP，失败会自己记日志
 				stopSampling().catch(function (e) {
-					log('停止采样失败：' + (e && e.message ? e.message : e), 'error')
+					log(tr('ctl.stop_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				})
 			}, 0)
 		}
@@ -340,7 +342,7 @@
 			try {
 				onSampleStored(wave.total() - 1, tMs)
 			} catch (e) {
-				log('样点时间锚点更新失败：' + (e && e.message ? e.message : e), 'warn')
+				log(tr('ctl.anchor_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 			}
 			return true
 		}
@@ -349,7 +351,7 @@
 		function errText(w) {
 			const e = w && w.error
 			if (!e) return ''
-			return '（' + (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') + '）'
+			return tr('ctl.err_detail', { msg: (e.message ? e.message : String(e)) + (e.code ? ' [' + e.code + ']' : '') })
 		}
 
 		function writeRaw(bytes, note) {
@@ -363,73 +365,73 @@
 		 */
 		async function applyVoltageMv(mv, guard) {
 			if (mv == null || !isFinite(mv)) {
-				log('请先设定源电压 mV', 'error')
+				log(tr('ctl.voltage_required'), 'error')
 				return { ok: false, stale: false }
 			}
 			const clamped = Math.max(PROTO.VDD_LOW_MV, Math.min(PROTO.VDD_HIGH_MV, Math.round(mv)))
 			if (!isConnected()) {
 				toggleVoltageSource(clamped)
-				log('电压已设为 ' + clamped + ' mV（打开设备后写入）')
+				log(tr('ctl.voltage_pending', { mv: clamped }))
 				return { ok: false, stale: false }
 			}
 			if (guardStep(guard)) return { ok: false, stale: false }
 			const w = await writeRaw(PROTO.cmdRegulatorSet(clamped), 'REGULATOR ' + clamped + ' mV')
 			if (!w.ok) {
-				if (!w.stale) log('设定电压失败：设备未确认写入，保持上一次有效电压', 'error')
+				if (!w.stale) log(tr('ctl.voltage_write_failed_log'), 'error')
 				onChange()
 				return { ok: false, stale: !!w.stale }
 			}
 			if (voltageMv !== clamped && sampling) voltageChanges++
 			toggleVoltageSource(clamped)
-			log('设定电压 ' + clamped + ' mV', 'success')
+			log(tr('ctl.voltage_set', { mv: clamped }), 'success')
 			return { ok: true, stale: false }
 		}
 
 		async function doPowerOn(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
 			const mv = readVoltageMv()
 			if (mv == null || !isFinite(mv) || mv < PROTO.VDD_LOW_MV) {
-				log('请先设定源电压 mV（打开设备后会从设备读取）', 'error')
-				return { ok: false, code: 'voltage_unknown', message: '尚未设定源电压' }
+				log(tr('ctl.voltage_required_open'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown') }
 			}
 			const gen = genOf()
 			const v = await applyVoltageMv(mv, guard)
 			if (!v.ok) {
-				if (v.stale) return { ok: false, code: 'disconnected', message: '写电压时连接已变化，未上电', executed: 'unknown', powered: powerPayload() }
-				log('DUT 上电已中止：源电压写入失败', 'error')
-				return { ok: false, code: 'voltage_write_failed', message: '源电压写入失败，未上电', voltageMv: voltageMv, powered: powerPayload() }
+				if (v.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed_voltage'), executed: 'unknown', powered: powerPayload() }
+				log(tr('ctl.power_on_aborted'), 'error')
+				return { ok: false, code: 'voltage_write_failed', message: tr('ctl.power_on_voltage_failed'), voltageMv: voltageMv, powered: powerPayload() }
 			}
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未上电', executed: false, powered: powerPayload() }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.power_on_cancelled'), executed: false, powered: powerPayload() }
 			if (!stillSameConn(gen)) {
-				return { ok: false, code: 'disconnected', message: '电压写入后设备已变化，未上电', executed: false, powered: powerPayload() }
+				return { ok: false, code: 'disconnected', message: tr('ctl.power_on_device_changed'), executed: false, powered: powerPayload() }
 			}
-			const w = await writeRaw(PROTO.cmdDutPower(true), 'DUT 上电')
+			const w = await writeRaw(PROTO.cmdDutPower(true), tr('ctl.note_power_on'))
 			if (!w.ok) {
 				// 连接已经变了：这次结果不属于新连接，不能改它的供电状态
-				if (w.stale) return { ok: false, code: 'disconnected', message: '上电过程中连接已变化，结果未知', executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_on_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				// 同一连接写失败：不知道设备收没收到，标未知
 				markPowered(null, 'unknown')
-				log('DUT 上电写入失败：状态未知', 'error')
-				return { ok: false, code: 'power_write_failed', message: '上电命令写入失败，设备状态未知', executed: 'unknown', powered: powerPayload() }
+				log(tr('ctl.power_on_write_failed_log'), 'error')
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_on_write_failed'), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(true, 'commanded')
-			log('DUT 已上电（命令已写入，设备无回执）', 'success')
+			log(tr('ctl.power_on_done'), 'success')
 			return { ok: true, changed: true, powered: powerPayload(), voltageMv: voltageMv }
 		}
 
 		async function doPowerOff(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未执行', executed: false, powered: powerPayload() }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.cancelled_nothing_done'), executed: false, powered: powerPayload() }
 			const gen = genOf()
-			const w = await writeRaw(PROTO.cmdDutPower(false), 'DUT 下电')
+			const w = await writeRaw(PROTO.cmdDutPower(false), tr('ctl.note_power_off'))
 			if (!w.ok) {
-				if (w.stale) return { ok: false, code: 'disconnected', message: '下电过程中连接已变化，结果未知', executed: 'unknown', powered: powerPayload() }
+				if (w.stale) return { ok: false, code: 'disconnected', message: tr('ctl.power_off_conn_changed'), executed: 'unknown', powered: powerPayload() }
 				markPowered(null, 'unknown')
-				log('DUT 下电写入失败：状态未知', 'error')
-				return { ok: false, code: 'power_write_failed', message: '下电命令写入失败，设备状态未知', executed: 'unknown', powered: powerPayload() }
+				log(tr('ctl.power_off_write_failed_log'), 'error')
+				return { ok: false, code: 'power_write_failed', message: tr('ctl.power_off_write_failed'), executed: 'unknown', powered: powerPayload() }
 			}
 			markPowered(false, 'commanded')
-			log('DUT 已下电（命令已写入，设备无回执）')
+			log(tr('ctl.power_off_done'))
 			return { ok: true, changed: true, powered: powerPayload() }
 		}
 
@@ -449,7 +451,7 @@
 				metaBuf = ''
 				modifiers = PROTO.defaultModifiers()
 				modifiersOk = false
-				log('读取设备参数失败：GET_META_DATA 写入失败' + errText(mw) + '，使用默认 R/O 表', 'error')
+				log(tr('ctl.meta_write_failed', { err: errText(mw) }), 'error')
 				onChange()
 				return false
 			}
@@ -467,13 +469,13 @@
 				metaBuf = ''
 				if (link && typeof link.setConverterModifiers === 'function') link.setConverterModifiers(modifiers)
 				const saved = modifiers.savedVddMv || 0
-				log('设备参数读取完成' +
+				log(tr('ctl.meta_done', { details:
 					(modifiers.deviceSn ? ' · SN ' + modifiers.deviceSn : '') +
 					(saved ? ' · VDD ' + saved + ' mV' : '') +
-					(modifiers.Calibrated != null ? ' · Calibrated=' + modifiers.Calibrated : ''), 'success')
+					(modifiers.Calibrated != null ? ' · Calibrated=' + modifiers.Calibrated : '') }), 'success')
 				if (saved >= PROTO.VDD_LOW_MV && saved <= PROTO.VDD_HIGH_MV) toggleVoltageSource(Math.round(saved))
 				else {
-					log('设备未返回 VDD，请手动设定源电压', 'warn')
+					log(tr('ctl.meta_no_vdd'), 'warn')
 					toggleVoltageSource(null)
 				}
 				return true
@@ -482,7 +484,7 @@
 			modifiers = PROTO.defaultModifiers()
 			modifiersOk = false
 			metaBuf = ''
-			log('设备参数读取超时，使用默认 R/O 表', 'warn')
+			log(tr('ctl.meta_timeout'), 'warn')
 			onChange()
 			return false
 		}
@@ -515,21 +517,21 @@
 		}
 
 		async function startSampling(guard) {
-			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+			if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
 			if (sampling) return { ok: true, changed: false, sampling: true }
 			const mv = readVoltageMv()
 			if (!isFinite(mv) || mv == null || mv < PROTO.VDD_LOW_MV) {
-				log('请先设定源电压 mV（设备要求先设电压再开采样）', 'error')
-				return { ok: false, code: 'voltage_unknown', message: '尚未设定源电压' }
+				log(tr('ctl.voltage_required_start'), 'error')
+				return { ok: false, code: 'voltage_unknown', message: tr('ctl.voltage_unknown') }
 			}
 			// 先 STOP → 排空残留 → 再 START
 			link.setDrop(true)
 			const gen0 = genOf()
 			await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP')
 			await drainSampleRx(opts.rxDrainMs)
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未开始采样', executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: '设备已变化，未开始采样', executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), executed: false }
 			}
 
 			const baseHz = deviceStreamHz > 1000 ? deviceStreamHz : PROTO.NOMINAL_BASE_HZ
@@ -540,13 +542,13 @@
 				try {
 					await store.init()
 				} catch (e) {
-					log('初始化波形存储失败：' + (e && e.message ? e.message : e), 'warn')
+					log(tr('ctl.store_init_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				}
 			}
 			// 存储初始化等 await 之后重新确认：取消 / 断开 / 换设备都不能继续
-			if (guardStep(guard)) return { ok: false, code: 'aborted', message: '请求已取消，未开始采样', executed: false }
+			if (guardStep(guard)) return { ok: false, code: 'aborted', message: tr('ctl.start_cancelled'), executed: false }
 			if (!stillSameConn(gen0)) {
-				return { ok: false, code: 'disconnected', message: '设备已变化，未开始采样', executed: false }
+				return { ok: false, code: 'disconnected', message: tr('ctl.start_device_changed'), executed: false }
 			}
 
 			link.resetParser(true)
@@ -565,7 +567,7 @@
 				acq.storeEnabled = acq.start === 'off'
 				acq.preMin = Infinity
 				acq.preMax = -Infinity
-				if (acq.start !== 'off') log('采样沿启动已 Arm：等待 ' + acq.start + ' 后开始入库（电平 ' + (trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : 'Auto') + '）')
+				if (acq.start !== 'off') log(tr('ctl.acq_armed', { edge: tr('ui.edge_' + acq.start), level: trigLevelUA != null ? trigLevelUA.toFixed(2) + ' µA' : tr('ctl.level_auto') }))
 			}
 			stopScheduled = false
 			sampling = true
@@ -574,19 +576,21 @@
 			const startW = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START')
 			if (!startW.ok) {
 				if (startW.stale) {
-					return { ok: false, code: 'disconnected', message: '开始采样过程中连接已变化，结果未知', executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.start_conn_changed'), executed: 'unknown' }
 				}
 				sampling = false
 				link.setDrop(true)
-				log('开始采样失败：START 写入失败' + errText(startW), 'error')
+				log(tr('ctl.start_write_failed_log', { err: errText(startW) }), 'error')
 				onChange()
-				return { ok: false, code: 'capture_start_failed', message: 'START 写入失败，未开始采样' + errText(startW) }
+				return { ok: false, code: 'capture_start_failed', message: tr('ctl.start_write_failed', { err: errText(startW) }) }
 			}
 			// START 已下发后再接收样点（此前 drop 挡住 STOP 尾包与竞态）
 			link.setDrop(false)
 			const warmMs = targetRateHz > 0 ? Math.round(warmupLeft / targetRateHz * 1000) : 0
-			log('采样已开始 · 目标 ' + targetRateHz + ' Hz · ' + (recordMode === 'long' ? '长期统计' : '波形') +
-				' · 预热约 ' + warmMs + ' ms（' + warmupLeft + ' 点）' + (modifiersOk ? '' : ' · 默认修正参数'), 'success')
+			log(tr('ctl.started', {
+				hz: targetRateHz, mode: tr(recordMode === 'long' ? 'ctl.mode_long' : 'ctl.mode_wave'),
+				ms: warmMs, n: warmupLeft, mods: modifiersOk ? '' : tr('ctl.default_mods'),
+			}), 'success')
 			return { ok: true, changed: true, sampling: true }
 		}
 
@@ -605,7 +609,7 @@
 			if (flushed.remaining > 0) {
 				// 确实排不完的（例如冷存储卡住）：计数 + 标缺口，绝不静默丢
 				noteGap({ reason: 'stop_drain', missedSamples: flushed.remaining, bytes: flushed.remainingBytes })
-				log('停止采样时仍有 ' + flushed.remaining + ' 个待入库样点未能处理，已标记缺口', 'warn')
+				log(tr('ctl.stop_undrained', { n: flushed.remaining }), 'warn')
 			}
 			sampling = false
 			onChange()
@@ -617,12 +621,12 @@
 			}
 			link.resetParser(false)
 			const stopped = !!(wave && wave.storageStop && wave.storageStop())
-			log(stopped ? '已停止采样（存储限制）' : '已停止采样')
-			if (!stopW.ok) log('STOP 写入失败：本地已停止入库，设备可能仍在采样', 'warn')
+			log(tr(stopped ? 'ctl.stopped_storage' : 'ctl.stopped'))
+			if (!stopW.ok) log(tr('ctl.stop_write_failed_log'), 'warn')
 			onChange()
 			if (stopW.ok) return { ok: true, changed: true, sampling: false }
-			if (stopW.stale) return { ok: false, code: 'disconnected', message: '停止采样过程中连接已变化，结果未知', executed: 'unknown', sampling: false }
-			return { ok: false, code: 'stop_write_failed', message: 'STOP 写入失败，设备可能仍在采样', sampling: false }
+			if (stopW.stale) return { ok: false, code: 'disconnected', message: tr('ctl.stop_conn_changed'), executed: 'unknown', sampling: false }
+			return { ok: false, code: 'stop_write_failed', message: tr('ctl.stop_write_failed'), sampling: false }
 		}
 
 		// ---- 对外（界面 / 测试）----
@@ -631,7 +635,7 @@
 			return runOp(async function () {
 				const g = await guardStart(guard)
 				if (g) return g
-				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+				if (!isConnected()) return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
 				const gen = genOf()
 				// 只有「上次命令」的状态才能跳过；实测 / 未知都不足以代替一次显式命令
 				if (power.source === 'commanded' && power.on === want) {
@@ -639,7 +643,7 @@
 				}
 				const r = want ? await doPowerOn(guard) : await doPowerOff(guard)
 				if (!stillSameConn(gen) && r && r.ok) {
-					return { ok: false, code: 'disconnected', message: '操作期间设备断开，结果未知', executed: 'unknown', powered: powerPayload() }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), executed: 'unknown', powered: powerPayload() }
 				}
 				return r
 			}, { failFast: !!guard })
@@ -655,17 +659,17 @@
 						toggleVoltageSource(requested)
 						return { ok: true, pending: true, requestedMv: requested }
 					}
-					return { ok: false, code: 'power_not_connected', message: '功耗仪未连接' }
+					return { ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') }
 				}
 				if (!isFinite(requested) || requested < PROTO.VDD_LOW_MV || requested > PROTO.VDD_HIGH_MV) {
-					return { ok: false, code: 'out_of_range', message: '电压必须在 ' + PROTO.VDD_LOW_MV + '..' + PROTO.VDD_HIGH_MV + ' mV' }
+					return { ok: false, code: 'out_of_range', message: tr('ctl.out_of_range', { lo: PROTO.VDD_LOW_MV, hi: PROTO.VDD_HIGH_MV }) }
 				}
 				const gen = genOf()
 				const applied = await applyVoltageMv(requested, guard)
 				if (!stillSameConn(gen) || applied.stale) {
-					return { ok: false, code: 'disconnected', message: '操作期间设备断开，结果未知', executed: 'unknown' }
+					return { ok: false, code: 'disconnected', message: tr('ctl.op_disconnected'), executed: 'unknown' }
 				}
-				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: '电压写入失败，未生效', voltageMv: voltageMv, requestedMv: requested }
+				if (!applied.ok) return { ok: false, code: 'voltage_write_failed', message: tr('ctl.voltage_not_applied'), voltageMv: voltageMv, requestedMv: requested }
 				return { ok: true, requestedMv: requested, appliedMv: voltageMv, clamped: voltageMv !== requested }
 			}, { failFast: !!guard })
 		}
@@ -688,7 +692,7 @@
 		}
 
 		function togglePower() {
-			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: '功耗仪未连接' })
+			if (!isConnected()) return Promise.resolve({ ok: false, code: 'power_not_connected', message: tr('ctl.not_connected') })
 			return setPower(power.on !== true)
 		}
 
@@ -700,23 +704,23 @@
 			link.resetParser(false)
 			let pw = null
 			try {
-				pw = await writeRaw(PROTO.cmdAverageStart(), 'AVERAGE_START · DUT 供电探测')
+				pw = await writeRaw(PROTO.cmdAverageStart(), tr('ctl.note_probe_start'))
 				if (!pw || !pw.ok) {
 					probe = null
-					log('DUT 供电探测未执行：START 写入失败' + errText(pw), 'error')
+					log(tr('ctl.probe_write_failed', { err: errText(pw) }), 'error')
 					return null
 				}
 				await new Promise(function (r) { clock.setTimeout(r, opts.probeMs) })
 			} catch (e) {
 				probe = null
-				log('DUT 供电探测异常：' + (e && e.message ? e.message : e), 'error')
+				log(tr('ctl.probe_error', { err: (e && e.message ? e.message : e) }), 'error')
 				return null
 			}
-			try { await writeRaw(PROTO.cmdAverageStop(), 'AVERAGE_STOP · DUT 供电探测') } catch (e) { /* 忽略 */ }
+			try { await writeRaw(PROTO.cmdAverageStop(), tr('ctl.note_probe_stop')) } catch (e) { /* 忽略 */ }
 			const vals = probe ? probe.vals.slice() : []
 			probe = null
 			if (vals.length < 200) {
-				log('DUT 供电探测无结果：' + opts.probeMs + ' ms 内只解出 ' + vals.length + ' 个样点（设备可能未响应 START）', 'warn')
+				log(tr('ctl.probe_empty', { ms: opts.probeMs, n: vals.length }), 'warn')
 				return null
 			}
 			vals.sort(function (a, b) { return a - b })
@@ -829,7 +833,7 @@
 			lastTMs = 0
 			lastTMsValid = false
 			gapPending = false
-			if (wasSampling) log('会话已终止（' + reason + '），供电状态置为未知', 'warn')
+			if (wasSampling) log(tr('ctl.session_ended', { reason: reason }), 'warn')
 			onChange()
 			return { wasSampling: wasSampling }
 		}
@@ -874,7 +878,7 @@
 		async function importSeries(parsed, o) {
 			o = o || {}
 			if (!parsed || !parsed.ok || !parsed.rows || !parsed.rows.length) {
-				return { ok: false, code: 'empty', message: '没有可导入的样点' }
+				return { ok: false, code: 'empty', message: tr('ctl.import_empty') }
 			}
 			if (sampling) await stopSampling()
 			clearSessionState()
@@ -915,28 +919,31 @@
 					if (wave && typeof wave.waitIdle === 'function') await wave.waitIdle(200)
 					// 每次 await 之后校验会话：变了就停止，绝不把旧导入写进新会话
 					if (epochOf() !== importEpoch) {
-						log('CSV 导入已取消：会话在导入期间发生变化（清空 / 重新采集 / 再次导入）', 'warn')
+						log(tr('ctl.import_cancelled_log'), 'warn')
 						return {
 							ok: false, code: 'session_changed', cancelled: true,
 							stored: stored, requested: requested, gaps: gapsApplied,
-							message: '导入期间会话已变化，已取消（已写入 ' + stored + ' / ' + requested + '）',
+							message: tr('ctl.import_cancelled', { stored: stored, requested: requested }),
 						}
 					}
 				}
 			}
 			onChange()
 			if (storageStopped || stored < requested) {
-				log('CSV 导入不完整：只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）', 'warn')
+				log(tr('ctl.import_partial_log', { stored: stored, requested: requested }), 'warn')
 				return {
 					ok: false, code: 'incomplete',
 					stored: stored, requested: requested, gaps: gapsApplied,
-					message: '只写入了 ' + stored + ' / ' + requested + ' 个样点（存储容量不足）',
+					message: tr('ctl.import_partial', { stored: stored, requested: requested }),
 				}
 			}
-			log('已导入 ' + stored + ' 个样点（' + (samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : '周期未知') +
-				(estimated ? ' · 周期按默认值估计' : '') +
-				(gapsApplied ? ' · ' + gapsApplied + ' 处缺口' : '') +
-				(parsed.hasVoltage ? '' : ' · 文件无电压，能量不可用'), 'success')
+			log(tr('ctl.imported', {
+				n: stored,
+				rate: samplePeriodSec > 0 ? Math.round(1 / samplePeriodSec) + ' Hz' : tr('ctl.period_unknown'),
+				extra: (estimated ? tr('ctl.import_estimated') : '') +
+					(gapsApplied ? tr('ctl.import_gaps', { n: gapsApplied }) : '') +
+					(parsed.hasVoltage ? '' : tr('ctl.import_no_voltage')),
+			}), 'success')
 			return {
 				ok: true, samples: stored, requested: requested, gaps: gapsApplied,
 				samplePeriodSec: samplePeriodSec, estimatedPeriod: estimated,

@@ -7,6 +7,8 @@
 //  - 缺口（串口丢事件 / 存储淘汰）只标记不猜测：duration 与能量按连续段算，绝不跨缺口累加。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const BYTES_PER_SAMPLE = 4
 	// 每个块描述符、字符串与完整包络按 4 KiB 预留；这不是 JS 引擎堆的精确测量。
@@ -116,7 +118,7 @@
 				return new Float32Array(CHUNK_SIZE)
 			} catch (e) {
 				growBlocked = true
-				log('内存不足，无法分配波形块：' + (e && e.message ? e.message : e), 'warn')
+				log(tr('wav.alloc_failed', { err: (e && e.message ? e.message : e) }), 'warn')
 				return null
 			}
 		}
@@ -241,7 +243,7 @@
 				return got
 			}).catch(function (e) {
 				if (epoch !== waveEpoch) return null
-				log('冷数据回读失败 ' + ch.id + '：' + (e && e.message ? e.message : e), 'warn')
+				log(tr('wav.cold_read_failed', { id: ch.id, err: (e && e.message ? e.message : e) }), 'warn')
 				return null
 			}).finally(function () {
 				hydrateInFlight--
@@ -513,7 +515,7 @@
 			if (isFinite(rawBudgetBytes) && diskUsedBytes() + rawBytes > rawBudgetBytes) return false
 			// 归档队列里的数据仍在内存里：不能让队列无限长
 			if (archiveQueuedSamples + ch.n > archiveQueueMax()) {
-				triggerStorageStop('波形归档跟不上采集速度（待写 ' + archiveQueue.length + ' 块），已停止采样以免内存失控')
+				triggerStorageStop(tr('wav.archive_lagging', { n: archiveQueue.length }))
 				return false
 			}
 			const samples = ch.buf.subarray(0, ch.n)
@@ -531,7 +533,7 @@
 			archiveQueue.push({ ch: ch, samples: samples })
 			if (!ramArchiveNoted) {
 				ramArchiveNoted = true
-				log('热区预算已满，开始压缩归档到内存冷区（压缩后占用更少）')
+				log(tr('wav.archive_start'))
 			}
 			pumpArchiveQueue()
 			return true
@@ -549,7 +551,7 @@
 				try {
 					await barrier
 					if (epoch !== waveEpoch) return
-					if (!Store) throw new Error('冷存储未接入')
+					if (!Store) throw new Error(tr('wav.no_store'))
 					await Store.init()
 					if (epoch !== waveEpoch) return
 					const res = await Store.writeChunk(ch.id, samples)
@@ -572,11 +574,11 @@
 							ch.state = 'dropped'
 							droppedSamples += ch.n
 							noteGap(ch.base)
-							log('归档失败且无法回灌热区，这部分数据作缺口处理', 'error')
+							log(tr('wav.archive_lost'), 'error')
 						}
 					}
-					log('波形归档失败：' + msg, 'error')
-					triggerStorageStop('波形归档失败，已停止采样以防丢数据')
+					log(tr('wav.archive_failed', { err: msg }), 'error')
+					triggerStorageStop(tr('wav.archive_failed_stop'))
 				} finally {
 					// 含正在压缩/写入的块；它的缓冲到这里才可释放
 					if (epoch === waveEpoch) archiveQueuedSamples = Math.max(0, archiveQueuedSamples - samples.length)
@@ -607,7 +609,7 @@
 				n += ch.n
 			}
 			if (n > 0) {
-				log('存储上限：已淘汰最早的 ' + list.length + ' 个块（约 ' + n + ' 点），波形与统计在这些位置标为缺口', 'warn')
+				log(tr('wav.evicted', { blocks: list.length, n: n }), 'warn')
 				clearBucketCache()
 				scheduleUI()
 			}
@@ -618,12 +620,12 @@
 			needSamples = needSamples || 1
 			while (hotCount + needSamples > RING_CAP_MAX && !growBlocked) {
 				if (!enqueueOldestHotArchive()) {
-					triggerStorageStop('热区已满且无法继续归档，已停止采样（不覆盖旧数据）')
+					triggerStorageStop(tr('wav.hot_full_stop'))
 					return false
 				}
 			}
 			if (growBlocked && hotCount + needSamples > RING_CAP_MAX) {
-				triggerStorageStop('内存不足且无法继续归档，已停止采样')
+				triggerStorageStop(tr('wav.oom_stop'))
 				return false
 			}
 			return true
@@ -638,14 +640,14 @@
 			let ch = waveChunks.length ? waveChunks[waveChunks.length - 1] : null
 			if (!ch || ch.state !== 'hot' || !ch.buf || ch.n >= CHUNK_SIZE) {
 				if (waveChunks.length >= metadataChunkLimit()) {
-					triggerStorageStop('波形块索引达到内存预留上限，已停止采样；已有数据保留，可导出后清空继续')
+					triggerStorageStop(tr('wav.index_full_stop'))
 					return false
 				}
 				ch = newHotChunk()
 				if (!ch) {
 					if (enqueueOldestHotArchive()) ch = newHotChunk()
 					if (!ch) {
-						triggerStorageStop('无法分配新波形块，已停止采样')
+						triggerStorageStop(tr('wav.alloc_stop'))
 						return false
 					}
 				}
@@ -686,7 +688,7 @@
 					const j = archiveQueue[i]
 					if (j && j.ch) pts += j.ch.n || 0
 				}
-				log('清空数据：丢弃 ' + archiveQueue.length + ' 个未归档块（约 ' + pts + ' 点）', 'warn')
+				log(tr('wav.clear_drop', { blocks: archiveQueue.length, n: pts }), 'warn')
 				archiveQueue.length = 0
 			}
 			archiveQueuedSamples = 0

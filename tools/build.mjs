@@ -17,6 +17,7 @@ const FILES = [
 	'css/app.css',
 	'icon.svg',
 	'js/app.js',
+	'js/power-i18n.js',
 	'js/power-protocol.js',
 	'js/power-view.js',
 	'js/power-panels.js',

@@ -10,7 +10,7 @@
 <body>
 	<header class="head">
 		<div>
-			<h1>Power Analyzer<span class="sub">current and power capture over an exclusively claimed serial port</span></h1>
+			<h1><span data-i18n="app.title">Power Analyzer</span><span class="sub" data-i18n="h.current_and_power_capture_over_an_exclus">current and power capture over an exclusively claimed serial port</span></h1>
 		</div>
 		<div class="chips">
 			<span class="chip" id="chip-port" data-state="off">port: none</span>
@@ -23,20 +23,20 @@
 
 	<section class="bar">
 		<div class="group">
-			<label for="port">Port</label>
-			<select id="port" aria-label="Serial port"><option value="">no ports</option></select>
-			<button type="button" id="btn-refresh">Refresh</button>
+			<label for="port" data-i18n="h.port">Port</label>
+			<select id="port" aria-label="Serial port" data-i18n-aria="a.serial_port"><option value="">no ports</option></select>
+			<button type="button" id="btn-refresh" data-i18n="h.refresh">Refresh</button>
 			<button type="button" id="btn-connect">Connect</button>
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label>Mode</label>
+			<label data-i18n="h.mode">Mode</label>
 			<span class="seg">
-				<button type="button" id="btn-mode-wave" aria-pressed="true">Waveform</button>
-				<button type="button" id="btn-mode-long" aria-pressed="false">Long stats</button>
+				<button type="button" id="btn-mode-wave" aria-pressed="true" data-i18n="h.waveform">Waveform</button>
+				<button type="button" id="btn-mode-long" aria-pressed="false" data-i18n="h.long_stats">Long stats</button>
 			</span>
-			<label for="rate">Rate</label>
-			<select id="rate" aria-label="Sample rate">
+			<label for="rate" data-i18n="h.rate">Rate</label>
+			<select id="rate" aria-label="Sample rate" data-i18n-aria="a.sample_rate">
 				<option value="1000">1 kHz</option>
 				<option value="10000">10 kHz</option>
 				<option value="100000">100 kHz</option>
@@ -44,16 +44,16 @@
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label for="voltage">Source (mV)</label>
+			<label for="voltage" data-i18n="h.source_mv">Source (mV)</label>
 			<input type="number" id="voltage" min="500" max="5000" step="100" value="3300">
-			<button type="button" id="btn-apply-voltage">Apply</button>
+			<button type="button" id="btn-apply-voltage" data-i18n="h.apply">Apply</button>
 			<button type="button" id="btn-power" aria-pressed="false">DUT on</button>
 		</div>
 		<div class="sep"></div>
 		<div class="group">
 			<button type="button" id="btn-sample" data-primary="1">Start capture</button>
-			<button type="button" id="btn-clear">Clear</button>
-			<button type="button" id="btn-diag" aria-pressed="false" title="Show bytes sent / received and the last error">Diagnostics</button>
+			<button type="button" id="btn-clear" data-i18n="h.clear">Clear</button>
+			<button type="button" id="btn-diag" aria-pressed="false" title="Show bytes sent / received and the last error" data-i18n="h.diagnostics" data-i18n-title="a.show_bytes_sent_received_and_the_last_er">Diagnostics</button>
 		</div>
 	</section>
 
@@ -61,45 +61,45 @@
 
 	<section class="panel diag" id="diag" hidden>
 		<div class="panel-head">
-			<h2>Diagnostics</h2>
-			<div class="meta">serial claim link</div>
+			<h2 data-i18n="h.diagnostics">Diagnostics</h2>
+			<div class="meta" data-i18n="h.serial_claim_link">serial claim link</div>
 		</div>
 		<dl class="diag-grid">
-			<dt>Sent</dt><dd id="diag-tx">—</dd>
-			<dt>Received</dt><dd id="diag-rx">—</dd>
-			<dt>Decoded</dt><dd id="diag-decode">—</dd>
-			<dt>Link</dt><dd id="diag-link">—</dd>
-			<dt>Last error</dt><dd id="diag-error">none</dd>
+			<dt data-i18n="h.sent">Sent</dt><dd id="diag-tx">—</dd>
+			<dt data-i18n="h.received">Received</dt><dd id="diag-rx">—</dd>
+			<dt data-i18n="h.decoded">Decoded</dt><dd id="diag-decode">—</dd>
+			<dt data-i18n="h.link">Link</dt><dd id="diag-link">—</dd>
+			<dt data-i18n="h.last_error">Last error</dt><dd id="diag-error">none</dd>
 		</dl>
 	</section>
 
 	<section class="bar">
 		<div class="group">
-			<label>Y axis</label>
+			<label data-i18n="h.y_axis">Y axis</label>
 			<span class="seg">
-				<button type="button" id="btn-ylin" aria-pressed="true">Linear</button>
-				<button type="button" id="btn-ylog" aria-pressed="false">Log</button>
-				<button type="button" id="btn-ysym" aria-pressed="false">Symlog</button>
+				<button type="button" id="btn-ylin" aria-pressed="true" data-i18n="h.linear">Linear</button>
+				<button type="button" id="btn-ylog" aria-pressed="false" data-i18n="h.log">Log</button>
+				<button type="button" id="btn-ysym" aria-pressed="false" data-i18n="h.symlog">Symlog</button>
 			</span>
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label>Show</label>
-			<button type="button" id="btn-env" aria-pressed="true" title="min/max envelope">Envelope</button>
-			<button type="button" id="btn-band" aria-pressed="true" title="mean ±1σ band">mean ±1σ</button>
+			<label data-i18n="h.show">Show</label>
+			<button type="button" id="btn-env" aria-pressed="true" title="min/max envelope" data-i18n="h.envelope" data-i18n-title="a.min_max_envelope">Envelope</button>
+			<button type="button" id="btn-band" aria-pressed="true" title="mean ±1σ band" data-i18n="h.mean_1" data-i18n-title="a.mean_1_band">mean ±1σ</button>
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label for="trig-mode">Display trigger</label>
-			<select id="trig-mode" aria-label="Display trigger edge">
-				<option value="off">off</option>
-				<option value="rise">rise</option>
-				<option value="fall">fall</option>
-				<option value="either">either</option>
+			<label for="trig-mode" data-i18n="h.display_trigger">Display trigger</label>
+			<select id="trig-mode" aria-label="Display trigger edge" data-i18n-aria="a.display_trigger_edge">
+				<option value="off" data-i18n="h.off">off</option>
+				<option value="rise" data-i18n="h.rise">rise</option>
+				<option value="fall" data-i18n="h.fall">fall</option>
+				<option value="either" data-i18n="h.either">either</option>
 			</select>
-			<input type="text" id="trig-level" placeholder="auto µA" aria-label="Trigger level in µA" size="8">
-			<label for="trig-pre">pre</label>
-			<select id="trig-pre" aria-label="Pre-trigger position">
+			<input type="text" id="trig-level" placeholder="auto µA" aria-label="Trigger level in µA" size="8" data-i18n-placeholder="a.auto_a" data-i18n-aria="a.trigger_level_in_a">
+			<label for="trig-pre" data-i18n="h.pre">pre</label>
+			<select id="trig-pre" aria-label="Pre-trigger position" data-i18n-aria="a.pre_trigger_position">
 				<option value="0.1">10%</option>
 				<option value="0.25" selected>25%</option>
 				<option value="0.5">50%</option>
@@ -107,81 +107,81 @@
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<label for="acq-start">Capture trigger</label>
-			<select id="acq-start" aria-label="Capture start edge">
-				<option value="off">start off</option>
-				<option value="rise">start ↑</option>
-				<option value="fall">start ↓</option>
-				<option value="either">start ↕</option>
+			<label for="acq-start" data-i18n="h.capture_trigger">Capture trigger</label>
+			<select id="acq-start" aria-label="Capture start edge" data-i18n-aria="a.capture_start_edge">
+				<option value="off" data-i18n="h.start_off">start off</option>
+				<option value="rise" data-i18n="h.start">start ↑</option>
+				<option value="fall" data-i18n="h.start2">start ↓</option>
+				<option value="either" data-i18n="h.start3">start ↕</option>
 			</select>
-			<select id="acq-stop" aria-label="Capture stop edge">
-				<option value="off">stop off</option>
-				<option value="rise">stop ↑</option>
-				<option value="fall">stop ↓</option>
-				<option value="either">stop ↕</option>
+			<select id="acq-stop" aria-label="Capture stop edge" data-i18n-aria="a.capture_stop_edge">
+				<option value="off" data-i18n="h.stop_off">stop off</option>
+				<option value="rise" data-i18n="h.stop">stop ↑</option>
+				<option value="fall" data-i18n="h.stop2">stop ↓</option>
+				<option value="either" data-i18n="h.stop3">stop ↕</option>
 			</select>
 		</div>
 		<div class="sep"></div>
 		<div class="group">
-			<button type="button" id="btn-reset" title="Reset zoom and pan (0)">Reset view</button>
-			<button type="button" id="btn-max" aria-pressed="false" title="Maximize (F)">Maximize</button>
+			<button type="button" id="btn-reset" title="Reset zoom and pan (0)" data-i18n="h.reset_view" data-i18n-title="a.reset_zoom_and_pan_0">Reset view</button>
+			<button type="button" id="btn-max" aria-pressed="false" title="Maximize (F)" data-i18n-title="a.maximize_f">Maximize</button>
 		</div>
 	</section>
 
 	<main class="body">
 		<section class="panel">
 			<div class="panel-head">
-				<h2>Current</h2>
+				<h2 data-i18n="h.current">Current</h2>
 				<div class="meta" id="scope-meta">no data</div>
 			</div>
 			<div class="scope-wrap">
-				<canvas id="wave" tabindex="0" aria-label="Current waveform. Drag to pan, shift-drag to zoom into a box, drag a cursor line to move it."></canvas>
-				<div class="scope-empty" id="scope-empty">Connect the analyzer and start a capture</div>
+				<canvas id="wave" tabindex="0" aria-label="Current waveform. Drag to pan, shift-drag to zoom into a box, drag a cursor line to move it." data-i18n-aria="a.current_waveform_drag_to_pan_shift_drag_"></canvas>
+				<div class="scope-empty" id="scope-empty" data-i18n="h.connect_the_analyzer_and_start_a_capture">Connect the analyzer and start a capture</div>
 				<div class="minimap-wrap">
-					<canvas id="minimap" aria-label="Session overview"></canvas>
+					<canvas id="minimap" aria-label="Session overview" data-i18n-aria="a.session_overview"></canvas>
 				</div>
 			</div>
 			<div class="readouts">
 				<div class="readout" data-accent="1">
-					<div class="k">Current</div>
+					<div class="k" data-i18n="h.current">Current</div>
 					<div class="v" id="ro-current">0<span class="u">µA</span></div>
 				</div>
 				<div class="readout">
-					<div class="k">Power</div>
+					<div class="k" data-i18n="h.power">Power</div>
 					<div class="v" id="ro-power">0<span class="u">µW</span></div>
 				</div>
 				<div class="readout">
-					<div class="k">Voltage</div>
+					<div class="k" data-i18n="h.voltage">Voltage</div>
 					<div class="v" id="ro-voltage">—<span class="u">mV</span></div>
 				</div>
 				<div class="readout">
-					<div class="k">Samples kept</div>
+					<div class="k" data-i18n="h.samples_kept">Samples kept</div>
 					<div class="v" id="ro-samples">0</div>
 				</div>
 			</div>
 			<div class="cursors" id="cursor-strip">
 				<div class="cur-block">
-					<span class="k">Cursor A</span>
+					<span class="k" data-i18n="h.cursor_a">Cursor A</span>
 					<span class="v" id="cur-a">—</span>
 				</div>
 				<div class="cur-block">
-					<span class="k">Cursor B</span>
+					<span class="k" data-i18n="h.cursor_b">Cursor B</span>
 					<span class="v" id="cur-b">—</span>
 				</div>
 				<div class="cur-block">
-					<span class="k">Δt (wall / summed)</span>
+					<span class="k" data-i18n="h.t_wall_summed">Δt (wall / summed)</span>
 					<span class="v" id="cur-dt">—</span>
 				</div>
 				<div class="cur-block">
-					<span class="k">Mean · min / max</span>
+					<span class="k" data-i18n="h.mean_min_max">Mean · min / max</span>
 					<span class="v" id="cur-mean">—</span>
 				</div>
 				<div class="cur-block">
-					<span class="k">Charge</span>
+					<span class="k" data-i18n="h.charge">Charge</span>
 					<span class="v" id="cur-charge">—</span>
 				</div>
 				<div class="cur-block">
-					<span class="k">Energy</span>
+					<span class="k" data-i18n="h.energy">Energy</span>
 					<span class="v" id="cur-energy">—</span>
 				</div>
 			</div>
@@ -190,60 +190,60 @@
 		<aside class="side">
 			<section class="panel">
 				<div class="panel-head">
-					<h2>Session</h2>
+					<h2 data-i18n="h.session">Session</h2>
 					<div class="meta" id="session-meta">—</div>
 				</div>
 				<div class="panel-section">
 					<dl class="rows">
-						<dt>Duration</dt><dd id="st-duration">0 s</dd>
-						<dt>Rate</dt><dd id="st-rate">—</dd>
-						<dt>Samples</dt><dd id="st-samples">0</dd>
-						<dt>Data gaps</dt><dd id="st-gaps" data-warn="0">0</dd>
-						<dt>Energy</dt><dd id="st-energy">—</dd>
-						<dt>Charge</dt><dd id="st-charge">—</dd>
-						<dt>Power state</dt><dd id="st-power">unknown</dd>
+						<dt data-i18n="h.duration">Duration</dt><dd id="st-duration">0 s</dd>
+						<dt data-i18n="h.rate">Rate</dt><dd id="st-rate">—</dd>
+						<dt data-i18n="h.samples">Samples</dt><dd id="st-samples">0</dd>
+						<dt data-i18n="h.data_gaps">Data gaps</dt><dd id="st-gaps" data-warn="0">0</dd>
+						<dt data-i18n="h.energy">Energy</dt><dd id="st-energy">—</dd>
+						<dt data-i18n="h.charge">Charge</dt><dd id="st-charge">—</dd>
+						<dt data-i18n="h.power_state">Power state</dt><dd id="st-power">unknown</dd>
 					</dl>
-					<p class="hint" id="gaps-hint">Gaps come from the host dropping batches, from the device losing samples or from a stalled stream; time and energy never span a gap.</p>
+					<p class="hint" id="gaps-hint" data-i18n="h.gaps_come_from_the_host_dropping_batches">Gaps come from the host dropping batches, from the device losing samples or from a stalled stream; time and energy never span a gap.</p>
 					<dl class="rows">
-						<dt>Window start</dt><dd id="win-start">0</dd>
-						<dt>Window mean</dt><dd id="win-mean">—</dd>
-						<dt>Window min / max</dt><dd id="win-range">—</dd>
+						<dt data-i18n="h.window_start">Window start</dt><dd id="win-start">0</dd>
+						<dt data-i18n="h.window_mean">Window mean</dt><dd id="win-mean">—</dd>
+						<dt data-i18n="h.window_min_max">Window min / max</dt><dd id="win-range">—</dd>
 					</dl>
 				</div>
 			</section>
 
 			<section class="panel">
 				<div class="panel-head">
-					<h2>Analysis</h2>
+					<h2 data-i18n="h.analysis">Analysis</h2>
 					<div class="meta" id="an-meta">—</div>
 				</div>
 				<div class="panel-section">
 					<div class="actions">
-						<label for="an-source">Range</label>
-						<select id="an-source" aria-label="Analysis range">
-							<option value="auto">auto</option>
-							<option value="selection">cursors</option>
-							<option value="window">window</option>
+						<label for="an-source" data-i18n="h.range">Range</label>
+						<select id="an-source" aria-label="Analysis range" data-i18n-aria="a.analysis_range">
+							<option value="auto" data-i18n="h.auto">auto</option>
+							<option value="selection" data-i18n="h.cursors">cursors</option>
+							<option value="window" data-i18n="h.window">window</option>
 						</select>
-						<button type="button" id="btn-an-refresh">Recompute</button>
+						<button type="button" id="btn-an-refresh" data-i18n="h.recompute">Recompute</button>
 					</div>
 					<dl class="rows">
-						<dt>Average</dt><dd id="an-avg">—</dd>
-						<dt>Min / max</dt><dd id="an-range">—</dd>
-						<dt>RMS / pp</dt><dd id="an-rms">—</dd>
-						<dt>Low / high level</dt><dd id="an-levels">—</dd>
-						<dt>Period / duty</dt><dd id="an-period">—</dd>
-						<dt>Frequency</dt><dd id="an-freq">—</dd>
-						<dt>Charge per cycle</dt><dd id="an-qcycle">—</dd>
-						<dt>Spikes / segments</dt><dd id="an-events">—</dd>
-						<dt>Gaps in range</dt><dd id="an-gaps" data-warn="0">0</dd>
+						<dt data-i18n="h.average">Average</dt><dd id="an-avg">—</dd>
+						<dt data-i18n="h.min_max">Min / max</dt><dd id="an-range">—</dd>
+						<dt data-i18n="h.rms_pp">RMS / pp</dt><dd id="an-rms">—</dd>
+						<dt data-i18n="h.low_high_level">Low / high level</dt><dd id="an-levels">—</dd>
+						<dt data-i18n="h.period_duty">Period / duty</dt><dd id="an-period">—</dd>
+						<dt data-i18n="h.frequency">Frequency</dt><dd id="an-freq">—</dd>
+						<dt data-i18n="h.charge_per_cycle">Charge per cycle</dt><dd id="an-qcycle">—</dd>
+						<dt data-i18n="h.spikes_segments">Spikes / segments</dt><dd id="an-events">—</dd>
+						<dt data-i18n="h.gaps_in_range">Gaps in range</dt><dd id="an-gaps" data-warn="0">0</dd>
 					</dl>
 				</div>
 				<div class="panel-section">
 					<div class="actions">
-						<button type="button" id="btn-fft" aria-pressed="false">FFT</button>
-						<button type="button" id="btn-battery" aria-pressed="false">Battery</button>
-						<button type="button" id="btn-cycles" aria-pressed="false">Cycles</button>
+						<button type="button" id="btn-fft" aria-pressed="false" data-i18n="h.fft">FFT</button>
+						<button type="button" id="btn-battery" aria-pressed="false" data-i18n="h.battery">Battery</button>
+						<button type="button" id="btn-cycles" aria-pressed="false" data-i18n="h.cycles">Cycles</button>
 					</div>
 					<div id="an-fft-block" hidden>
 						<div class="meta" id="an-fft-meta">—</div>
@@ -251,41 +251,41 @@
 					</div>
 					<div id="an-battery-block" hidden>
 						<div class="actions">
-							<label for="an-capacity">Capacity (mAh)</label>
+							<label for="an-capacity" data-i18n="h.capacity_mah">Capacity (mAh)</label>
 							<input type="number" id="an-capacity" min="1" max="100000" step="10" value="2000">
 						</div>
 						<dl class="rows">
-							<dt>Estimated life</dt><dd id="an-battery">—</dd>
+							<dt data-i18n="h.estimated_life">Estimated life</dt><dd id="an-battery">—</dd>
 						</dl>
 					</div>
 					<div id="an-cycles-block" hidden>
 						<div class="meta" id="an-cycles-meta">—</div>
-						<p class="hint">The overlay is drawn in the waveform corner while Cycles is on.</p>
+						<p class="hint" data-i18n="h.the_overlay_is_drawn_in_the_waveform_cor">The overlay is drawn in the waveform corner while Cycles is on.</p>
 					</div>
 				</div>
 			</section>
 
 			<section class="panel">
 				<div class="panel-head">
-					<h2>Storage</h2>
+					<h2 data-i18n="h.storage">Storage</h2>
 					<div class="meta" id="store-meta">—</div>
 				</div>
 				<div class="panel-section">
 					<dl class="rows">
-						<dt>Cold (raw equivalent)</dt><dd id="store-raw">0 B</dd>
-						<dt>Cold (compressed)</dt><dd id="store-comp">0 B</dd>
-						<dt>Cold blocks</dt><dd id="store-blocks">0</dd>
-						<dt>Limits</dt><dd id="store-caps">—</dd>
+						<dt data-i18n="h.cold_raw_equivalent">Cold (raw equivalent)</dt><dd id="store-raw">0 B</dd>
+						<dt data-i18n="h.cold_compressed">Cold (compressed)</dt><dd id="store-comp">0 B</dd>
+						<dt data-i18n="h.cold_blocks">Cold blocks</dt><dd id="store-blocks">0</dd>
+						<dt data-i18n="h.limits">Limits</dt><dd id="store-caps">—</dd>
 					</dl>
 					<div class="actions">
-						<label for="cap">Cold cap (MiB)</label>
+						<label for="cap" data-i18n="h.cold_cap_mib">Cold cap (MiB)</label>
 						<input type="number" id="cap" min="16" max="2048" step="16" value="512">
-						<button type="button" id="btn-apply-cap">Apply</button>
+						<button type="button" id="btn-apply-cap" data-i18n="h.apply">Apply</button>
 					</div>
-					<p class="hint">Cold data lives in memory only (the sandbox has no disk). When the cap is hit, the oldest blocks are dropped and marked as gaps.</p>
+					<p class="hint" data-i18n="h.cold_data_lives_in_memory_only_the_sandb">Cold data lives in memory only (the sandbox has no disk). When the cap is hit, the oldest blocks are dropped and marked as gaps.</p>
 					<div class="actions">
-						<label for="view">Window</label>
-						<select id="view" aria-label="Waveform window">
+						<label for="view" data-i18n="h.window2">Window</label>
+						<select id="view" aria-label="Waveform window" data-i18n-aria="a.waveform_window">
 							<option value="2">2 s</option>
 							<option value="10" selected>10 s</option>
 							<option value="60">60 s</option>
@@ -297,30 +297,30 @@
 
 			<section class="panel">
 				<div class="panel-head">
-					<h2>Export</h2>
+					<h2 data-i18n="h.export">Export</h2>
 					<div class="meta" id="export-meta">limit 8 MiB</div>
 				</div>
 				<div class="panel-section">
 					<div class="actions">
-						<button type="button" id="btn-export-view">Export window</button>
-						<button type="button" id="btn-export-all">Export all</button>
-						<button type="button" id="btn-export-summary">Export summary</button>
+						<button type="button" id="btn-export-view" data-i18n="h.export_window">Export window</button>
+						<button type="button" id="btn-export-all" data-i18n="h.export_all">Export all</button>
+						<button type="button" id="btn-export-summary" data-i18n="h.export_summary">Export summary</button>
 					</div>
-					<p class="hint" id="export-hint">Exports go through the host file saver. Anything past 8 MiB is refused with the exact size, never truncated.</p>
+					<p class="hint" id="export-hint" data-i18n="h.exports_go_through_the_host_file_saver_a">Exports go through the host file saver. Anything past 8 MiB is refused with the exact size, never truncated.</p>
 				</div>
 				<div class="panel-section">
 					<div class="actions">
-						<label for="import-file">Import CSV</label>
-						<input type="file" id="import-file" accept=".csv,text/csv" aria-label="Import a CSV capture">
-						<button type="button" id="btn-import">Load into session</button>
+						<label for="import-file" data-i18n="h.import_csv">Import CSV</label>
+						<input type="file" id="import-file" accept=".csv,text/csv" aria-label="Import a CSV capture" data-i18n-aria="a.import_a_csv_capture">
+						<button type="button" id="btn-import" data-i18n="h.load_into_session">Load into session</button>
 					</div>
-					<p class="hint" id="import-hint">Replaces the current session with the file. Parsed locally; gap markers become gaps, per-row voltage is kept as history.</p>
+					<p class="hint" id="import-hint" data-i18n="h.replaces_the_current_session_with_the_fi">Replaces the current session with the file. Parsed locally; gap markers become gaps, per-row voltage is kept as history.</p>
 				</div>
 			</section>
 
 			<section class="panel">
 				<div class="panel-head">
-					<h2>Log</h2>
+					<h2 data-i18n="h.log">Log</h2>
 					<div class="meta" id="log-meta">0 lines</div>
 				</div>
 				<ul class="log" id="log"></ul>
@@ -329,6 +329,7 @@
 	</main>
 
 	<script src="sdk/devicedock-plugin.js"></script>
+	<script src="js/power-i18n.js"></script>
 	<script src="js/power-protocol.js"></script>
 	<script src="js/power-view.js"></script>
 	<script src="js/power-lane.js"></script>

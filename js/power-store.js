@@ -3,6 +3,8 @@
 // 同一个上限下多留几倍时长。超限时按最早写入的块淘汰并回报给调用方（波形要标成缺口）。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const DEFAULT_CAP_RAW_BYTES = 512 * 1024 * 1024
 	const BYTES_PER_SAMPLE = 4
@@ -23,7 +25,7 @@
 		const stream = new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate'))
 		const buf = await new Response(stream).arrayBuffer()
 		if (expectBytes && buf.byteLength !== expectBytes) {
-			throw new Error('冷数据长度不符：期望 ' + expectBytes + ' 字节，解出 ' + buf.byteLength)
+			throw new Error(tr('sto.len_mismatch', { expect: expectBytes, got: buf.byteLength }))
 		}
 		return new Float32Array(buf)
 	}
@@ -111,7 +113,7 @@
 
 		async function readChunk(id, n) {
 			const blk = blocks.get(id)
-			if (!blk) throw new Error('冷数据块不存在: ' + id)
+			if (!blk) throw new Error(tr('sto.missing_block', { id: id }))
 			const expect = (n | 0) * BYTES_PER_SAMPLE
 			if (blk.byteSize === expect) {
 				const copy = blk.body.slice()

@@ -88,6 +88,7 @@ class El {
 	removeEventListener() {}
 	setAttribute(k, v) { this.attrs[k] = String(v) }
 	getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null }
+	removeAttribute(k) { delete this.attrs[k] }
 	getContext() { return makeCtx2d() }
 	getBoundingClientRect() {
 		return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight, right: this.clientWidth, bottom: this.clientHeight }
@@ -140,7 +141,30 @@ function makeDocument() {
 		listeners: {},
 		fullscreenElement: null,
 	}
+	// 带 data-i18n* 的元素：从真实 index.html 解析出来（有 id 的复用 getElementById 的同一个对象），
+	// 这样语言切换的静态文案刷新走的是真实标记，而不是测试里另编一份
+	const i18nEls = []
+	const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8')
+	const tagRe = /<(\w+)\s([^<>]*data-i18n[^<>]*)>/g
+	let m
+	while ((m = tagRe.exec(html))) {
+		const attrs = {}
+		const attrRe = /([\w-]+)="([^"]*)"/g
+		let a
+		while ((a = attrRe.exec(m[2]))) attrs[a[1]] = a[2]
+		const el = attrs.id ? doc.getElementById(attrs.id) : new El(m[1])
+		Object.keys(attrs).forEach(function (k) { if (k.indexOf('data-i18n') === 0 || k === 'title' || k === 'placeholder' || k === 'aria-label') el.attrs[k] = attrs[k] })
+		i18nEls.push(el)
+	}
+	doc.querySelectorAll = function (sel) {
+		void sel
+		return i18nEls.filter(function (el) {
+			return ['data-i18n', 'data-i18n-title', 'data-i18n-placeholder', 'data-i18n-aria'].some(function (k) { return el.getAttribute(k) })
+		})
+	}
+	doc.title = ''
 	doc._byId = byId
+	doc._i18nEls = i18nEls
 	return doc
 }
 
@@ -204,18 +228,37 @@ function makeFakeSdk(state) {
 			ack: async () => ({ ack: true }),
 		},
 	}
+	// 宿主语言推送：state.localeSupport 打开时模拟新 SDK（getLocale / onLocale），否则只有 on('app.locale')
+	state.emit = function (name, payload) {
+		const set = handlers.get(name)
+		if (set) Array.from(set).forEach(function (fn) { fn(payload) })
+	}
+	if (state.localeSupport) {
+		const fns = []
+		sdk.getLocale = function () { return state.hostLocale || null }
+		sdk.onLocale = function (fn) {
+			fns.push(fn)
+			if (state.hostLocale) fn(state.hostLocale)
+			return function () {}
+		}
+		state.pushLocale = function (l) {
+			state.hostLocale = l
+			fns.forEach(function (fn) { fn(l) })
+		}
+	}
 	return sdk
 }
 
 // ---------- 运行 app.js ----------
 const root = path.join(__dirname, '..')
 const files = [
-	'js/power-protocol.js', 'js/power-view.js', 'js/power-lane.js', 'js/power-analysis.js',
+	'js/power-i18n.js', 'js/power-protocol.js', 'js/power-view.js', 'js/power-lane.js', 'js/power-analysis.js',
 	'js/power-store.js', 'js/power-wave.js', 'js/power-panels.js', 'js/power-claim.js',
 	'js/power-control.js', 'js/power-export.js', 'js/power-import.js',
 ]
 
-function makeEnv(state) {
+function makeEnv(state, opts) {
+	opts = opts || {}
 	const document = makeDocument()
 	const win = {
 		document: document,
@@ -239,6 +282,8 @@ function makeEnv(state) {
 		console, Date, Math, JSON, Number, String, Boolean, Array, Object, Promise, Map, Set,
 		Uint8Array, Float32Array, Float64Array, ArrayBuffer, isFinite, parseInt, parseFloat, Infinity, NaN,
 	}
+	// 没给 navigator 时沙箱里就没有（回退到 en）
+	if (opts.navigator) { sandbox.navigator = opts.navigator; win.navigator = opts.navigator }
 	sandbox.globalThis = sandbox
 	sandbox.window.window = win
 	vm.createContext(sandbox)
@@ -362,6 +407,39 @@ const fireKey = (win, key, props) => {
 	await tick(520)
 	const kept = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
 	assert.ok(kept > 0, '样点进波形：' + ['st-samples', 'ro-samples', 'scope-meta'].map((id) => id + '=' + text(document, id)).join(' '))
+
+	// ---- 语言切换（旧 SDK 路径：on('app.locale')）：采集中就地刷新，采集状态不丢 ----
+	{
+		assert.equal(text(document, 'btn-sample'), 'Stop capture', '无 navigator / 无宿主推送时回退 en')
+		state.emit('app.locale', { locale: 'zh-CN' })
+		await tick(20)
+		assert.equal(text(document, 'btn-sample'), '停止采集', '运行时按钮文案切到中文')
+		assert.equal(text(document, 'chip-sampling'), '采集中')
+		assert.equal(text(document, 'btn-connect'), '断开')
+		assert.equal(text(document, 'btn-refresh'), '刷新', '静态 data-i18n 文案刷新')
+		assert.equal(text(document, 'gaps-hint').indexOf('缺口来自'), 0)
+		assert.equal(document.getElementById('trig-level').getAttribute('placeholder'), '自动 µA', 'placeholder 刷新')
+		assert.equal(document.getElementById('port').getAttribute('aria-label'), '串口', 'aria-label 刷新')
+		assert.match(text(document, 'chip-port'), /^端口：BLU Power Monitor/)
+		assert.equal(text(document, 'session-meta'), '已连接')
+		assert.match(text(document, 'chip-theme'), /^主题：/)
+		assert.match(text(document, 'scope-meta'), /个样点/)
+		assert.equal(document.title, '功耗分析仪')
+		assert.equal(document.documentElement.getAttribute('lang'), 'zh-CN')
+		// 采集没有被打断：样点继续入库
+		const before = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		state.pushRxSamples(600, 1000)
+		await tick(450)
+		const after = Number(text(document, 'ro-samples').replace(/[^0-9]/g, ''))
+		assert.ok(after > before, '切换语言后采集继续：' + before + ' → ' + after)
+		assert.equal(text(document, 'btn-sample'), '停止采集')
+		state.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(text(document, 'btn-sample'), 'Stop capture')
+		assert.equal(text(document, 'btn-refresh'), 'Refresh')
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		assert.equal(document.getElementById('trig-level').getAttribute('placeholder'), 'auto µA')
+	}
 
 	// ---- 缺口 1：宿主静默少发一批（offset 跳号）----
 	const gapsBefore = text(document, 'chip-gaps')
@@ -656,7 +734,7 @@ const fireKey = (win, key, props) => {
 		const sl = document.getElementById('status-line')
 		assert.equal(sl.hidden, false, '状态条要显示出来')
 		assert.equal(sl.dataset.level, 'error')
-		assert.match(sl.textContent, /START 写入失败.*USB 写超时/, '状态条写明原因：' + sl.textContent)
+		assert.match(sl.textContent, /START could not be written.*USB 写超时/, '状态条写明原因：' + sl.textContent)
 		assert.equal(text(document, 'btn-sample'), 'Start capture')
 		// 诊断面板：发送失败计数与最近错误
 		click(document, 'btn-diag')
@@ -673,7 +751,7 @@ const fireKey = (win, key, props) => {
 		assert.equal(text(document, 'chip-sampling'), 'capturing')
 		await tick(3200)
 		assert.equal(text(document, 'chip-sampling'), 'no response', '看门狗必须真的在跑：' + text(document, 'chip-sampling'))
-		assert.match(sl.textContent, /设备无应答/, '状态条：' + sl.textContent)
+		assert.match(sl.textContent, /No response from the device/, '状态条：' + sl.textContent)
 		assert.equal(text(document, 'chip-gaps'), gapsBefore, '从未收到数据不算缺口')
 		state.silent = false
 		click(document, 'btn-sample')
@@ -731,6 +809,38 @@ const fireKey = (win, key, props) => {
 	click(document, 'btn-apply-cap')
 	await tick(500)
 	assert.ok(state.saved.some(([k, v]) => k === 'settings' && v.capMiB === 256), '冷区上限写进设置：' + JSON.stringify(state.saved.slice(-1)))
+
+	// ---- 语言来源：navigator 回退 / 新 SDK onLocale 覆盖 navigator ----
+	{
+		// 1) 旧宿主：SDK 没有 onLocale，navigator 是中文 → 中文界面
+		const s1 = Object.assign({}, state, { settings: {}, saved: [], hostLogs: [], claimIds: [], busy: [], released: [], acquires: [] })
+		const e1 = makeEnv(s1, { navigator: { language: 'zh-CN' } })
+		await tick(80)
+		assert.equal(e1.document.getElementById('btn-sample').textContent, '开始采集', 'navigator 回退为中文')
+		assert.equal(e1.document.getElementById('btn-refresh').textContent, '刷新')
+		assert.equal(e1.document.getElementById('chip-sampling').textContent, '空闲')
+		assert.equal(e1.document.getElementById('btn-connect').textContent, '连接')
+		// 宿主后来推了 en（旧 SDK 也会把 app.locale 转给 on()）
+		s1.emit('app.locale', { locale: 'en' })
+		await tick(20)
+		assert.equal(e1.document.getElementById('btn-sample').textContent, 'Start capture')
+
+		// 2) 新宿主：onLocale 已有值时立即回调，覆盖 navigator；之后的推送就地生效
+		const s2 = Object.assign({}, state, {
+			settings: {}, saved: [], hostLogs: [], claimIds: [], busy: [], released: [], acquires: [],
+			localeSupport: true, hostLocale: 'en',
+			ports: [{ key: 'z1', portName: 'COM4', productName: 'CH340' }],
+		})
+		const e2 = makeEnv(s2, { navigator: { language: 'zh-CN' } })
+		await tick(80)
+		assert.equal(e2.document.getElementById('btn-sample').textContent, 'Start capture', '宿主语言优先于 navigator')
+		assert.match(e2.document.getElementById('port').options[0].textContent, /^No BLU device found \(1 other port\(s\) hidden\)/)
+		s2.pushLocale('zh-CN')
+		await tick(20)
+		assert.equal(e2.document.getElementById('btn-sample').textContent, '开始采集')
+		assert.match(e2.document.getElementById('port').options[0].textContent, /^未发现 BLU 设备（已隐藏 1 个其他串口）/, '空态提示也跟着切语言：' + e2.document.getElementById('port').options[0].textContent)
+		assert.equal(e2.document.getElementById('port').disabled, true, '空态下拉保持禁用')
+	}
 
 	console.log('app-smoke: ok')
 	process.exit(0)

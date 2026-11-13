@@ -3,6 +3,8 @@
 // 逐行电压与「能量是否可用」的判定。只解析字符串，不碰文件系统。
 const assert = require('node:assert/strict')
 const I = require('../js/power-import.js')
+// 摘要文案按英文断言（模块在 node 里默认中文）
+require('../js/power-i18n.js').setLocale('en')
 
 ;(function () {
 	// ---- 本插件导出的格式（含表头与 gap 标记）----

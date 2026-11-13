@@ -23,6 +23,8 @@
 
 	// 浏览器里由 <script> 顺序保证已加载；node 单测里按相对路径取同一份实现
 	const PROTO = global.PowerProtocol || (typeof require === 'function' ? require('./power-protocol.js') : null)
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	function toBytes(value) {
 		if (!value) return new Uint8Array(0)
@@ -204,7 +206,7 @@
 					try {
 						onGap(job.info)
 					} catch (e) {
-						onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error')
+						onLog(tr('clm.gap_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 					}
 					// 断点不占样点预算，但也要让出线程
 					if (pending.length && now() - started >= DRAIN_BUDGET_MS) break
@@ -224,7 +226,7 @@
 				try {
 					onSamples(chunk, job.at, meta)
 				} catch (e) {
-					onLog('样点处理出错：' + (e && e.message ? e.message : e), 'error')
+					onLog(tr('clm.samples_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				}
 				// 按时间预算让出线程：重活（画布/统计刷新）由上层自己排，这里只负责把队列喂进去
 				if (pending.length && now() - started >= DRAIN_BUDGET_MS) break
@@ -246,7 +248,7 @@
 				const job = pending[0]
 				if (job.kind === 'break') {
 					pending.shift()
-					try { onGap(job.info) } catch (e) { onLog('缺口处理出错：' + (e && e.message ? e.message : e), 'error') }
+					try { onGap(job.info) } catch (e) { onLog(tr('clm.gap_handler_failed', { err: (e && e.message ? e.message : e) }), 'error') }
 				} else {
 					const rest = job.samples.length - job.from
 					const take = Math.min(rest, DRAIN_CHUNK)
@@ -258,7 +260,7 @@
 					try {
 						onSamples(chunk, job.at, Object.assign({}, job.meta, { from: from, total: job.samples.length }))
 					} catch (e) {
-						onLog('样点处理出错：' + (e && e.message ? e.message : e), 'error')
+						onLog(tr('clm.samples_handler_failed', { err: (e && e.message ? e.message : e) }), 'error')
 					}
 				}
 				drained += Math.max(0, before - pendingCount)
@@ -397,8 +399,8 @@
 			} catch (e) {
 				// 回调抛错会被宿主当成「已消费」而吞掉，所以这里必须自己接住并标缺口
 				stats.decodeErrors++
-				noteError('样点解码失败：' + (e && e.message ? e.message : e))
-				onLog('样点解码失败：' + (e && e.message ? e.message : e), 'error')
+				noteError(tr('clm.decode_failed', { err: (e && e.message ? e.message : e) }))
+				onLog(tr('clm.decode_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				enqueueBreak({ reason: 'decode_error', at: at, gen: streamGen })
 				breakStream()
 				return undefined
@@ -455,7 +457,7 @@
 					opening = false
 					gen++
 					emitState()
-					onLog('占用声明已被释放，串口按已关闭处理', 'warn')
+					onLog(tr('clm.claim_released'), 'warn')
 				}
 				return
 			}
@@ -480,9 +482,9 @@
 		 * 半成品声明自己释放掉，失败原因原样抛出。
 		 */
 		async function openOn(key) {
-			if (!host || !host.claim) throw new Error('宿主没有提供串口占用能力')
+			if (!host || !host.claim) throw new Error(tr('clm.no_claim_api'))
 			if (open || opening) {
-				try { await close() } catch (e) { /* 旧连接关闭失败不阻止新连接，但要记下来 */ onLog('关闭旧连接失败：' + (e && e.message ? e.message : e), 'warn') }
+				try { await close() } catch (e) { /* 旧连接关闭失败不阻止新连接，但要记下来 */ onLog(tr('clm.close_old_failed', { err: (e && e.message ? e.message : e) }), 'warn') }
 			}
 			opening = true
 			emitState()
@@ -491,7 +493,7 @@
 			try {
 				const res = await host.claim.acquire(String(key), 'exclusive')
 				acquiredId = res && res.claimId ? res.claimId : null
-				if (!acquiredId) throw new Error('宿主未返回占用声明')
+				if (!acquiredId) throw new Error(tr('clm.no_claim_id'))
 				claimId = acquiredId
 				portKey = String(key)
 				await host.claim.open(acquiredId, { baudRate: baudRate })
@@ -513,8 +515,8 @@
 				lastSeq = 0
 				resetStream(0, 0)
 				stats.openFailures++
-				noteError('打开串口失败：' + (e && e.message ? e.message : e))
-				onLog('打开串口失败：' + (e && e.message ? e.message : e), 'error')
+				noteError(tr('clm.open_failed', { err: (e && e.message ? e.message : e) }))
+				onLog(tr('clm.open_failed', { err: (e && e.message ? e.message : e) }), 'error')
 				throw e
 			} finally {
 				// 无论成功失败都要退出 Opening，界面才不会卡死
@@ -556,8 +558,8 @@
 			const myGen = gen
 			const myId = claimId
 			if (!open || !myId) {
-				noteError('写入失败（串口未打开）' + (note ? '：' + note : ''))
-				if (note) onLog('写入失败（未打开）：' + note, 'error')
+				noteError(tr('clm.write_not_open', { note: note || '—' }))
+				if (note) onLog(tr('clm.write_not_open', { note: note }), 'error')
 				return { ok: false, stale: false }
 			}
 			// 宿主 claim.write 只收 0..255 的普通数组或十六进制串（plugin-rpc.toBytes）；
@@ -569,14 +571,14 @@
 			} catch (e) {
 				const msg = (e && e.message ? e.message : String(e)) + (e && e.code ? ' [' + e.code + ']' : '')
 				stats.txFailures++
-				noteError('写入失败' + (note ? '（' + note + '）' : '') + '：' + msg)
-				onLog('写入错误' + (note ? '（' + note + '）' : '') + '：' + msg, 'error')
+				noteError(tr('clm.write_failed', { note: note || '—', err: msg }))
+				onLog(tr('clm.write_failed', { note: note || '—', err: msg }), 'error')
 				return { ok: false, stale: false, error: e }
 			}
 			stats.txBytes += data.length
 			stats.lastTxAt = now()
 			if (!open || gen !== myGen || claimId !== myId) {
-				if (note) onLog('写入完成时连接已变化：' + note, 'warn')
+				if (note) onLog(tr('clm.write_stale', { note: note }), 'warn')
 				return { ok: false, stale: true }
 			}
 			return { ok: true, stale: false }

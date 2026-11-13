@@ -11,6 +11,8 @@
 //  - 沿触发的 waiting 阶段只累计 pre-range（供 Auto 电平），且 unknown 状态只 seed 不产生沿。
 ;(function (global) {
 	'use strict'
+	const I18N = global.PowerI18n || (typeof require === 'function' ? require('./power-i18n.js') : null)
+	const tr = I18N.t
 
 	const C = {
 		DEFAULT_VIEW_POINTS: 2000,
@@ -726,12 +728,12 @@
 		const rx = Math.max(0, Number(o.rxBytes) || 0)
 		const n = Math.max(0, Number(o.samples) || 0)
 		if (rx === 0) {
-			return { kind: 'no_response', level: 'error', message: '设备无应答：START 后 ' + sec + ' s 内未收到任何字节（检查设备是否为功耗仪、USB 连接与供电）' }
+			return { kind: 'no_response', level: 'error', message: tr('view.no_response', { sec: sec }) }
 		}
 		if (n === 0) {
-			return { kind: 'undecodable', level: 'error', message: '解析失败：START 后收到 ' + rx + ' 字节但没有解出任何样点（帧格式不符或数据错位）' }
+			return { kind: 'undecodable', level: 'error', message: tr('view.undecodable', { bytes: rx }) }
 		}
-		return { kind: 'stall', level: 'warn', message: '采样流中断 ' + sec + ' s（设备停发或 USB 卡顿），已标记缺口；不自动重连' }
+		return { kind: 'stall', level: 'warn', message: tr('view.stall', { sec: sec }) }
 	}
 
 	// ---------- 总览条（minimap） ----------
