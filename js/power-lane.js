@@ -61,6 +61,9 @@
 		const intervalMs = opts.intervalMs > 0 ? opts.intervalMs : 200
 		const gapMs = opts.gapMs > 0 ? opts.gapMs : 20
 		const jumpMs = opts.jumpMs > 0 ? opts.jumpMs : 500
+		// 硬容量：长采集时锚点数组不能无界增长（每 200 ms 一个锚点 ≈ 1 小时 18k 个）。
+		// 塞满后按 2 倍抽稀（保留首尾），内存与查找都封顶。
+		const maxAnchors = opts.maxAnchors > 0 ? opts.maxAnchors : 20000
 		const wallOffset = typeof opts.wallOffset === 'function'
 			? opts.wallOffset
 			: function () { return Date.now() - perfNow() }
@@ -74,6 +77,34 @@
 		let lastOff = 0
 		let lastAnchorT = -Infinity
 
+		/** 锚点超上限时按 2 倍抽稀（保留首尾），并重建映射段边界 */
+		function thinAnchors() {
+			const n = lis.length
+			if (n <= 2) return
+			const nLis = []
+			const nTs = []
+			const nOffs = []
+			for (let i = 0; i < n; i += 2) {
+				nLis.push(lis[i])
+				nTs.push(ts[i])
+				nOffs.push(offs[i])
+			}
+			// 末样点锚点必须保留（末样点插值依赖它）
+			if (nLis[nLis.length - 1] !== lis[n - 1]) {
+				nLis.push(lis[n - 1])
+				nTs.push(ts[n - 1])
+				nOffs.push(offs[n - 1])
+			}
+			lis = nLis
+			ts = nTs
+			offs = nOffs
+			// 段边界重新算：墙钟偏移跳变超过 jumpMs 处开新段
+			segs = []
+			for (let i = 0; i < nOffs.length; i++) {
+				if (i === 0 || Math.abs(nOffs[i] - nOffs[i - 1]) > jumpMs) segs.push(i)
+			}
+		}
+
 		function pushAnchor(li, t, off) {
 			const n = lis.length
 			if (n && lis[n - 1] === li) {
@@ -85,6 +116,7 @@
 			lis.push(li)
 			ts.push(t)
 			offs.push(off)
+			if (lis.length > maxAnchors) thinAnchors()
 		}
 
 		function note(li, tMs) {
@@ -115,6 +147,14 @@
 
 		function has() {
 			return lastLi >= 0 && lis.length > 0
+		}
+
+		function anchorCount() {
+			return lis.length
+		}
+
+		function maxCount() {
+			return maxAnchors
 		}
 
 		function range() {
@@ -202,7 +242,8 @@
 			note: note, reset: reset, has: has, range: range,
 			perfToLi: perfToLi, liToPerf: liToPerf, wallToPerf: wallToPerf,
 			wallToLi: wallToLi, liToWall: liToWall,
-			anchorCount: function () { return lis.length },
+			anchorCount: anchorCount,
+			maxCount: maxCount,
 			segmentCount: function () { return segs.length },
 		}
 	}

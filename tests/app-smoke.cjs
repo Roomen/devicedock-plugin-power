@@ -154,6 +154,7 @@ function makeFakeSdk(state) {
 			const set = handlers.get(name) || new Set()
 			set.add(fn)
 			handlers.set(name, set)
+			if (name === 'claim.state') state.claimStateHandler = fn
 			return function () { set.delete(fn) }
 		},
 		getTheme() { return { theme: 'dark', tokens: {} } },
@@ -285,6 +286,7 @@ const fireKey = (win, key, props) => {
 		rxHandler: null,
 		gapHandler: null,
 		claimErrorHandler: null,
+		claimStateHandler: null,
 	}
 	state.pushRxBytes = function (bytes) {
 		state.rxSeq++
@@ -590,6 +592,39 @@ const fireKey = (win, key, props) => {
 	await tick(80)
 	assert.equal(text(document, 'btn-connect'), 'Connect')
 	assert.equal(document.getElementById('port').disabled, false)
+
+	// ---- 意外断开：终止会话、释放更新屏障、供电状态失效 ----
+	{
+		const releasedBefore = state.released.length
+		// 重新连接并开始采样
+		click(document, 'btn-connect')
+		await tick(500)
+		click(document, 'btn-sample')
+		await tick(150)
+		assert.equal(text(document, 'chip-sampling'), 'capturing')
+		state.pushRxSamples(600, 1000)
+		await tick(120)
+		// 宿主收回占用声明（意外断开）
+		assert.equal(typeof state.claimStateHandler, 'function', '插件要订阅占用状态')
+		state.claimStateHandler({ claims: [] })
+		await tick(150)
+		assert.equal(text(document, 'chip-sampling'), 'idle', '断开后采样会话必须结束')
+		assert.equal(state.released.length, releasedBefore + 1, '断开后必须释放更新屏障')
+		assert.equal(text(document, 'st-power'), 'unknown', '断开后供电状态必须置为未知：' + text(document, 'st-power'))
+		assert.equal(text(document, 'btn-sample'), 'Start capture')
+		// 重新连接后：旧会话状态不能串过来（必须能真正重新开始采样）
+		click(document, 'btn-connect')
+		await tick(500)
+		assert.equal(text(document, 'btn-connect'), 'Disconnect')
+		state.writes.length = 0
+		click(document, 'btn-sample')
+		await tick(150)
+		assert.ok(state.writes.some((w) => w[0] === 0x06), '新连接必须真的发 START（不能因为旧 sampling=true 直接返回）')
+		click(document, 'btn-sample')
+		await tick(150)
+		click(document, 'btn-connect')
+		await tick(150)
+	}
 
 	// ---- 冷区上限 ----
 	document.getElementById('cap').value = '256'

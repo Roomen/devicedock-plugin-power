@@ -571,9 +571,21 @@
 		async function stopSampling(guard) {
 			if (!sampling) return { ok: true, changed: false, sampling: false }
 			const gen0 = genOf()
-			sampling = false
+			// 1) 先停止接收新数据（排空窗口挡住 STOP 之后的尾包与竞态）
 			link.setDrop(true)
 			acqStoreEnabled = true
+			// 2) 把**截止点之前已经收到**的样点排空入库，再冻结统计。
+			//    不能直接 sampling=false：队列里剩下的样点会被当成「未采样」丢掉，而且没有任何记录。
+			let flushed = { drained: 0, remaining: 0, remainingBytes: 0 }
+			if (link && typeof link.flushQueue === 'function') {
+				flushed = link.flushQueue(250)
+			}
+			if (flushed.remaining > 0) {
+				// 确实排不完的（例如冷存储卡住）：计数 + 标缺口，绝不静默丢
+				noteGap({ reason: 'stop_drain', missedSamples: flushed.remaining, bytes: flushed.remainingBytes })
+				log('停止采样时仍有 ' + flushed.remaining + ' 个待入库样点未能处理，已标记缺口', 'warn')
+			}
+			sampling = false
 			onChange()
 			let stopW = { ok: true, stale: false }
 			try {
@@ -751,6 +763,62 @@
 			return out
 		}
 
+		/**
+		 * 连接已失效（意外关闭 / 宿主收回声明 / 停用）时终止会话。
+		 * sampling、看门狗、busy 由调用方（界面）一起收尾；这里负责设备侧的会话状态：
+		 *  - 采样立刻结束（不再写设备，也绝不把旧会话状态带进下一次连接）；
+		 *  - 供电状态失效（协议没有回读，断开后不能假装知道 on/off）；
+		 *  - 端口里剩下的数据标成缺口（丢了多少要能看见）。
+		 */
+		function abortSession(reason) {
+			const wasSampling = sampling
+			const pendingSamples = link && typeof link.pendingSamples === 'function' ? link.pendingSamples() : 0
+			sampling = false
+			stopScheduled = false
+			if (wasSampling) {
+				// 已收到的样点先尽量入库；剩下的如实标缺口
+				let flushed = { remaining: 0, remainingBytes: 0 }
+				if (link && typeof link.flushQueue === 'function') {
+					try { flushed = link.flushQueue(100) } catch (e) { /* 忽略 */ }
+				}
+				const lost = flushed.remaining || pendingSamples
+				if (lost > 0) noteGap({ reason: 'session_aborted', missedSamples: lost, bytes: flushed.remainingBytes || 0 })
+			}
+			// 供电状态未知：不能把上一次会话的 commanded 带过来
+			power = { on: null, source: 'unknown' }
+			if (acq) {
+				acq.startState = 0
+				acq.stopState = 0
+				acq.storeEnabled = acq.start === 'off'
+				acq.startLatched = acq.start === 'off'
+				acq.preMin = Infinity
+				acq.preMax = -Infinity
+			}
+			lastTMs = 0
+			gapPending = false
+			if (wasSampling) log('会话已终止（' + reason + '），供电状态置为未知', 'warn')
+			onChange()
+			return { wasSampling: wasSampling }
+		}
+
+		/** 新建连接前调用：清掉上一次会话可能残留的采样 / 供电 / 触发状态 */
+		function prepareSession() {
+			sampling = false
+			stopScheduled = false
+			power = { on: null, source: 'unknown' }
+			lastTMs = 0
+			gapPending = false
+			if (acq) {
+				acq.startState = 0
+				acq.stopState = 0
+				acq.storeEnabled = acq.start === 'off'
+				acq.startLatched = acq.start === 'off'
+				acq.preMin = Infinity
+				acq.preMax = -Infinity
+			}
+			onChange()
+		}
+
 		function acqState() {
 			if (!acq) return null
 			return {
@@ -808,6 +876,8 @@
 			},
 			trigLevel: trigLevel,
 			acqState: acqState,
+			abortSession: abortSession,
+			prepareSession: prepareSession,
 			// 长期模式的折叠总览（minimap）
 			minimapData: function () { return folding.getData() },
 			foldingLength: function () { return folding.length },

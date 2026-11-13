@@ -311,4 +311,78 @@ const total = (batches) => batches.reduce((s, b) => s + b.n, 0)
 	assert.equal(total(batches), 722)
 }
 
-console.log('power-claim: ok')
+// ---- 打开失败必须回到「未打开」（不能永久停在 Opening） ----
+async function openFailureCase() {
+	const states = []
+	const released = []
+	let mode = 'acquire-fail'
+	const host = {
+		claim: {
+			acquire: async () => {
+				if (mode === 'acquire-fail') throw new Error('port busy')
+				return { claimId: 'cX' }
+			},
+			open: async () => {
+				if (mode === 'open-fail') throw new Error('cannot open')
+				return { open: true }
+			},
+			release: async (id) => { released.push(id); return { released: true } },
+			write: async () => ({ bytes: 0 }),
+			ack: async () => ({ ack: true }),
+		},
+	}
+	const link = Claim.createClaimLink({ host, scheduleDrain: function (fn) { fn() }, onState: function (s) { states.push(s) } })
+	let err = null
+	try { await link.open('p1') } catch (e) { err = e }
+	assert.ok(err, '申请被拒要抛出')
+	assert.equal(link.isOpening(), false, '失败后不能停在 Opening')
+	assert.equal(link.isOpen(), false)
+	assert.equal(states[states.length - 1].opening, false, '最后一次状态必须是 opening=false')
+	assert.equal(link.stats().openFailures, 1)
+
+	// 拿到声明但 open 失败：声明必须还回去，状态同样回到未打开
+	mode = 'open-fail'
+	err = null
+	try { await link.open('p1') } catch (e) { err = e }
+	assert.ok(err, 'open 失败要抛出')
+	assert.deepEqual(released, ['cX'], '半成品声明要释放：' + JSON.stringify(released))
+	assert.equal(link.isOpening(), false)
+	assert.equal(link.isOpen(), false)
+	assert.equal(link.claimId(), null)
+
+	// 之后还能重新打开（界面不会被卡死）
+	mode = 'ok'
+	const ok = await link.open('p1')
+	assert.equal(ok.ok, true)
+	assert.equal(link.isOpen(), true)
+	assert.equal(link.stats().openFailures, 2)
+}
+
+// ---- 挂断：释放声明；重复 close 幂等 ----
+async function closeCase() {
+	const released = []
+	const host = {
+		claim: {
+			acquire: async () => ({ claimId: 'cY' }),
+			open: async () => ({ open: true }),
+			close: async () => ({ closed: true }),
+			release: async (id) => { released.push(id); return { released: true } },
+			write: async () => ({ bytes: 0 }),
+			ack: async () => ({ ack: true }),
+		},
+	}
+	const link = Claim.createClaimLink({ host, scheduleDrain: function (fn) { fn() } })
+	await link.open('p1')
+	await link.close()
+	assert.deepEqual(released, ['cY'])
+	assert.equal(link.isOpen(), false)
+	await link.close()
+	assert.deepEqual(released, ['cY'], '没有声明时 close 不重复释放')
+}
+
+openFailureCase().then(closeCase).then(function () {
+	console.log('power-claim: ok')
+}).catch(function (e) {
+	console.error(e)
+	process.exit(1)
+})

@@ -207,4 +207,41 @@ function fakeRow(attrs) {
 	assert.match(L.fmtClock(new Date(2026, 0, 2, 3, 4, 5, 6).getTime()), /^03:04:05\.006$/)
 }
 
+// ---- 锚点数组有硬上限：长采集不会无界增长，抽稀后映射仍然可用 ----
+{
+	const OFF = 1.7e12
+	const tr = L.createAnchorTrack({ intervalMs: 10, gapMs: 50, maxAnchors: 500, wallOffset: () => OFF })
+	assert.equal(tr.maxCount(), 500)
+	// 每 10 ms 一个锚点 → 灌 10000 个，必须被抽稀
+	for (let i = 0; i < 10000; i++) tr.note(i, i * 10)
+	assert.ok(tr.anchorCount() <= 500, '锚点数必须封顶：' + tr.anchorCount())
+	// 抽稀之后插值仍然单调、首尾仍可用
+	const mid = tr.perfToLi(50000)
+	assert.ok(mid != null && mid > 0 && mid < 10000, '中点仍能映射：' + mid)
+	const last = tr.perfToLi(99990)
+	assert.ok(Math.abs(last - 9999) < 1e-6, '末点仍精确：' + last)
+	assert.ok(Math.abs(tr.perfToLi(0) - 0) < 1e-6, '首点仍精确')
+	// 单调：抽稀不能把映射弄乱
+	let prev = -1
+	for (let k = 0; k < 200; k++) {
+		const li = tr.perfToLi((k / 200) * 99990)
+		assert.ok(li >= prev, '映射必须单调')
+		prev = li
+	}
+}
+
+// ---- reset 之后锚点全部清空（新采集会话不继承旧锚点） ----
+{
+	const tr = L.createAnchorTrack({ intervalMs: 10, gapMs: 50, maxAnchors: 100, wallOffset: () => 0 })
+	for (let i = 0; i < 3000; i++) tr.note(i, i)
+	assert.ok(tr.anchorCount() > 0)
+	tr.reset()
+	assert.equal(tr.anchorCount(), 0, 'reset 必须清空锚点数组')
+	assert.equal(tr.has(), false)
+	assert.equal(tr.range(), null)
+	tr.note(0, 0)
+	tr.note(1, 10)
+	assert.ok(tr.anchorCount() > 0 && tr.has())
+}
+
 console.log('power-lane: ok')

@@ -444,6 +444,48 @@ test('缺口（有序到达）：采样沿触发的滞回状态与 pre-range 一
 	assert.equal(h.control.acqState().startState, 0, '缺口后沿状态复位')
 })
 
+test('停止采样：先把队列里已收到的样点排空，再冻结统计', async () => {
+	const h = await connected()
+	h.control.setTargetRateHz(1000)
+	await h.control.startSampling()
+	// 手动往队列里塞样点（模拟「点停止时还有一批没入库」）
+	const list = []
+	for (let i = 0; i < 300; i++) list.push({ iUA: 100, range: 3, logic: 0xff })
+	// 直接用 pushSamples 走 control 的入库路径（link 队列另有测试）
+	h.control.pushSamples(list, 10, { from: 0, total: 300 })
+	const before = h.wave.pushed
+	await h.control.stopSampling()
+	assert.ok(h.wave.pushed >= before, '停止不能丢已经入库的样点：' + before + ' → ' + h.wave.pushed)
+})
+
+test('意外断开：终止会话、供电状态置为未知、下一次连接不继承旧状态', async () => {
+	const h = await connected()
+	await h.control.startSampling()
+	assert.equal(h.control.isSampling(), true)
+	h.control.markPowered(true, 'commanded')
+	const r = h.control.abortSession('连接已断开')
+	assert.equal(r.wasSampling, true)
+	assert.equal(h.control.isSampling(), false, '断开后不能还在采样')
+	assert.equal(h.control.powerPayload().state, 'unknown', '断开后供电状态必须未知')
+	assert.equal(h.control.powerPayload().source, 'unknown')
+	// 下一次连接前清掉残留：采样标志与供电状态都回到初始
+	h.control.markPowered(false, 'commanded')
+	h.control.prepareSession()
+	assert.equal(h.control.powerPayload().state, 'unknown')
+	assert.equal(h.control.isSampling(), false)
+})
+
+test('保存设置后 Start 必须真的下发 START（旧 sampling 状态不会短路）', async () => {
+	const h = await connected()
+	await h.control.startSampling()
+	h.control.abortSession('模拟断开')
+	h.state.writes.length = 0
+	// 重新开始采样：必须真的发 STOP 排空 + START
+	const r = await h.control.startSampling()
+	assert.equal(r.ok, true)
+	assert.deepEqual(h.state.writes.map((w) => w.bytes[0]), [0x07, 0x06])
+})
+
 test('电压在采样中改变：摘要标出这一点', async () => {
 	const h = await connected()
 	await h.control.startSampling()

@@ -193,7 +193,10 @@
 					hostLog('host dropped ' + info.bytes + ' bytes (' + info.reason + '), marked as a gap')
 				}
 			},
-			onState: function () { renderConnState() },
+			onState: function (st) {
+				renderConnState()
+				handleLinkState(st)
+			},
 			onLog: log,
 			onBytes: function (bytes) {
 				if (!control || !control.isMetaCollecting()) return false
@@ -243,7 +246,8 @@
 	}
 
 	if (window.PowerSerialLane && typeof window.PowerSerialLane.createAnchorTrack === 'function') {
-		laneTrack = window.PowerSerialLane.createAnchorTrack({ intervalMs: 200, gapMs: 20 })
+		// 锚点只用于「事件 ↔ 样点下标」的对齐；数组有硬上限，且每次新采集会话重置
+		laneTrack = window.PowerSerialLane.createAnchorTrack({ intervalMs: 200, gapMs: 20, maxAnchors: 20000 })
 	}
 
 	// ---------- 数据到达 ----------
@@ -357,13 +361,43 @@
 		$('btn-apply-voltage').disabled = !open
 	}
 
+	// 「是我们自己关的」标记：只有非主动关闭才按意外断开处理
+	let closingByUs = false
+	let linkWasOpen = false
+	/**
+	 * 意外关闭 / 宿主收回声明：统一终止会话。
+	 * 采样、看门狗、更新屏障与供电状态都不能留到下一次连接。
+	 */
+	function handleLinkState(st) {
+		const isOpen = !!(st && st.open)
+		if (linkWasOpen && !isOpen && !closingByUs) {
+			const wasSampling = control ? control.isSampling() : false
+			if (control) control.abortSession('连接已断开')
+			releaseBusy()
+			if (stall) stall.stop()
+			View.resetScopeTrigger(trig)
+			trigScanFrom = null
+			updateSampleButton()
+			renderSessionPanel()
+			log('串口连接已断开：采样会话、更新屏障与供电状态已终止', 'warn')
+			hostLog('serial session terminated after an unexpected disconnect')
+			void wasSampling
+		}
+		linkWasOpen = isOpen
+	}
+
 	async function toggleConnect() {
 		const btn = $('btn-connect')
 		btn.disabled = true
 		try {
 			if (link.isOpen()) {
-				if (control.isSampling()) await control.stopCapture()
-				await link.close()
+				closingByUs = true
+				try {
+					if (control.isSampling()) await control.stopCapture()
+					await link.close()
+				} finally {
+					closingByUs = false
+				}
 				releaseBusy()
 				if (stall) stall.stop()
 				log('串口已释放')
@@ -375,6 +409,9 @@
 					return
 				}
 				await link.open(key)
+				// 新连接不得继承旧会话状态（采样 / 供电 / 触发）
+				control.prepareSession()
+				linkWasOpen = true
 				const sel = $('port')
 				const label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : key
 				log('已独占占用串口（mode=exclusive）', 'success')
@@ -428,7 +465,8 @@
 			if (r && r.ok) {
 				const st = control.state()
 				hostLog('capture started at ' + fmtCount(st.targetRateHz) + ' Hz (' + (st.recordMode === 'wave' ? 'waveform' : 'long stats') + ')')
-				// 新一轮采集：触发扫描与视图从 Live 重新开始
+				// 新一轮采集：锚点、触发扫描与视图都从零开始（锚点不能跨会话累积）
+				if (laneTrack) laneTrack.reset()
 				View.resetScopeTrigger(trig)
 				trigScanFrom = null
 				trigUserOverride = false

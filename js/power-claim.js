@@ -105,6 +105,7 @@
 			hostGaps: 0,
 			genSwitches: 0,
 			parserRebuilds: 0,
+			openFailures: 0,
 			parserGaps: 0,
 			sampleLossGaps: 0,
 			decodeErrors: 0,
@@ -458,38 +459,52 @@
 			return Array.isArray(ports) ? ports : []
 		}
 
+		/**
+		 * 声明并打开串口。整个过程包在 try/finally 里：**任何一步失败都必须回到「未打开」**，
+		 * 否则界面会永久停在 Opening（连接 / 选口 / 刷新全被禁用）。
+		 * 半成品声明自己释放掉，失败原因原样抛出。
+		 */
 		async function openOn(key) {
 			if (!host || !host.claim) throw new Error('宿主没有提供串口占用能力')
-			if (open || opening) await close()
+			if (open || opening) {
+				try { await close() } catch (e) { /* 旧连接关闭失败不阻止新连接，但要记下来 */ onLog('关闭旧连接失败：' + (e && e.message ? e.message : e), 'warn') }
+			}
 			opening = true
 			emitState()
-			const res = await host.claim.acquire(String(key), 'exclusive')
-			const id = res && res.claimId
-			if (!id) {
-				opening = false
-				emitState()
-				throw new Error('宿主未返回占用声明')
-			}
-			claimId = id
-			portKey = String(key)
+			let acquiredId = null
+			let opened = false
 			try {
-				await host.claim.open(claimId, { baudRate: baudRate })
+				const res = await host.claim.acquire(String(key), 'exclusive')
+				acquiredId = res && res.claimId ? res.claimId : null
+				if (!acquiredId) throw new Error('宿主未返回占用声明')
+				claimId = acquiredId
+				portKey = String(key)
+				await host.claim.open(acquiredId, { baudRate: baudRate })
+				opened = true
+				open = true
+				gen++
+				resetStream(0, 0)
+				// 新连接必须从干净的字节流开始：旧解析器、旧残帧、旧计数器一律不带过来
+				parser = createParser()
+				dropStream = false
 			} catch (e) {
-				opening = false
-				const failedId = claimId
+				// 失败清理：已经拿到的声明要还回去，本地状态全部回到未打开
+				if (acquiredId && !opened) {
+					try { await host.claim.release(acquiredId) } catch (e2) { /* 释放失败交给宿主 pendingReleases */ }
+				}
 				claimId = null
 				portKey = null
-				emitState()
-				try { await host.claim.release(failedId) } catch (e2) { /* 忽略 */ }
+				open = false
+				lastSeq = 0
+				resetStream(0, 0)
+				stats.openFailures++
+				onLog('打开串口失败：' + (e && e.message ? e.message : e), 'error')
 				throw e
+			} finally {
+				// 无论成功失败都要退出 Opening，界面才不会卡死
+				opening = false
+				emitState()
 			}
-			opening = false
-			open = true
-			gen++
-			resetStream(0, 0)
-			parser = createParser()
-			dropStream = false
-			emitState()
 			return { ok: true, claimId: claimId }
 		}
 
